@@ -128,22 +128,20 @@ class VisionRotaryEmbedding:
     """Pre-computed 2D rotary frequency table for vision encoder (Qwen3VLVisionRotaryEmbedding).
 
     head_dim // 2 frequencies per row/col, looked up by (row, col) 2D positions.
+    Frequency table is generated on-the-fly for any max_hw value.
     """
 
-    def __init__(self, dim: int, max_grid_size: int = 48):
+    def __init__(self, dim: int):
         """
         Args:
-            dim:            head_dim // 2 = hidden_size // (2 * num_heads)
-            max_grid_size:  maximum H or W for frequency table (matches pos_embed grid)
+            dim:  head_dim // 2 = hidden_size // (2 * num_heads)
         """
-        inv_freq = 1.0 / (10000.0 ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
-        t = torch.arange(max_grid_size, dtype=torch.float32)
-        self.freq_table = torch.einsum("i,j->ij", t, inv_freq)  # (max_grid_size, dim)
-        self.dim = dim
+        self.inv_freq = 1.0 / (10000.0 ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
 
     def __call__(self, max_hw: int) -> torch.Tensor:
-        """Return frequency table slice up to max_hw positions."""
-        return self.freq_table[:max_hw]  # (max_hw, dim)
+        """Return frequency table for positions up to max_hw."""
+        t = torch.arange(max_hw, dtype=torch.float32)
+        return torch.einsum("i,j->ij", t, self.inv_freq)  # (max_hw, dim)
 
 
 def compute_rot_pos_emb(grid_thw: torch.Tensor, rotary_emb: VisionRotaryEmbedding,

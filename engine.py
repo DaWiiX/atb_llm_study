@@ -91,9 +91,7 @@ class Qwen3VLEngine:
             rope_theta=self.t_cfg.get("rope_theta", 5000000.0),
             mrope_section=tuple(self.t_cfg["rope_scaling"]["mrope_section"]),
         )
-        self.vis_rotary = VisionRotaryEmbedding(
-            dim=self.hd_v // 2,
-            max_grid_size=int(self.v_cfg["num_position_embeddings"] ** 0.5))
+        self.vis_rotary = VisionRotaryEmbedding(dim=self.hd_v // 2)
 
         # ── Preprocessor params ──────────────────────────────────────
         pp = load_preprocessor_config(model_dir)
