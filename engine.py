@@ -100,24 +100,34 @@ class Qwen3VLEngine:
         self.pp_min_px = pp["min_pixels"]
         self.pp_max_px = pp["max_pixels"]
 
-        # ── Cached weights ───────────────────────────────────────────
+        # ── Cached weights (NPU-resident float16) ────────────────────
         self.embed_w = get_embed_weight(self.weights)
-        self.norm_w = get_text_norm_weight(self.weights)
-        self.t_layer_weights = [get_text_layer_weights(self.weights, i)
-                                for i in range(self.n_layer)]
+        self.norm_w = get_text_norm_weight(self.weights).half().npu()
+        self.t_layer_weights = [
+            [w.half().npu() for w in get_text_layer_weights(self.weights, i)]
+            for i in range(self.n_layer)
+        ]
 
-        # Vision: block weights by layer
-        self.v_block_weights = [get_vision_block_weights(self.weights, i)
-                               for i in range(self.v_depth)]
+        # Vision: block weights by layer (NPU-resident)
+        self.v_block_weights = [
+            [w.half().npu() for w in get_vision_block_weights(self.weights, i)]
+            for i in range(self.v_depth)
+        ]
         self.v_pe_w, self.v_pe_b = get_patch_embed_weights(
             self.weights, self.v_cfg["hidden_size"])
+        self.v_pe_w = self.v_pe_w.half().npu()
+        self.v_pe_b = self.v_pe_b.half().npu()
         self.v_pos_embed = get_vision_pos_embed(self.weights)
         self.num_grid = int(self.v_cfg["num_position_embeddings"] ** 0.5)
 
-        # Vision: merger weights
-        self.v_merger_w = get_merger_weights(self.weights, is_deepstack=False)
-        self.v_ds_w = [get_merger_weights(self.weights, is_deepstack=True, ds_idx=i)
-                       for i in range(len(self.ds_indexes))]
+        # Vision: merger weights (NPU-resident)
+        self.v_merger_w = [w.half().npu() for w in
+                           get_merger_weights(self.weights, is_deepstack=False)]
+        self.v_ds_w = [
+            [w.half().npu() for w in
+             get_merger_weights(self.weights, is_deepstack=True, ds_idx=i)]
+            for i in range(len(self.ds_indexes))
+        ]
 
         # ── Build ATB graphs ────────────────────────────────────────
         self._build_graphs()
@@ -134,19 +144,21 @@ class Qwen3VLEngine:
         self.g_t_norm = build_text_norm_graph(self.hidden_t)
         self._text_S = None
         self.g_t_layer = None
+        self._cached_mask = None
 
     def _make_vision_config(self):
         """Create a config-like object for ATB vision graph builders."""
         return VisionConfigWrapper(self.v_cfg)
 
     def _ensure_text_graph(self, S: int):
-        """Lazily build text decoder layer graph for sequence length S."""
+        """Lazily build text decoder layer graph and cached mask for sequence length S."""
         if self._text_S == S and self.g_t_layer is not None:
             return
         self._text_S = S
         self.g_t_layer = build_text_layer_graph(
             self.nh_t, self.nkv_t, self.hd_t, self.interm_t,
             B=1, S=S, use_mask=True)
+        self._cached_mask = make_causal_mask(S).half().npu()
 
     # ── Preprocessing ──────────────────────────────────────────────
 
@@ -199,7 +211,6 @@ class Qwen3VLEngine:
         """Run full TextModel on ATB NPU."""
         S = inputs_embeds.shape[1]
         self._ensure_text_graph(S)
-        cm = make_causal_mask(S)
 
         hidden = inputs_embeds
         cos, sin = self.text_rope(position_ids)
@@ -210,7 +221,7 @@ class Qwen3VLEngine:
             hidden = run_text_layer(self.g_t_layer, hidden,
                                     self.t_layer_weights[li],
                                     cos_f, sin_f, S,
-                                    causal_mask=cm)
+                                    causal_mask=self._cached_mask)
             if deepstack_features and li < len(deepstack_features):
                 ds = deepstack_features[li].to(hidden.dtype)
                 hidden[0, visual_mask, :] += ds
