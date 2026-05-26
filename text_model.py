@@ -76,21 +76,45 @@ def run_text_layer(graph, hidden_states, layer_weights, cos, sin, seqlen,
     Args:
         graph:         the shared DecoderLayer ATB graph.
         hidden_states: (B, S, hidden_size) float tensor on CPU.
-        layer_weights: list of 11 weight tensors for this layer.
+        layer_weights: list of 11 weight tensors for this layer (NPU float16).
         cos, sin:      (B*S, head_dim) float position embeddings on CPU.
         seqlen:        int, total tokens (B*S).
-        causal_mask:   (S, S) float causal mask on CPU (optional, for MASK_TYPE_NORM).
+        causal_mask:   (S, S) float causal mask on NPU (optional).
 
     Returns (B, S, hidden_size) float tensor on CPU.
     """
     ntoken = hidden_states.shape[0] * hidden_states.shape[1]
     inputs = [hidden_states.half().npu()]
-    inputs.extend([w.half().npu() for w in layer_weights])
+    inputs.extend(layer_weights)  # already NPU float16
     inputs.extend([cos.half().npu(), sin.half().npu()])
     if causal_mask is not None:
-        inputs.append(causal_mask.half().npu())
+        inputs.append(causal_mask)
     inputs.append(torch.tensor([ntoken], dtype=torch.int32))
     return graph.forward(inputs)[0].cpu().float()
+
+
+def run_text_layer_npu(graph, hidden_npu, layer_weights, cos_npu, sin_npu,
+                        seqlen, causal_mask=None):
+    """Execute one DecoderLayer on NPU — hidden stays on NPU (no copy).
+
+    Args:
+        graph:         the shared DecoderLayer ATB graph.
+        hidden_npu:    (B, S, hidden_size) float16 on NPU.
+        layer_weights: list of 11 weight tensors (NPU float16).
+        cos_npu, sin_npu: (B*S, head_dim) float16 on NPU.
+        seqlen:        int, total tokens.
+        causal_mask:   (S, S) float16 on NPU (optional).
+
+    Returns (B, S, hidden_size) float16 on NPU.
+    """
+    ntoken = hidden_npu.shape[0] * hidden_npu.shape[1]
+    inputs = [hidden_npu]
+    inputs.extend(layer_weights)
+    inputs.extend([cos_npu, sin_npu])
+    if causal_mask is not None:
+        inputs.append(causal_mask)
+    inputs.append(torch.tensor([ntoken], dtype=torch.int32))
+    return graph.forward(inputs)[0]
 
 
 def run_text_norm(graph, hidden_states, norm_weight):

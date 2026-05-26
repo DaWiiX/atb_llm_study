@@ -6,7 +6,7 @@ sys.path.insert(0, '/mnt/workspace/gitCode/atb_python_model')
 sys.path.insert(0, '/mnt/workspace/gitCode/transformers/src')
 import torch, torch_npu, torch_atb
 from atb_python_model.utils import set_atb_buffer_size
-set_atb_buffer_size(5000 * 1024 * 1024)
+set_atb_buffer_size(15000 * 1024 * 1024)
 
 from atb_python_model.engine import Qwen3VLEngine
 from atb_python_model.preprocess import preprocess_image
@@ -71,6 +71,7 @@ def test_case(name, input_ids, pv_raw, grid_thw):
     # ── Shared mask ────────────────────────────────────────────────
     cm = make_causal_mask(S)
     mask_tf = cm.unsqueeze(0).unsqueeze(0).float()
+    cm_npu = cm.half().npu()  # ATB needs float16 on NPU
 
     # ── ATB forward ────────────────────────────────────────────────
     h_atb = ie.clone()
@@ -78,7 +79,7 @@ def test_case(name, input_ids, pv_raw, grid_thw):
         sin_f = sin.reshape(-1, engine.hd_t)
         h_atb = run_text_layer(engine.g_t_layer, h_atb,
                                engine.t_layer_weights[li],
-                               cos_f, sin_f, S, causal_mask=cm)
+                               cos_f, sin_f, S, causal_mask=cm_npu)
     h_atb = run_text_norm(engine.g_t_norm, h_atb, engine.norm_w)
 
     # ── TF manual forward (same inputs as ATB) ─────────────────────

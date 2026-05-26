@@ -28,23 +28,12 @@ from .engine_utils import (
 from .vision_model import (
     build_vision_first_layer, build_vision_merger, build_deepstack_merger,
     run_first_layer, run_block, run_merger,
+    run_first_layer_npu, run_block_npu, run_merger_npu,
 )
 from .vision_block import build_vision_block
 from .text_model import (
     build_text_layer_graph, build_text_norm_graph,
     run_text_layer, run_text_norm, make_causal_mask,
-)
-from .utils import set_atb_buffer_size
-from .text_model import make_causal_mask
-from .vision_model import (
-    build_vision_first_layer, build_vision_merger, build_deepstack_merger,
-    run_first_layer, run_block, run_merger,
-)
-from .vision_block import build_vision_block
-from .text_model import (
-    build_text_layer_graph, build_text_norm_graph,
-    run_text_layer, run_text_norm,
-    make_causal_mask,
 )
 
 
@@ -160,6 +149,20 @@ class Qwen3VLEngine:
             B=1, S=S, use_mask=True)
         self._cached_mask = make_causal_mask(S).half().npu()
 
+    def _build_graphs(self):
+        """Build all ATB graphs."""
+        # Vision
+        self.g_v_first = build_vision_first_layer(self._make_vision_config())
+        _, self.g_v_block, _ = build_vision_block(self.nh_v, self.hd_v, "VisBlock")
+        self.g_v_merger = build_vision_merger(self._make_vision_config())
+        self.g_v_ds = build_deepstack_merger(self._make_vision_config())
+
+        # Text
+        self.g_t_norm = build_text_norm_graph(self.hidden_t)
+        self._text_S = None
+        self.g_t_layer = None
+        self._cached_mask = None
+
     # ── Preprocessing ──────────────────────────────────────────────
 
     def preprocess_image(self, image: torch.Tensor):
@@ -172,43 +175,36 @@ class Qwen3VLEngine:
     # ── Vision inference ───────────────────────────────────────────
 
     def _run_vision(self, pixel_values, grid_thw):
-        """Run full VisionModel on ATB NPU.
+        """Run full VisionModel on ATB NPU — outputs stay on NPU.
 
-        Returns (merged_features, deepstack_features_read_by, deepstack_features).
+        Returns (vis_npu, ds_feats_npu) — both NPU float16 tensors.
         """
-        # Position embed (CPU)
         pos = fast_pos_embed_interpolate(
             grid_thw, self.v_pos_embed, self.num_grid, self.merge_size)
-
-        # Rotary embed (CPU)
         rope = compute_rot_pos_emb(grid_thw, self.vis_rotary, self.merge_size)
         rope = rope.reshape(pixel_values.shape[0], -1)
         emb = torch.cat((rope, rope), dim=-1)
         cos, sin = emb.cos(), emb.sin()
 
-        # Block 0 (ATB)
-        h = run_first_layer(self.g_v_first, pixel_values,
-                            self.v_pe_w, self.v_pe_b, pos, cos, sin,
-                            self.v_block_weights[0])
+        h = run_first_layer_npu(self.g_v_first, pixel_values,
+                                self.v_pe_w, self.v_pe_b, pos, cos, sin,
+                                self.v_block_weights[0])
 
-        # Blocks 1..23 (ATB, looped)
         ds_feats = []
         for li in range(1, self.v_depth):
-            h = run_block(self.g_v_block, h, self.v_block_weights[li], cos, sin)
+            h = run_block_npu(self.g_v_block, h, self.v_block_weights[li], cos, sin)
             if li in self.ds_indexes:
                 ds_idx = self.ds_indexes.index(li)
-                ds = run_merger(self.g_v_ds, h, self.v_ds_w[ds_idx])
-                ds_feats.append(ds)
+                ds_feats.append(run_merger_npu(self.g_v_ds, h, self.v_ds_w[ds_idx]))
 
-        # Main merger (ATB)
-        merged = run_merger(self.g_v_merger, h, self.v_merger_w)
-        return merged, ds_feats
+        vis = run_merger_npu(self.g_v_merger, h, self.v_merger_w)
+        return vis, ds_feats
 
     # ── Text inference ─────────────────────────────────────────────
 
     def _run_text(self, inputs_embeds, position_ids,
                   visual_mask=None, deepstack_features=None):
-        """Run full TextModel on ATB NPU."""
+        """Run full TextModel on ATB NPU — uses run_text_layer (proven stable)."""
         S = inputs_embeds.shape[1]
         self._ensure_text_graph(S)
 
@@ -223,8 +219,8 @@ class Qwen3VLEngine:
                                     cos_f, sin_f, S,
                                     causal_mask=self._cached_mask)
             if deepstack_features and li < len(deepstack_features):
-                ds = deepstack_features[li].to(hidden.dtype)
-                hidden[0, visual_mask, :] += ds
+                ds = deepstack_features[li].cpu().float()
+                hidden[0, visual_mask, :] += ds.to(hidden)
 
         return run_text_norm(self.g_t_norm, hidden, self.norm_w)
 

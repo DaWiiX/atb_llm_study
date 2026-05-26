@@ -183,8 +183,22 @@ def run_first_layer(graph, pixel_values, pe_w, pe_b, pos_embeds, cos, sin,
               pos_embeds.half().npu(),
               cos.half().npu(), sin.half().npu(),
               torch.tensor([npatches], dtype=torch.int32)]
-    inputs.extend([w.half().npu() for w in block0_weights])
+    inputs.extend(block0_weights)  # already NPU
     return graph.forward(inputs)[0].cpu().float()
+
+
+def run_first_layer_npu(graph, pixel_values, pe_w, pe_b, pos_embeds, cos, sin,
+                        block0_weights):
+    """Like run_first_layer but returns NPU-resident output."""
+    pv = pixel_values.reshape(-1) if pixel_values.ndim == 2 else pixel_values
+    npatches = pos_embeds.shape[0]
+    inputs = [pv.half().npu(),
+              pe_w, pe_b,
+              pos_embeds.half().npu(),
+              cos.half().npu(), sin.half().npu(),
+              torch.tensor([npatches], dtype=torch.int32)]
+    inputs.extend(block0_weights)
+    return graph.forward(inputs)[0]
 
 
 def run_block(graph, hidden, block_weights, cos, sin):
@@ -192,17 +206,27 @@ def run_block(graph, hidden, block_weights, cos, sin):
 
     Args:
         hidden:       (N, hidden) float on CPU.
-        block_weights: 12 weight tensors for this block.
+        block_weights: 12 weight tensors for this block (NPU float16).
         cos, sin:     (N, nh*hd) rotary embeddings.
 
     Returns (N, hidden) float on CPU.
     """
     npatches = hidden.shape[0]
     inputs = [hidden.half().npu()]
-    inputs.extend([w.half().npu() for w in block_weights])
+    inputs.extend(block_weights)
     inputs.extend([cos.half().npu(), sin.half().npu(),
                    torch.tensor([npatches], dtype=torch.int32)])
     return graph.forward(inputs)[0].cpu().float()
+
+
+def run_block_npu(graph, hidden_npu, block_weights, cos, sin):
+    """Like run_block but hidden and output stay on NPU."""
+    npatches = hidden_npu.shape[0]
+    inputs = [hidden_npu]
+    inputs.extend(block_weights)
+    inputs.extend([cos.half().npu(), sin.half().npu(),
+                   torch.tensor([npatches], dtype=torch.int32)])
+    return graph.forward(inputs)[0]
 
 
 def run_merger(graph, hidden, merger_weights):
@@ -211,8 +235,15 @@ def run_merger(graph, hidden, merger_weights):
     Returns (N_out, out_hidden_size) float on CPU.
     """
     inputs = [hidden.half().npu()]
-    inputs.extend([w.half().npu() for w in merger_weights])
+    inputs.extend(merger_weights)
     return graph.forward(inputs)[0].cpu().float()
+
+
+def run_merger_npu(graph, hidden_npu, merger_weights):
+    """Like run_merger but input and output stay on NPU."""
+    inputs = [hidden_npu]
+    inputs.extend(merger_weights)
+    return graph.forward(inputs)[0]
 
 
 def run_vision_model(vision_model, pixel_values, pos_embeds, cos, sin,

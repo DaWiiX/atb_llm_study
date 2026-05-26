@@ -31,7 +31,7 @@ from PIL import Image
 
 from atb_python_model.utils import set_atb_buffer_size
 from atb_python_model.engine import Qwen3VLEngine
-set_atb_buffer_size(5000 * 1024 * 1024)
+set_atb_buffer_size(20000 * 1024 * 1024)  # 20GB for large sequences
 
 
 # ═════════════════════════════════════════════════════════════════════
@@ -142,35 +142,35 @@ def benchmark_atb_staged(atb, input_ids, img_arr, pv_raw, grid_thw,
         sync(); t2 = now(); t["vision_pos"] = t2 - t1
 
         # ── Vision model (NPU) ──────────────────────────────────────
-        h = run_first_layer(atb.g_v_first, pv, atb.v_pe_w, atb.v_pe_b,
-                            pos, cos_v, sin_v, atb.v_block_weights[0])
-        for li in range(1, atb.v_depth):
-            h = run_block(atb.g_v_block, h, atb.v_block_weights[li], cos_v, sin_v)
-        vis = run_merger(atb.g_v_merger, h, atb.v_merger_w)
+        vis, _ = atb._run_vision(pv, gth)
         sync(); t3 = now(); t["vision_model"] = t3 - t2
 
         # ── Text embed + vision injection (CPU) ─────────────────────
         ie = torch.nn.functional.embedding(input_ids, atb.embed_w).float()
         vis_mask = input_ids.squeeze(0) == atb.img_tok
-        ie[0, vis_mask, :] = vis.to(ie)
+        ie[0, vis_mask, :] = vis.cpu().float()
         sync(); t4 = now(); t["text_embed"] = t4 - t3
 
         # ── Position IDs + RoPE (CPU) ───────────────────────────────
         pid, _ = get_rope_index(input_ids, gth, None, None,
                                  image_token_id=atb.img_tok,
                                  spatial_merge_size=atb.spatial_merge)
-        cos, sin = atb.text_rope(pid)
-        cos_f = cos.reshape(-1, atb.hd_t)
-        sin_f = sin.reshape(-1, atb.hd_t)
-        cm = make_causal_mask(S)
         sync(); t5 = now(); t["position_ids"] = t5 - t4
 
         # ── Text model (NPU) ────────────────────────────────────────
-        ht = ie.clone()
+        atb._ensure_text_graph(S)
+        cos_f, sin_f = atb.text_rope(pid)
+        cos_npu = cos_f.reshape(-1, atb.hd_t).half().npu()
+        sin_npu = sin_f.reshape(-1, atb.hd_t).half().npu()
+        ht = ie.half().npu()
+        ntoken = 1 * S
         for li in range(atb.n_layer):
-            ht = run_text_layer(atb.g_t_layer, ht, atb.t_layer_weights[li],
-                                cos_f, sin_f, S, causal_mask=cm)
-        ht = run_text_norm(atb.g_t_norm, ht, atb.norm_w)
+            inputs = [ht]
+            inputs.extend(atb.t_layer_weights[li])
+            inputs.extend([cos_npu, sin_npu])
+            inputs.append(atb._cached_mask)
+            inputs.append(torch.tensor([ntoken], dtype=torch.int32))
+            ht = atb.g_t_layer.forward(inputs)[0]
         sync(); t6 = now(); t["text_model"] = t6 - t5
 
         for s in stages:
@@ -340,8 +340,8 @@ def print_report(resolution, S, atb_e2e, torch_e2e, atb_stages, torch_stages):
 
 if __name__ == "__main__":
     rp = '/mnt/workspace/gitCode/models/Qwen3-VL-Embedding-2B'
-    print("Loading models...")
-    atb, ref = setup(rp)
+    print("Loading ATB engine...")
+    atb = Qwen3VLEngine(rp)
 
     resolutions = [
         (416, 672),
@@ -358,21 +358,46 @@ if __name__ == "__main__":
         n_vis_tokens = int(torch.prod(grid_thw, dim=1).sum()) // (atb.merge_size ** 2)
         print(f"  Image: {w}x{h} → grid={grid_thw.tolist()} → {n_vis_tokens} vision tokens, S={S}")
 
-        # ATB staged
+        # ATB staged (with sync at boundaries)
         atb_stages = benchmark_atb_staged(atb, tf_in['input_ids'], img_arr,
                                           pv_raw, grid_thw, n_warmup=3, n_iter=5)
-        # ATB E2E (no sync)
+        # ATB E2E (no sync — real throughput)
         atb_e2e = benchmark_atb_e2e(atb, tf_in['input_ids'], pv_raw, grid_thw,
                                      n_warmup=3, n_iter=5)
 
-        # torch_npu staged
-        torch_stages = benchmark_torch_staged(ref, atb, tf_in['input_ids'], img_arr,
-                                               pv_raw, grid_thw, tf_in,
-                                               n_warmup=3, n_iter=5)
-        # torch_npu E2E (no sync)
-        torch_e2e = benchmark_torch_e2e(ref, tf_in, n_warmup=3, n_iter=5)
+        # Print ATB-only report
+        labels = {
+            "preprocess":    "Preprocess       ",
+            "vision_pos":    "Vision PosEmb    ",
+            "vision_model":  "Vision Model     ",
+            "text_embed":    "Text Embed+Inj   ",
+            "position_ids":  "Position IDs     ",
+            "text_model":    "Text Model       ",
+        }
+        stage_order = ["preprocess", "vision_pos", "vision_model",
+                       "text_embed", "position_ids", "text_model"]
 
-        print_report(f"{w}x{h}", S, atb_e2e, torch_e2e, atb_stages, torch_stages)
+        print(f"\n{'─'*80}")
+        print(f" {w}x{h}  (S={S})")
+        print(f"{'─'*80}")
+        print(f"{'Stage':<20} {'Time (ms)':>12} {'%':>8}")
+        print(f"{'─'*20} {'─'*12} {'─'*8}")
+
+        total_staged = 0.0
+        for s in stage_order:
+            ms = np.mean(atb_stages[s]) * 1000
+            total_staged += ms
+        for s in stage_order:
+            ms = np.mean(atb_stages[s]) * 1000
+            pct = ms / total_staged * 100 if total_staged > 0 else 0
+            print(f"{labels[s]:<20} {ms:>10.2f}  {pct:>6.1f}%")
+        print(f"{'─'*20} {'─'*12} {'─'*8}")
+        print(f"{'Staged sum':<20} {total_staged:>10.2f}")
+
+        e2e_ms = np.mean(atb_e2e) * 1000
+        e2e_std = np.std(atb_e2e) * 1000
+        print(f"\n{'E2E (no sync)':<20} {e2e_ms:>8.1f} ± {e2e_std:<5.1f} ms")
+        print(f"  (sync overhead: total_staged - e2e = {total_staged - e2e_ms:.1f} ms)")
 
     print(f"\n{'='*80}")
     print(" Done.")
