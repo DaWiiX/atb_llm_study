@@ -1,17 +1,12 @@
 """Test Qwen3VLTextDecoderLayer: transformers vs ATB graph."""
-import sys
-import os
-
-_pkg_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if _pkg_dir not in sys.path:
-    sys.path.insert(0, _pkg_dir)
-
+import sys, os
+sys.path.insert(0, '/mnt/workspace/gitCode/transformers/src')
 import torch
 import torch_npu  # noqa: needed for .npu()
 
-from atb_python_model import data_utils, utils
-from atb_python_model.text_decoder_layer import build_decoder_layer
-from atb_python_model.transformers_runner import run_decoder_layer
+from atb_python_qwen3vl_embedding import data_utils, utils
+from atb_python_qwen3vl_embedding.text_decoder_layer import build_decoder_layer
+from atb_python_qwen3vl_embedding.transformers_runner import run_decoder_layer
 
 
 def test_decoder_layer(B=1, S=16, seed=42):

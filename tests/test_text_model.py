@@ -1,21 +1,17 @@
 """Test Qwen3VLTextModel: transformers vs ATB (split-graph loop)."""
 import sys, os, torch, torch.nn.functional as F
-
-_pkg_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if _pkg_dir not in sys.path:
-    sys.path.insert(0, _pkg_dir)
 sys.path.insert(0, '/mnt/workspace/gitCode/transformers/src')
 
-from atb_python_model.utils import set_atb_buffer_size, compare_tensors
-from atb_python_model.text_model import (
+from atb_python_qwen3vl_embedding.utils import set_atb_buffer_size, compare_tensors
+from atb_python_qwen3vl_embedding.text_model import (
     build_text_layer_graph, build_text_norm_graph, run_text_model,
 )
 
 
 def test_text_model(B=1, S=8, num_layers=2, seed=42):
     print(f"\n=== Qwen3VLTextModel ({num_layers} layers, split-graph) ===")
-    from atb_python_model import data_utils
-    from atb_python_model.transformers_runner import run_text_model as run_tf
+    from atb_python_qwen3vl_embedding import data_utils
+    from atb_python_qwen3vl_embedding.transformers_runner import run_text_model as run_tf
 
     config = data_utils.make_config(
         num_heads=4, num_kv_heads=4, head_dim=64,

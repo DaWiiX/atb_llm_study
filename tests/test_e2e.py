@@ -9,18 +9,15 @@ Pipeline:
 import sys, os, torch, torch.nn.functional as F, warnings
 warnings.filterwarnings('ignore')
 
-_pkg_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if _pkg_dir not in sys.path:
-    sys.path.insert(0, _pkg_dir)
 sys.path.insert(0, '/mnt/workspace/gitCode/transformers/src')
 os.environ['TRANSFORMERS_VERBOSITY'] = 'error'
 
-from atb_python_model.utils import set_atb_buffer_size, compare_tensors
-from atb_python_model.vision_model import (
+from atb_python_qwen3vl_embedding.utils import set_atb_buffer_size, compare_tensors
+from atb_python_qwen3vl_embedding.vision_model import (
     build_vision_first_layer, build_vision_merger, run_vision_model,
 )
-from atb_python_model.vision_block import build_vision_block
-from atb_python_model.preprocess import preprocess_image
+from atb_python_qwen3vl_embedding.vision_block import build_vision_block
+from atb_python_qwen3vl_embedding.preprocess import preprocess_image
 
 
 def test_e2e():

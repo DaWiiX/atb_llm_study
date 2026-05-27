@@ -1,17 +1,12 @@
 """Test Qwen3VLTextMLP: transformers vs ATB graph."""
-import sys
-import os
-
-_pkg_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if _pkg_dir not in sys.path:
-    sys.path.insert(0, _pkg_dir)
-
+import sys, os
+sys.path.insert(0, '/mnt/workspace/gitCode/transformers/src')
 import torch
 import torch_npu  # noqa: needed for .npu()
 
-from atb_python_model import data_utils, utils
-from atb_python_model.text_mlp import build_mlp
-from atb_python_model.transformers_runner import run_mlp
+from atb_python_qwen3vl_embedding import data_utils, utils
+from atb_python_qwen3vl_embedding.text_mlp import build_mlp
+from atb_python_qwen3vl_embedding.transformers_runner import run_mlp
 
 
 def test_mlp(B=1, S=16, seed=42):
@@ -22,7 +17,7 @@ def test_mlp(B=1, S=16, seed=42):
     gen_data["config"] = config
     ref_out, weights = run_mlp(gen_data, seed=seed)
 
-    _, graph_op, _ = build_mlp(intermediate_size=512)
+    _, graph_op, _ = build_mlp(config.hidden_size, config.intermediate_size)
 
     utils.set_atb_buffer_size(100 * 1024 * 1024)
     atb_out = graph_op.forward([

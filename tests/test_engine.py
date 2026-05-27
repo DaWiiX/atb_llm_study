@@ -2,18 +2,17 @@
 # Pure ATB Engine E2E Test — zero transformers in inference path
 # ============================================================
 import sys, os; os.environ['TRANSFORMERS_VERBOSITY'] = 'error'
-sys.path.insert(0, '/mnt/workspace/gitCode/atb_python_model')
 sys.path.insert(0, '/mnt/workspace/gitCode/transformers/src')
 import torch, torch_npu, torch_atb
-from atb_python_model.utils import set_atb_buffer_size
+from atb_python_qwen3vl_embedding.utils import set_atb_buffer_size
 set_atb_buffer_size(15000 * 1024 * 1024)
 
-from atb_python_model.engine import Qwen3VLEngine
-from atb_python_model.preprocess import preprocess_image
-from atb_python_model.engine_utils import (
+from atb_python_qwen3vl_embedding.engine import Qwen3VLEngine
+from atb_python_qwen3vl_embedding.preprocess import preprocess_image
+from atb_python_qwen3vl_embedding.engine_utils import (
     TextRotaryEmbedding, get_rope_index, get_embed_weight,
 )
-from atb_python_model.text_model import (
+from atb_python_qwen3vl_embedding.text_model import (
     run_text_layer, run_text_norm, make_causal_mask,
 )
 from PIL import Image

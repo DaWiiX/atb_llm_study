@@ -1,11 +1,9 @@
 """Test Qwen3VLVisionPatchEmbed: ATB vs transformers."""
 import sys, os, torch, torch_npu, torch_atb, torch.nn.functional as F, warnings
-_pkg_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if _pkg_dir not in sys.path: sys.path.insert(0, _pkg_dir)
 sys.path.insert(0, '/mnt/workspace/gitCode/transformers/src')
 os.environ['TRANSFORMERS_VERBOSITY'] = 'error'; warnings.filterwarnings('ignore')
-from atb_python_model.utils import set_atb_buffer_size, compare_tensors
-from atb_python_model.vision_patch_embed import build_patch_embed
+from atb_python_qwen3vl_embedding.utils import set_atb_buffer_size, compare_tensors
+from atb_python_qwen3vl_embedding.vision_patch_embed import build_patch_embed
 
 def test_patch_embed():
     print("\n=== Qwen3VLVisionPatchEmbed ===")

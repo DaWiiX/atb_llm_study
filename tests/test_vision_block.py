@@ -1,11 +1,9 @@
 """Test Qwen3VLVisionBlock: transformers vs ATB graph."""
 import sys, os, torch, torch_npu, torch.nn.functional as F
-_pkg_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if _pkg_dir not in sys.path: sys.path.insert(0, _pkg_dir)
 sys.path.insert(0, '/mnt/workspace/gitCode/transformers/src')
 import warnings; warnings.filterwarnings('ignore')
-from atb_python_model.vision_block import build_vision_block
-from atb_python_model.utils import set_atb_buffer_size, compare_tensors
+from atb_python_qwen3vl_embedding.vision_block import build_vision_block
+from atb_python_qwen3vl_embedding.utils import set_atb_buffer_size, compare_tensors
 from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLVisionBlock
 from transformers.models.qwen3_vl.modular_qwen3_vl import Qwen3VLVisionConfig, Qwen3VLVisionRotaryEmbedding
 

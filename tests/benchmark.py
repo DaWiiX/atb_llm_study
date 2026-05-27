@@ -20,7 +20,6 @@ Usage:
 """
 import sys, os, time, argparse
 os.environ['TRANSFORMERS_VERBOSITY'] = 'error'
-sys.path.insert(0, '/mnt/workspace/gitCode/atb_python_model')
 sys.path.insert(0, '/mnt/workspace/gitCode/transformers/src')
 
 import torch
@@ -29,8 +28,8 @@ import safetensors.torch
 import numpy as np
 from PIL import Image
 
-from atb_python_model.utils import set_atb_buffer_size
-from atb_python_model.engine import Qwen3VLEngine
+from atb_python_qwen3vl_embedding.utils import set_atb_buffer_size
+from atb_python_qwen3vl_embedding.engine import Qwen3VLEngine
 set_atb_buffer_size(20000 * 1024 * 1024)  # 20GB for large sequences
 
 
@@ -83,7 +82,7 @@ def make_test_image(w: int, h: int):
     img = Image.new('RGB', (w, h), color='blue')
     img_arr = torch.from_numpy(np.array(img)).permute(2, 0, 1)
 
-    from atb_python_model.preprocess import preprocess_image
+    from atb_python_qwen3vl_embedding.preprocess import preprocess_image
     pv_raw, grid_thw = preprocess_image(img_arr)
 
     from transformers import AutoProcessor
@@ -103,17 +102,17 @@ def make_test_image(w: int, h: int):
 def benchmark_atb_staged(atb, input_ids, img_arr, pv_raw, grid_thw,
                           n_warmup=5, n_iter=10):
     """Measure per-stage timing for ATB engine (WITH sync at boundaries)."""
-    from atb_python_model.engine_utils import (
+    from atb_python_qwen3vl_embedding.engine_utils import (
         TextRotaryEmbedding, get_rope_index, get_embed_weight,
         fast_pos_embed_interpolate, compute_rot_pos_emb,
         VisionRotaryEmbedding, get_vision_pos_embed,
         get_vision_block_weights, get_patch_embed_weights, get_merger_weights,
     )
-    from atb_python_model.preprocess import preprocess_image
-    from atb_python_model.text_model import (
+    from atb_python_qwen3vl_embedding.preprocess import preprocess_image
+    from atb_python_qwen3vl_embedding.text_model import (
         make_causal_mask, run_text_layer, run_text_norm,
     )
-    from atb_python_model.vision_model import run_first_layer, run_block, run_merger
+    from atb_python_qwen3vl_embedding.vision_model import run_first_layer, run_block, run_merger
 
     S = input_ids.shape[1]
     atb._ensure_text_graph(S)
@@ -200,10 +199,10 @@ def benchmark_atb_e2e(atb, input_ids, pv_raw, grid_thw, n_warmup=5, n_iter=10):
 def benchmark_torch_staged(ref, atb, input_ids, img_arr, pv_raw, grid_thw, tf_in,
                             n_warmup=5, n_iter=10):
     """Measure per-stage timing for torch_npu (WITH sync at boundaries)."""
-    from atb_python_model.engine_utils import (
+    from atb_python_qwen3vl_embedding.engine_utils import (
         fast_pos_embed_interpolate, compute_rot_pos_emb, get_rope_index,
     )
-    from atb_python_model.preprocess import preprocess_image
+    from atb_python_qwen3vl_embedding.preprocess import preprocess_image
 
     im_tok = ref.config.image_token_id
     S = input_ids.shape[1]

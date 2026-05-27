@@ -1,5 +1,5 @@
 """
-atb_python_model — Pure ATB graph implementations for Qwen3VL-Embedding-2B.
+atb_python_qwen3vl_embedding — Pure ATB graph implementations for Qwen3VL-Embedding-2B.
 
 Zero transformers dependency in the inference path.
 

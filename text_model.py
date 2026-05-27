@@ -93,6 +93,30 @@ def run_text_layer(graph, hidden_states, layer_weights, cos, sin, seqlen,
     return graph.forward(inputs)[0].cpu().float()
 
 
+def run_text_layer_fast(graph, hidden_states, layer_weights, cos_npu, sin_npu,
+                         seqlen, causal_mask=None):
+    """Execute one DecoderLayer — cos/sin already NPU fp16.
+
+    Args:
+        graph:         the shared DecoderLayer ATB graph.
+        hidden_states: (B, S, hidden_size) float tensor on CPU.
+        layer_weights: list of 11 weight tensors (NPU float16).
+        cos_npu, sin_npu: (B*S, head_dim) float16 on NPU (pre-transferred).
+        seqlen:        int, total tokens (B*S).
+        causal_mask:   (S, S) float causal mask on NPU (optional).
+
+    Returns (B, S, hidden_size) float tensor on CPU.
+    """
+    ntoken = hidden_states.shape[0] * hidden_states.shape[1]
+    inputs = [hidden_states.half().npu()]
+    inputs.extend(layer_weights)
+    inputs.extend([cos_npu, sin_npu])
+    if causal_mask is not None:
+        inputs.append(causal_mask)
+    inputs.append(torch.tensor([ntoken], dtype=torch.int32))
+    return graph.forward(inputs)[0].cpu().float()
+
+
 def run_text_layer_npu(graph, hidden_npu, layer_weights, cos_npu, sin_npu,
                         seqlen, causal_mask=None):
     """Execute one DecoderLayer on NPU — hidden stays on NPU (no copy).
@@ -124,6 +148,12 @@ def run_text_norm(graph, hidden_states, norm_weight):
     """
     inputs = [hidden_states.half().npu(), norm_weight.half().npu()]
     return graph.forward(inputs)[0].cpu().float()
+
+
+def run_text_norm_npu(graph, hidden_npu, norm_weight):
+    """Execute final RMSNorm on ATB NPU — input and output stay on NPU."""
+    inputs = [hidden_npu, norm_weight]
+    return graph.forward(inputs)[0]
 
 
 def run_text_model(text_model, hidden_states, cos, sin, seqlen,

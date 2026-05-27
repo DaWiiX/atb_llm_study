@@ -16,10 +16,9 @@
 #   8. norm → final hidden_states
 # ============================================================
 import sys, os; os.environ['TRANSFORMERS_VERBOSITY'] = 'error'
-sys.path.insert(0, '/mnt/workspace/gitCode/atb_python_model')
 sys.path.insert(0, '/mnt/workspace/gitCode/transformers/src')
 import torch, torch_npu, torch_atb
-from atb_python_model.utils import set_atb_buffer_size
+from atb_python_qwen3vl_embedding.utils import set_atb_buffer_size
 set_atb_buffer_size(5000 * 1024 * 1024)  # 5GB, 必须在所有 graph build 之前调用
 
 from transformers import AutoModel, AutoProcessor
@@ -39,12 +38,12 @@ tm = model.language_model  # Qwen3VLTextModel
 vm = model.visual           # Qwen3VLVisionModel
 
 # ── 构建 ATB 图（一次性构建，全部组件）───────────────────────────
-from atb_python_model.vision_model import (
+from atb_python_qwen3vl_embedding.vision_model import (
     build_vision_first_layer, build_vision_merger, build_deepstack_merger,
     collect_patch_embed_weight, collect_block_weights, collect_merger_weights,
     run_first_layer, run_block, run_merger, run_vision_model,
 )
-from atb_python_model.vision_block import build_vision_block
+from atb_python_qwen3vl_embedding.vision_block import build_vision_block
 
 cfg_v = vm.config
 nh_v = cfg_v.num_heads
@@ -56,8 +55,8 @@ _, g_v_block, _ = build_vision_block(nh_v, hd_v, "VisBlock")
 g_v_merger = build_vision_merger(cfg_v)
 g_v_deepstack = build_deepstack_merger(cfg_v)
 
-from atb_python_model.text_decoder_layer import build_decoder_layer
-from atb_python_model.text_model import (
+from atb_python_qwen3vl_embedding.text_decoder_layer import build_decoder_layer
+from atb_python_qwen3vl_embedding.text_model import (
     build_text_norm_graph, collect_text_layer_weights,
     make_causal_mask, run_text_layer, run_text_norm,
 )
@@ -218,7 +217,7 @@ tf_in_img = proc.apply_chat_template(msgs_img, tokenize=True,
     return_dict=True, return_tensors='pt', add_generation_prompt=True)
 
 # ATB: 用自己的 preprocess_image 处理原始图像
-from atb_python_model.preprocess import preprocess_image
+from atb_python_qwen3vl_embedding.preprocess import preprocess_image
 pv_raw, grid_thw = preprocess_image(
     torch.from_numpy(np.array(img)).permute(2, 0, 1))
 

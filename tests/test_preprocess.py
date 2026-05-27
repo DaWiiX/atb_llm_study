@@ -1,12 +1,10 @@
 """Test preprocessing: pure Python vs transformers Processor."""
 import sys, os, torch, torch.nn.functional as F
-_pkg = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if _pkg not in sys.path: sys.path.insert(0, _pkg)
 sys.path.insert(0, '/mnt/workspace/gitCode/transformers/src')
 import warnings; warnings.filterwarnings('ignore')
 os.environ['TRANSFORMERS_VERBOSITY'] = 'error'
 
-from atb_python_model.preprocess import preprocess_image
+from atb_python_qwen3vl_embedding.preprocess import preprocess_image
 
 def test_preprocess():
     print("\n=== Image Preprocessing ===")

@@ -3,17 +3,13 @@
 Uses 3 subgraphs (first_layer, per_block, merger) and loops blocks at runtime.
 """
 import sys, os, torch, torch.nn.functional as F
-
-_pkg_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if _pkg_dir not in sys.path:
-    sys.path.insert(0, _pkg_dir)
 sys.path.insert(0, '/mnt/workspace/gitCode/transformers/src')
 
-from atb_python_model.utils import set_atb_buffer_size, compare_tensors
-from atb_python_model.vision_model import (
+from atb_python_qwen3vl_embedding.utils import set_atb_buffer_size, compare_tensors
+from atb_python_qwen3vl_embedding.vision_model import (
     build_vision_first_layer, build_vision_merger, run_vision_model,
 )
-from atb_python_model.vision_block import build_vision_block
+from atb_python_qwen3vl_embedding.vision_block import build_vision_block
 def test_vision_model(depth=1, seed=42):
     print(f"\n=== Qwen3VLVisionModel (depth={depth}) ===")
     from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLVisionModel

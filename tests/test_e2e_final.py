@@ -3,11 +3,10 @@
 # 三种输入：纯文本 / 纯图片 / 图片+文本
 # ============================================================
 import sys, os; os.environ['TRANSFORMERS_VERBOSITY'] = 'error'
-sys.path.insert(0, '/mnt/workspace/gitCode/atb_python_model')
 sys.path.insert(0, '/mnt/workspace/gitCode/transformers/src')
 import torch, torch_npu, torch_atb
 import torch.nn.functional as F
-from atb_python_model.utils import set_atb_buffer_size
+from atb_python_qwen3vl_embedding.utils import set_atb_buffer_size
 set_atb_buffer_size(5000 * 1024 * 1024)
 
 from transformers import AutoModel, AutoProcessor
@@ -23,12 +22,12 @@ nh_t, kv_t, hd_t, hidden_t, interm_t = (cfg_t.num_attention_heads, cfg_t.num_key
     cfg_t.head_dim, cfg_t.hidden_size, cfg_t.intermediate_size)
 
 # ── Build all ATB graphs once ─────────────────────────────────────
-from atb_python_model.vision_model import (build_vision_first_layer, build_vision_merger,
+from atb_python_qwen3vl_embedding.vision_model import (build_vision_first_layer, build_vision_merger,
     build_deepstack_merger, run_vision_model)
-from atb_python_model.vision_block import build_vision_block
-from atb_python_model.preprocess import preprocess_image
-from atb_python_model.text_decoder_layer import build_decoder_layer
-from atb_python_model.text_model import (build_text_norm_graph, collect_text_layer_weights,
+from atb_python_qwen3vl_embedding.vision_block import build_vision_block
+from atb_python_qwen3vl_embedding.preprocess import preprocess_image
+from atb_python_qwen3vl_embedding.text_decoder_layer import build_decoder_layer
+from atb_python_qwen3vl_embedding.text_model import (build_text_norm_graph, collect_text_layer_weights,
     make_causal_mask, run_text_layer, run_text_norm)
 
 cfg_v = vm.config; nh_v = cfg_v.num_heads; hd_v = cfg_v.hidden_size // nh_v

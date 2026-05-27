@@ -5,7 +5,7 @@ Zero dependency on transformers. Works directly with safetensors checkpoint
 files and JSON configs from a model directory.
 
 Usage:
-    from atb_python_model.utils import set_atb_buffer_size
+    from atb_python_qwen3vl_embedding.utils import set_atb_buffer_size
     set_atb_buffer_size(5 * 1024 * 1024 * 1024)
 
     engine = Qwen3VLEngine("/path/to/Qwen3-VL-Embedding-2B")
@@ -33,7 +33,7 @@ from .vision_model import (
 from .vision_block import build_vision_block
 from .text_model import (
     build_text_layer_graph, build_text_norm_graph,
-    run_text_layer, run_text_norm, make_causal_mask,
+    run_text_layer_npu, run_text_norm_npu, make_causal_mask,
 )
 
 
@@ -204,25 +204,28 @@ class Qwen3VLEngine:
 
     def _run_text(self, inputs_embeds, position_ids,
                   visual_mask=None, deepstack_features=None):
-        """Run full TextModel on ATB NPU — uses run_text_layer (proven stable)."""
+        """Run full TextModel on ATB NPU — NPU-resident hidden states."""
         S = inputs_embeds.shape[1]
         self._ensure_text_graph(S)
 
-        hidden = inputs_embeds
         cos, sin = self.text_rope(position_ids)
-        cos_f = cos.reshape(-1, self.hd_t)
-        sin_f = sin.reshape(-1, self.hd_t)
+        cos_npu = cos.reshape(-1, self.hd_t).half().npu()
+        sin_npu = sin.reshape(-1, self.hd_t).half().npu()
+
+        hidden = inputs_embeds.half().npu()
+
+        if visual_mask is not None:
+            visual_mask = visual_mask.npu()
 
         for li in range(self.n_layer):
-            hidden = run_text_layer(self.g_t_layer, hidden,
-                                    self.t_layer_weights[li],
-                                    cos_f, sin_f, S,
-                                    causal_mask=self._cached_mask)
+            hidden = run_text_layer_npu(self.g_t_layer, hidden,
+                                        self.t_layer_weights[li],
+                                        cos_npu, sin_npu, S,
+                                        causal_mask=self._cached_mask)
             if deepstack_features and li < len(deepstack_features):
-                ds = deepstack_features[li].cpu().float()
-                hidden[0, visual_mask, :] += ds.to(hidden)
+                hidden[0, visual_mask, :] += deepstack_features[li]
 
-        return run_text_norm(self.g_t_norm, hidden, self.norm_w)
+        return run_text_norm_npu(self.g_t_norm, hidden, self.norm_w).cpu().float()
 
     # ── Full pipeline ───────────────────────────────────────────────
 
@@ -239,16 +242,16 @@ class Qwen3VLEngine:
 
         Returns (B, S, hidden_size) float32 on CPU.
         """
-        # 1. Text embeddings (CPU)
-        inputs_embeds = F.embedding(input_ids, self.embed_w)
+        # 1. Text embeddings → NPU
+        inputs_embeds = F.embedding(input_ids, self.embed_w).half().npu()
 
-        # 2. Vision features (ATB + CPU injection)
+        # 2. Vision features — all NPU-resident
         ds_feats = []
         vis_mask = None
         if pixel_values is not None and image_grid_thw is not None:
             vis_embeds, ds_feats = self._run_vision(pixel_values, image_grid_thw)
             vis_mask = input_ids.squeeze(0) == self.img_tok
-            inputs_embeds[0, vis_mask, :] = vis_embeds.to(inputs_embeds)
+            inputs_embeds[0, vis_mask.npu(), :] = vis_embeds
 
         # 3. Position IDs (CPU)
         position_ids, _ = get_rope_index(
@@ -256,7 +259,7 @@ class Qwen3VLEngine:
             image_token_id=self.img_tok,
             spatial_merge_size=self.spatial_merge)
 
-        # 4. Text model (ATB)
+        # 4. Text model (ATB NPU)
         return self._run_text(inputs_embeds, position_ids,
                               vis_mask, ds_feats if ds_feats else None)
 
