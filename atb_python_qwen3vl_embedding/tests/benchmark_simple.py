@@ -125,7 +125,12 @@ if __name__ == "__main__":
         n_vis = int(torch.prod(grid_thw, dim=1).sum() // (atb.merge_size ** 2))
         print(f"  S={S}, vis_tokens={n_vis}")
 
+        torch.npu.synchronize()
+
         e2e = benchmark_atb_forward(atb, input_ids, pv_raw, grid_thw, n_warmup=3, n_iter=5)
+
+        torch.npu.synchronize()
+
         atb_results[(w, h)] = (S, n_vis, e2e)
 
     # Free ATB engine before loading ref model

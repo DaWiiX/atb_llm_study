@@ -112,7 +112,7 @@ Weights follow HuggingFace key naming: `model.language_model.*` for text, `model
 
 when you debug python code, remember to check atb log `cat /root/ascend/log/atb/$(ls -rt /root/ascend/log/atb/ | tail -n 1)`
 
-when you debug cpp code, remember to check atb log `cat 1. root/atb/log/$(ls -rt root/atb/log/ | tail -n 1)`
+when you debug cpp code, remember to check atb log `cat /root/atb/log/$(ls -rt /root/atb/log/ | tail -n 1)`
 
 when you trying to make atb cpp code, remember to execute blow code first:
 ```bash
