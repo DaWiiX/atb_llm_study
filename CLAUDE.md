@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Pure ATB graph implementations for Qwen3VL-Embedding-2B inference on Huawei Ascend NPU. The Python package (`atb_python_qwen3vl_embedding`) provides a **zero-dependency inference engine** — no transformers library in the hot path. It loads weights directly from safetensors and builds ATB computation graphs for every model component.
 
-The `atb_cpp_qwen3vl_embedding` directory is a placeholder (currently empty).
+The `atb_cpp_qwen3vl_embedding` directory contains a C++ multi-model LLM engine built on ATB, supporting Qwen3, Qwen3VL, DeepSeek-V2/V3, Mixtral and other architectures.
 
 ## Hardware requirements
 
