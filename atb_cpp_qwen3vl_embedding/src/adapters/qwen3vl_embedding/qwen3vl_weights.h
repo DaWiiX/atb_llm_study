@@ -70,21 +70,21 @@ struct PatchEmbedWeights {
 /// All tensors are float16 on NPU (except embed_weight which stays on CPU).
 struct Qwen3VLWeights {
     // Text
-    std::vector<TextLayerWeights> text_layers;    // 28 layers
-    atb::Tensor text_norm_weight;                  // final norm
+    std::vector<TextLayerWeights> text_layers;  // 28 layers
+    atb::Tensor text_norm_weight;               // final norm
 
     // Vision
-    std::vector<VisionBlockWeights> vis_blocks;    // 24 blocks
+    std::vector<VisionBlockWeights> vis_blocks;  // 24 blocks
     PatchEmbedWeights vis_patch_embed;
-    atb::Tensor vis_pos_embed;                     // (num_pos_embed, hidden_size) on NPU
+    atb::Tensor vis_pos_embed;  // (num_pos_embed, hidden_size) on NPU
 
     // Merger
     MergerWeights merger;
     std::vector<MergerWeights> deepstack_mergers;  // one per ds index
 
     // Embedding (stays on CPU for F.embedding lookup)
-    // We store it as a host-side buffer
-    void* embed_weight_host = nullptr;
+    // We store it as a host-side fp16 buffer
+    std::vector<uint16_t> embed_weight_host;
     int64_t embed_vocab_size = 0;
     int64_t embed_hidden_size = 0;
 };
@@ -97,12 +97,5 @@ Status LoadQwen3VLWeights(const std::string& model_dir,
                           TensorAllocator& alloc,
                           Qwen3VLWeights& weights);
 
-/// Convert bf16 (uint16 raw bits) to float16 (uint16 raw bits).
-/// Returns the float16 bits.
-uint16_t Bf16ToFp16(uint16_t bf16_bits);
-
-/// Convert bf16 buffer to fp16 buffer (element-wise).
-void Bf16ToFp16Buffer(const uint16_t* src, uint16_t* dst, size_t num_elements);
-
-} // namespace adapters
-} // namespace atb_llm
+}  // namespace adapters
+}  // namespace atb_llm

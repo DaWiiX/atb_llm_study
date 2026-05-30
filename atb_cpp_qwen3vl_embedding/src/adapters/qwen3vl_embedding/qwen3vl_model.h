@@ -4,6 +4,7 @@
 #include "adapters/qwen3vl_embedding/qwen3vl_config.h"
 #include "adapters/qwen3vl_embedding/qwen3vl_weights.h"
 #include "core/raii.h"
+#include "core/npu_tensor.h"
 #include "components/position/mrope.h"
 #include <cstdint>
 #include <memory>
@@ -34,8 +35,12 @@ public:
     // IModel interface
     Status Load(const std::string& model_dir, IRuntime* runtime) override;
     Status Forward(const InferRequest& request, InferResult& result) override;
-    const char* GetName() const override { return "qwen3vl_embedding"; }
-    bool HasVision() const override { return true; }
+    const char* GetName() const override {
+        return "qwen3vl_embedding";
+    }
+    bool HasVision() const override {
+        return true;
+    }
 
 private:
     // ── Config & weights ──────────────────────────────────
@@ -67,6 +72,17 @@ private:
                      uint16_t* vis_embeds_out, int64_t vis_embed_dim,
                      std::vector<std::vector<uint16_t>>& ds_features);
 
+    // ── Input preparation ────────────────────────────────
+    Status PrepareInputs(const InferRequest& request,
+                         std::vector<uint16_t>& inputs_embeds,
+                         int64_t& seq_len, int64_t& hidden_size,
+                         int32_t& hd, int64_t& vis_embed_dim,
+                         std::vector<float>& cos_f32,
+                         std::vector<float>& sin_f32,
+                         std::vector<float>& mask,
+                         std::vector<std::vector<uint16_t>>& ds_features,
+                         std::vector<int64_t>& image_token_positions);
+
     // ── Text pipeline ─────────────────────────────────────
     Status RunTextDecoder(uint16_t* hidden_states, int32_t seq_len,
                           const float* cos, const float* sin,
@@ -74,9 +90,19 @@ private:
                           const std::vector<std::vector<uint16_t>>& ds_features,
                           const std::vector<int64_t>& image_token_positions);
 
+    // ── Pooling ────────────────────────────────────────────
+    Status RunPooling(const uint16_t* hidden_states, int64_t seq_len,
+                      int64_t hidden_size, InferResult& result);
+
     // ── Helpers ───────────────────────────────────────────
     Status ExecuteGraph(OperationHandle& graph,
                         atb::VariantPack& vp);
+
+    void InjectDeepstack(NpuTensor& hidden_npu,
+                         const std::vector<uint16_t>& ds_feat,
+                         const std::vector<int64_t>& positions,
+                         int64_t seq_len, int64_t hidden_size,
+                         int64_t vis_embed_dim);
 
     /// Compute fast_pos_embed_interpolate on CPU.
     void ComputePosEmbedInterp(const int64_t* grid_thw, int64_t num_images,
@@ -92,8 +118,8 @@ private:
 
     /// Find image token positions in input_ids.
     std::vector<int64_t> FindImageTokenPositions(const int64_t* input_ids,
-                                                  int64_t seq_len);
+                                                 int64_t seq_len);
 };
 
-} // namespace adapters
-} // namespace atb_llm
+}  // namespace adapters
+}  // namespace atb_llm

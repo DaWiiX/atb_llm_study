@@ -1,5 +1,6 @@
 #include "adapters/qwen3vl_embedding/qwen3vl_preprocess.h"
 #include "adapters/qwen3vl_embedding/qwen3vl_weights.h"
+#include "utils/float_utils.h"
 #include "log/logger.h"
 #include <cmath>
 #include <algorithm>
@@ -14,17 +15,21 @@ void SmartResize(int32_t height, int32_t width,
                  int32_t& new_height, int32_t& new_width) {
     // Round to nearest multiple of factor
     int32_t h_bar = static_cast<int32_t>(std::round(
-        static_cast<float>(height) / factor)) * factor;
+                        static_cast<float>(height) / factor)) *
+                    factor;
     int32_t w_bar = static_cast<int32_t>(std::round(
-        static_cast<float>(width) / factor)) * factor;
+                        static_cast<float>(width) / factor)) *
+                    factor;
 
     int64_t area = static_cast<int64_t>(h_bar) * w_bar;
     if (area > max_pixels) {
         double beta = std::sqrt(static_cast<double>(height * width) / max_pixels);
         h_bar = std::max(factor, static_cast<int32_t>(
-            std::floor(height / beta / factor)) * factor);
+                                     std::floor(height / beta / factor)) *
+                                     factor);
         w_bar = std::max(factor, static_cast<int32_t>(
-            std::floor(width / beta / factor)) * factor);
+                                     std::floor(width / beta / factor)) *
+                                     factor);
     } else if (area < min_pixels) {
         double beta = std::sqrt(static_cast<double>(min_pixels) / (height * width));
         h_bar = static_cast<int32_t>(std::ceil(height * beta / factor)) * factor;
@@ -116,7 +121,7 @@ Status PreprocessImage(const uint8_t* image,
     }
 
     // 4. Pad to temporal_patch_size (single image -> 2 frames by duplicating)
-    int32_t total_frames = tp;  // For single image, we pad to tp=2
+    int32_t total_frames = tp;           // For single image, we pad to tp=2
     int32_t grid_t = total_frames / tp;  // = 1
     int32_t grid_h = new_h / patch_size;
     int32_t grid_w = new_w / patch_size;
@@ -158,9 +163,9 @@ Status PreprocessImage(const uint8_t* image,
                                 int64_t col = bc * merge_size * patch_size + ic * patch_size + pw;
                                 float val = resized[c * new_h * new_w + row * new_w + col];
                                 // Store as fp16
-                                uint16_t fp16_val = Bf16ToFp16(
+                                uint16_t fp16_val = atb_llm::Bf16ToFp16(
                                     static_cast<uint16_t>(
-                                        reinterpret_cast<uint32_t&>(val) >> 16));
+                                        FloatToUint32(val) >> 16));
                                 pixel_values[patch_idx * patch_dim + offset] = fp16_val;
                                 offset++;
                             }
@@ -173,9 +178,9 @@ Status PreprocessImage(const uint8_t* image,
                                 int64_t row = br * merge_size * patch_size + ir * patch_size + ph;
                                 int64_t col = bc * merge_size * patch_size + ic * patch_size + pw;
                                 float val = resized[c * new_h * new_w + row * new_w + col];
-                                uint16_t fp16_val = Bf16ToFp16(
+                                uint16_t fp16_val = atb_llm::Bf16ToFp16(
                                     static_cast<uint16_t>(
-                                        reinterpret_cast<uint32_t&>(val) >> 16));
+                                        FloatToUint32(val) >> 16));
                                 pixel_values[patch_idx * patch_dim + offset] = fp16_val;
                                 offset++;
                             }
@@ -196,5 +201,5 @@ Status PreprocessImage(const uint8_t* image,
     return STATUS_OK;
 }
 
-} // namespace adapters
-} // namespace atb_llm
+}  // namespace adapters
+}  // namespace atb_llm

@@ -1,4 +1,5 @@
 #include "adapters/qwen3vl_embedding/qwen3vl_weights.h"
+#include "utils/float_utils.h"
 #include "io/safetensors_reader.h"
 #include "log/logger.h"
 #include "safetensors.hh"
@@ -7,51 +8,6 @@
 
 namespace atb_llm {
 namespace adapters {
-
-// ═════════════════════════════════════════════════════════════════════
-// bf16 -> fp16 conversion
-// ═════════════════════════════════════════════════════════════════════
-
-uint16_t Bf16ToFp16(uint16_t bf16_bits) {
-    // bf16: 1 sign + 8 exp + 7 mantissa (stored in upper 16 bits of float32)
-    // fp16: 1 sign + 5 exp + 10 mantissa
-    //
-    // Strategy: bf16 -> float32 -> fp16
-    // We do this with bit manipulation to avoid FPU dependency.
-    uint32_t f32_bits = static_cast<uint32_t>(bf16_bits) << 16;
-    uint32_t sign = (f32_bits >> 16) & 0x8000;
-    int32_t exp = static_cast<int32_t>((f32_bits >> 23) & 0xFF) - 127;
-
-    if (exp == 128) {
-        // Inf or NaN -> clamp to fp16 inf
-        return static_cast<uint16_t>(sign | 0x7C00);
-    }
-    if (exp < -24) {
-        // Too small for fp16 denormals -> zero
-        return static_cast<uint16_t>(sign);
-    }
-    if (exp < -14) {
-        // fp16 denormal range
-        uint32_t mantissa = (f32_bits & 0x7FFFFF) | 0x800000;
-        int32_t shift = -14 - exp;
-        mantissa >>= (shift + 13);
-        return static_cast<uint16_t>(sign | mantissa);
-    }
-    if (exp > 15) {
-        // Overflow -> fp16 max
-        return static_cast<uint16_t>(sign | 0x7C00);
-    }
-    // Normal fp16
-    uint16_t fp16_exp = static_cast<uint16_t>(exp + 15);
-    uint16_t fp16_mantissa = static_cast<uint16_t>((f32_bits >> 13) & 0x3FF);
-    return static_cast<uint16_t>(sign | (fp16_exp << 10) | fp16_mantissa);
-}
-
-void Bf16ToFp16Buffer(const uint16_t* src, uint16_t* dst, size_t num_elements) {
-    for (size_t i = 0; i < num_elements; i++) {
-        dst[i] = Bf16ToFp16(src[i]);
-    }
-}
 
 // ═════════════════════════════════════════════════════════════════════
 // Helper: copy weight tensor to NPU as float16
@@ -78,7 +34,8 @@ static Status CopyWeightToFp16NPU(WeightLoader& loader,
 
     std::vector<int64_t> shape(info.shape.begin(), info.shape.end());
     size_t num_elements = 1;
-    for (auto d : shape) num_elements *= static_cast<size_t>(d);
+    for (auto d : shape)
+        num_elements *= static_cast<size_t>(d);
 
     auto st_dtype = static_cast<safetensors::dtype>(info.dtype);
 
@@ -91,8 +48,8 @@ static Status CopyWeightToFp16NPU(WeightLoader& loader,
     } else if (st_dtype == safetensors::kBFLOAT16) {
         // Convert bf16 -> fp16
         std::vector<uint16_t> fp16_buf(num_elements);
-        Bf16ToFp16Buffer(reinterpret_cast<const uint16_t*>(data),
-                         fp16_buf.data(), num_elements);
+        atb_llm::Bf16ToFp16Buffer(reinterpret_cast<const uint16_t*>(data),
+                                  fp16_buf.data(), num_elements);
         s = alloc.AllocFloat16(dst, shape);
         if (s != STATUS_OK) return s;
         return alloc.CopyToDevice(dst, fp16_buf.data(), num_elements * sizeof(uint16_t));
@@ -106,7 +63,7 @@ static Status CopyWeightToFp16NPU(WeightLoader& loader,
             uint32_t f32_bits;
             std::memcpy(&f32_bits, &f32_ptr[i], sizeof(uint32_t));
             uint16_t bf16 = static_cast<uint16_t>(f32_bits >> 16);
-            fp16_buf[i] = Bf16ToFp16(bf16);
+            fp16_buf[i] = atb_llm::Bf16ToFp16(bf16);
         }
         s = alloc.AllocFloat16(dst, shape);
         if (s != STATUS_OK) return s;
@@ -137,7 +94,8 @@ static Status CopyWeightToFp16Host(WeightLoader& loader,
     if (!data) return ERROR_WEIGHT_LOAD;
 
     size_t num_elements = 1;
-    for (auto d : info.shape) num_elements *= d;
+    for (auto d : info.shape)
+        num_elements *= d;
 
     auto st_dtype = static_cast<safetensors::dtype>(info.dtype);
     size_t required_bytes = num_elements * sizeof(uint16_t);
@@ -151,8 +109,8 @@ static Status CopyWeightToFp16Host(WeightLoader& loader,
     if (st_dtype == safetensors::kFLOAT16) {
         std::memcpy(host_dst, data, info.nbytes);
     } else if (st_dtype == safetensors::kBFLOAT16) {
-        Bf16ToFp16Buffer(reinterpret_cast<const uint16_t*>(data),
-                         reinterpret_cast<uint16_t*>(host_dst), num_elements);
+        atb_llm::Bf16ToFp16Buffer(reinterpret_cast<const uint16_t*>(data),
+                                  reinterpret_cast<uint16_t*>(host_dst), num_elements);
     } else if (st_dtype == safetensors::kFLOAT32) {
         const float* f32_ptr = reinterpret_cast<const float*>(data);
         uint16_t* dst16 = reinterpret_cast<uint16_t*>(host_dst);
@@ -160,7 +118,7 @@ static Status CopyWeightToFp16Host(WeightLoader& loader,
             uint32_t f32_bits;
             std::memcpy(&f32_bits, &f32_ptr[i], sizeof(uint32_t));
             uint16_t bf16 = static_cast<uint16_t>(f32_bits >> 16);
-            dst16[i] = Bf16ToFp16(bf16);
+            dst16[i] = atb_llm::Bf16ToFp16(bf16);
         }
     } else {
         LOG_ERROR("Unsupported dtype for host copy %s: %d", key.c_str(), info.dtype);
@@ -186,17 +144,28 @@ static Status LoadTextLayerWeights(WeightLoader& loader,
     };
 
     Status s;
-    s = load("self_attn.q_proj.weight", w.q_weight); if (s != STATUS_OK) return s;
-    s = load("self_attn.k_proj.weight", w.k_weight); if (s != STATUS_OK) return s;
-    s = load("self_attn.v_proj.weight", w.v_weight); if (s != STATUS_OK) return s;
-    s = load("self_attn.o_proj.weight", w.o_weight); if (s != STATUS_OK) return s;
-    s = load("self_attn.q_norm.weight", w.q_norm_weight); if (s != STATUS_OK) return s;
-    s = load("self_attn.k_norm.weight", w.k_norm_weight); if (s != STATUS_OK) return s;
-    s = load("mlp.gate_proj.weight", w.gate_weight); if (s != STATUS_OK) return s;
-    s = load("mlp.up_proj.weight", w.up_weight); if (s != STATUS_OK) return s;
-    s = load("mlp.down_proj.weight", w.down_weight); if (s != STATUS_OK) return s;
-    s = load("input_layernorm.weight", w.input_ln_weight); if (s != STATUS_OK) return s;
-    s = load("post_attention_layernorm.weight", w.post_ln_weight); if (s != STATUS_OK) return s;
+    s = load("self_attn.q_proj.weight", w.q_weight);
+    if (s != STATUS_OK) return s;
+    s = load("self_attn.k_proj.weight", w.k_weight);
+    if (s != STATUS_OK) return s;
+    s = load("self_attn.v_proj.weight", w.v_weight);
+    if (s != STATUS_OK) return s;
+    s = load("self_attn.o_proj.weight", w.o_weight);
+    if (s != STATUS_OK) return s;
+    s = load("self_attn.q_norm.weight", w.q_norm_weight);
+    if (s != STATUS_OK) return s;
+    s = load("self_attn.k_norm.weight", w.k_norm_weight);
+    if (s != STATUS_OK) return s;
+    s = load("mlp.gate_proj.weight", w.gate_weight);
+    if (s != STATUS_OK) return s;
+    s = load("mlp.up_proj.weight", w.up_weight);
+    if (s != STATUS_OK) return s;
+    s = load("mlp.down_proj.weight", w.down_weight);
+    if (s != STATUS_OK) return s;
+    s = load("input_layernorm.weight", w.input_ln_weight);
+    if (s != STATUS_OK) return s;
+    s = load("post_attention_layernorm.weight", w.post_ln_weight);
+    if (s != STATUS_OK) return s;
 
     return STATUS_OK;
 }
@@ -213,18 +182,30 @@ static Status LoadVisionBlockWeights(WeightLoader& loader,
     };
 
     Status s;
-    s = load("attn.qkv.weight", w.qkv_weight); if (s != STATUS_OK) return s;
-    s = load("attn.qkv.bias", w.qkv_bias); if (s != STATUS_OK) return s;
-    s = load("attn.proj.weight", w.proj_weight); if (s != STATUS_OK) return s;
-    s = load("attn.proj.bias", w.proj_bias); if (s != STATUS_OK) return s;
-    s = load("mlp.linear_fc1.weight", w.fc1_weight); if (s != STATUS_OK) return s;
-    s = load("mlp.linear_fc1.bias", w.fc1_bias); if (s != STATUS_OK) return s;
-    s = load("mlp.linear_fc2.weight", w.fc2_weight); if (s != STATUS_OK) return s;
-    s = load("mlp.linear_fc2.bias", w.fc2_bias); if (s != STATUS_OK) return s;
-    s = load("norm1.weight", w.n1_weight); if (s != STATUS_OK) return s;
-    s = load("norm1.bias", w.n1_bias); if (s != STATUS_OK) return s;
-    s = load("norm2.weight", w.n2_weight); if (s != STATUS_OK) return s;
-    s = load("norm2.bias", w.n2_bias); if (s != STATUS_OK) return s;
+    s = load("attn.qkv.weight", w.qkv_weight);
+    if (s != STATUS_OK) return s;
+    s = load("attn.qkv.bias", w.qkv_bias);
+    if (s != STATUS_OK) return s;
+    s = load("attn.proj.weight", w.proj_weight);
+    if (s != STATUS_OK) return s;
+    s = load("attn.proj.bias", w.proj_bias);
+    if (s != STATUS_OK) return s;
+    s = load("mlp.linear_fc1.weight", w.fc1_weight);
+    if (s != STATUS_OK) return s;
+    s = load("mlp.linear_fc1.bias", w.fc1_bias);
+    if (s != STATUS_OK) return s;
+    s = load("mlp.linear_fc2.weight", w.fc2_weight);
+    if (s != STATUS_OK) return s;
+    s = load("mlp.linear_fc2.bias", w.fc2_bias);
+    if (s != STATUS_OK) return s;
+    s = load("norm1.weight", w.n1_weight);
+    if (s != STATUS_OK) return s;
+    s = load("norm1.bias", w.n1_bias);
+    if (s != STATUS_OK) return s;
+    s = load("norm2.weight", w.n2_weight);
+    if (s != STATUS_OK) return s;
+    s = load("norm2.bias", w.n2_bias);
+    if (s != STATUS_OK) return s;
 
     return STATUS_OK;
 }
@@ -238,12 +219,18 @@ static Status LoadMergerWeights(WeightLoader& loader,
     };
 
     Status s;
-    s = load("norm.weight", w.norm_weight); if (s != STATUS_OK) return s;
-    s = load("norm.bias", w.norm_bias); if (s != STATUS_OK) return s;
-    s = load("linear_fc1.weight", w.fc1_weight); if (s != STATUS_OK) return s;
-    s = load("linear_fc1.bias", w.fc1_bias); if (s != STATUS_OK) return s;
-    s = load("linear_fc2.weight", w.fc2_weight); if (s != STATUS_OK) return s;
-    s = load("linear_fc2.bias", w.fc2_bias); if (s != STATUS_OK) return s;
+    s = load("norm.weight", w.norm_weight);
+    if (s != STATUS_OK) return s;
+    s = load("norm.bias", w.norm_bias);
+    if (s != STATUS_OK) return s;
+    s = load("linear_fc1.weight", w.fc1_weight);
+    if (s != STATUS_OK) return s;
+    s = load("linear_fc1.bias", w.fc1_bias);
+    if (s != STATUS_OK) return s;
+    s = load("linear_fc2.weight", w.fc2_weight);
+    if (s != STATUS_OK) return s;
+    s = load("linear_fc2.bias", w.fc2_bias);
+    if (s != STATUS_OK) return s;
 
     return STATUS_OK;
 }
@@ -298,34 +285,31 @@ Status LoadQwen3VLWeights(const std::string& model_dir,
         }
 
         weights.embed_vocab_size = 1;
-        for (auto d : emb_info.shape) weights.embed_vocab_size *= static_cast<int64_t>(d);
+        for (auto d : emb_info.shape)
+            weights.embed_vocab_size *= static_cast<int64_t>(d);
         weights.embed_vocab_size /= config.text_hidden_size;
         weights.embed_hidden_size = config.text_hidden_size;
 
         size_t num_elements = static_cast<size_t>(weights.embed_vocab_size) * config.text_hidden_size;
         size_t host_bytes = num_elements * sizeof(uint16_t);
-        weights.embed_weight_host = std::malloc(host_bytes);
-        if (!weights.embed_weight_host) {
-            LOG_ERROR("Failed to allocate host memory for embedding: %zu bytes", host_bytes);
-            return ERROR_NPU_MEMORY;
-        }
+        weights.embed_weight_host.resize(num_elements);
 
         // Copy embedding to host as fp16
         auto st_dtype = static_cast<safetensors::dtype>(emb_info.dtype);
         if (st_dtype == safetensors::kBFLOAT16) {
-            Bf16ToFp16Buffer(reinterpret_cast<const uint16_t*>(emb_data),
-                             reinterpret_cast<uint16_t*>(weights.embed_weight_host),
-                             num_elements);
+            atb_llm::Bf16ToFp16Buffer(reinterpret_cast<const uint16_t*>(emb_data),
+                                      weights.embed_weight_host.data(),
+                                      num_elements);
         } else if (st_dtype == safetensors::kFLOAT16) {
-            std::memcpy(weights.embed_weight_host, emb_data, host_bytes);
+            std::memcpy(weights.embed_weight_host.data(), emb_data, host_bytes);
         } else if (st_dtype == safetensors::kFLOAT32) {
             // Convert fp32 -> fp16
             const float* f32 = reinterpret_cast<const float*>(emb_data);
-            uint16_t* dst16 = reinterpret_cast<uint16_t*>(weights.embed_weight_host);
+            uint16_t* dst16 = weights.embed_weight_host.data();
             for (size_t i = 0; i < num_elements; i++) {
                 uint32_t bits;
                 std::memcpy(&bits, &f32[i], sizeof(uint32_t));
-                dst16[i] = Bf16ToFp16(static_cast<uint16_t>(bits >> 16));
+                dst16[i] = atb_llm::Bf16ToFp16(static_cast<uint16_t>(bits >> 16));
             }
         }
         LOG_INFO("Embedding weight loaded to host: vocab=%ld, hs=%ld",
@@ -365,13 +349,14 @@ Status LoadQwen3VLWeights(const std::string& model_dir,
 
         // Copy to host, convert to fp16, reshape
         size_t num_pe_elements = 1;
-        for (auto d : pe_info.shape) num_pe_elements *= d;
+        for (auto d : pe_info.shape)
+            num_pe_elements *= d;
         std::vector<uint16_t> pe_fp16(num_pe_elements);
 
         auto st_dtype = static_cast<safetensors::dtype>(pe_info.dtype);
         if (st_dtype == safetensors::kBFLOAT16) {
-            Bf16ToFp16Buffer(reinterpret_cast<const uint16_t*>(pe_data),
-                             pe_fp16.data(), num_pe_elements);
+            atb_llm::Bf16ToFp16Buffer(reinterpret_cast<const uint16_t*>(pe_data),
+                                      pe_fp16.data(), num_pe_elements);
         } else if (st_dtype == safetensors::kFLOAT16) {
             std::memcpy(pe_fp16.data(), pe_data, num_pe_elements * sizeof(uint16_t));
         } else {
@@ -422,5 +407,5 @@ Status LoadQwen3VLWeights(const std::string& model_dir,
     return STATUS_OK;
 }
 
-} // namespace adapters
-} // namespace atb_llm
+}  // namespace adapters
+}  // namespace atb_llm
