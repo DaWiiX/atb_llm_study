@@ -14,6 +14,7 @@
 
 #include "atb_llm/types.h"
 #include "atb_llm/engine.h"
+#include "utils/float_utils.h"
 #include "log/logger.h"
 
 #include <cstdio>
@@ -21,34 +22,6 @@
 #include <vector>
 #include <cmath>
 #include <cstdint>
-
-// ── fp16 -> fp32 conversion (IEEE 754 bit manipulation) ──
-static inline float Fp16ToF32(uint16_t fp16_bits) {
-    uint32_t sign = (fp16_bits >> 15) & 1;
-    uint32_t exp = (fp16_bits >> 10) & 0x1F;
-    uint32_t mantissa = fp16_bits & 0x3FF;
-    uint32_t f32_bits;
-    if (exp == 0) {
-        if (mantissa == 0) {
-            f32_bits = sign << 31;
-        } else {
-            // Denormalized fp16 -> normalize for fp32
-            exp = 1;
-            while (!(mantissa & 0x400)) { mantissa <<= 1; exp--; }
-            mantissa &= 0x3FF;
-            f32_bits = (sign << 31) | ((exp + 127 - 15) << 23) | (mantissa << 13);
-        }
-    } else if (exp == 31) {
-        // Inf or NaN
-        f32_bits = (sign << 31) | 0x7F800000 | (mantissa << 13);
-    } else {
-        // Normalized
-        f32_bits = (sign << 31) | ((exp + 127 - 15) << 23) | (mantissa << 13);
-    }
-    float val;
-    std::memcpy(&val, &f32_bits, sizeof(float));
-    return val;
-}
 
 #define IS_OK(s) ((s) == atb_llm::STATUS_OK)
 
@@ -102,7 +75,7 @@ int main(int argc, char** argv) {
     if (result.dtype == ACL_FLOAT16) {
         const uint16_t* fp16_data = result.As<uint16_t>();
         for (int64_t i = 0; i < dim; i++) {
-            fp32_data[i] = Fp16ToF32(fp16_data[i]);
+            fp32_data[i] = atb_llm::Fp16ToF32(fp16_data[i]);
         }
         LOG_INFO("Converted fp16 -> fp32 (%ld elements)", static_cast<long>(dim));
     } else if (result.dtype == ACL_FLOAT) {

@@ -12,6 +12,9 @@
  * Requires: NPU device + ATB/ACL runtime.
  */
 
+#define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+#include "doctest.h"
+
 #include "atb_llm/types.h"
 #include "atb_llm/runtime.h"
 #include "core/raii.h"
@@ -56,60 +59,46 @@
 #include <vector>
 #include <cmath>
 
-static int test_count = 0;
-static int pass_count = 0;
-
-#define TEST_ASSERT(cond, msg)                                          \
-    do {                                                                \
-        test_count++;                                                   \
-        if (!(cond)) {                                                  \
-            LOG_ERROR("FAIL: %s (%s:%d)", msg, __FILE__, __LINE__);    \
-        } else {                                                        \
-            pass_count++;                                               \
-            LOG_INFO("PASS: %s", msg);                                 \
-        }                                                               \
-    } while (0)
-
 #define IS_OK(s) ((s) == atb_llm::STATUS_OK)
 
 // ══════════════════════════════════════════════════════════
 // Test: New Op creation
 // ══════════════════════════════════════════════════════════
-void test_new_op_creation() {
+TEST_CASE("New Op Creation") {
     LOG_INFO("=== Test: New Op Creation (Phase 3) ===");
 
     // LayerNorm
     {
         auto op = atb_llm::ops::LayerNormOp::Create();
-        TEST_ASSERT(op.get() != nullptr, "LayerNormOp::Create() returns non-null");
+        CHECK(op.get() != nullptr);
     }
     {
         auto op = atb_llm::ops::LayerNormOp::Create(1e-5f, -1, -1);
-        TEST_ASSERT(op.get() != nullptr, "LayerNormOp::Create(with_params) returns non-null");
+        CHECK(op.get() != nullptr);
     }
 
     // SetValue
     {
         auto op = atb_llm::ops::SetValueOp::Create({0, 0}, {1, 10});
-        TEST_ASSERT(op.get() != nullptr, "SetValueOp::Create() returns non-null");
+        CHECK(op.get() != nullptr);
     }
 
     // Gather
     {
         auto op = atb_llm::ops::GatherOp::Create(0, 0);
-        TEST_ASSERT(op.get() != nullptr, "GatherOp::Create() returns non-null");
+        CHECK(op.get() != nullptr);
     }
 
     // Reduce
     {
         auto op = atb_llm::ops::ReduceOp::Create(
             atb_llm::ops::ReduceOp::ReduceType::MAX, {0});
-        TEST_ASSERT(op.get() != nullptr, "ReduceOp::Create(MAX) returns non-null");
+        CHECK(op.get() != nullptr);
     }
     {
         auto op = atb_llm::ops::ReduceOp::Create(
             atb_llm::ops::ReduceOp::ReduceType::SUM, {1});
-        TEST_ASSERT(op.get() != nullptr, "ReduceOp::Create(SUM) returns non-null");
+        CHECK(op.get() != nullptr);
     }
 
     LOG_INFO("New op creation tests done");
@@ -118,86 +107,78 @@ void test_new_op_creation() {
 // ══════════════════════════════════════════════════════════
 // Test: Vision Component graph builds
 // ══════════════════════════════════════════════════════════
-void test_vision_attention_graph() {
+TEST_CASE("VisionAttentionGraph") {
     LOG_INFO("=== Test: VisionAttentionGraph ===");
 
     atb_llm::OperationHandle op;
     atb_llm::Status s = atb_llm::components::VisionAttentionGraph::Build(
         "TestVisAttn", 16, 80, op);
-    TEST_ASSERT(IS_OK(s), "VisionAttentionGraph::Build succeeds");
-    TEST_ASSERT(op.get() != nullptr, "VisionAttentionGraph returns non-null");
+    CHECK(IS_OK(s));
+    CHECK(op.get() != nullptr);
 
     if (op) {
         // 8 inputs: hidden, qkv_w, qkv_b, proj_w, proj_b, c, s, seq
-        TEST_ASSERT(op.get()->GetInputNum() == 8,
-                    "VisionAttentionGraph has 8 inputs");
-        TEST_ASSERT(op.get()->GetOutputNum() == 1,
-                    "VisionAttentionGraph has 1 output");
+        CHECK(op.get()->GetInputNum() == 8);
+        CHECK(op.get()->GetOutputNum() == 1);
     }
 
     LOG_INFO("VisionAttentionGraph test done");
 }
 
-void test_vision_mlp_graph() {
+TEST_CASE("VisionMlpGraph") {
     LOG_INFO("=== Test: VisionMlpGraph ===");
 
     atb_llm::OperationHandle op;
     atb_llm::Status s = atb_llm::components::VisionMlpGraph::Build("TestVisMLP", op);
-    TEST_ASSERT(IS_OK(s), "VisionMlpGraph::Build succeeds");
-    TEST_ASSERT(op.get() != nullptr, "VisionMlpGraph returns non-null");
+    CHECK(IS_OK(s));
+    CHECK(op.get() != nullptr);
 
     if (op) {
         // 5 inputs: hidden, fc1_w, fc1_b, fc2_w, fc2_b
-        TEST_ASSERT(op.get()->GetInputNum() == 5,
-                    "VisionMlpGraph has 5 inputs");
-        TEST_ASSERT(op.get()->GetOutputNum() == 1,
-                    "VisionMlpGraph has 1 output");
+        CHECK(op.get()->GetInputNum() == 5);
+        CHECK(op.get()->GetOutputNum() == 1);
     }
 
     LOG_INFO("VisionMlpGraph test done");
 }
 
-void test_vision_block_graph() {
+TEST_CASE("VisionBlockGraph") {
     LOG_INFO("=== Test: VisionBlockGraph ===");
 
     atb_llm::OperationHandle op;
     atb_llm::Status s = atb_llm::components::VisionBlockGraph::Build(
         "TestVisBlock", 16, 80, 1e-6f, op);
-    TEST_ASSERT(IS_OK(s), "VisionBlockGraph::Build succeeds");
-    TEST_ASSERT(op.get() != nullptr, "VisionBlockGraph returns non-null");
+    CHECK(IS_OK(s));
+    CHECK(op.get() != nullptr);
 
     if (op) {
         // 16 inputs: hidden + 4 attn + 4 mlp + 4 norm + cos + sin + seqlen
-        TEST_ASSERT(op.get()->GetInputNum() == 16,
-                    "VisionBlockGraph has 16 inputs");
-        TEST_ASSERT(op.get()->GetOutputNum() == 1,
-                    "VisionBlockGraph has 1 output");
+        CHECK(op.get()->GetInputNum() == 16);
+        CHECK(op.get()->GetOutputNum() == 1);
     }
 
     LOG_INFO("VisionBlockGraph test done");
 }
 
-void test_patch_embed_graph() {
+TEST_CASE("PatchEmbedGraph") {
     LOG_INFO("=== Test: PatchEmbedGraph ===");
 
     atb_llm::OperationHandle op;
     atb_llm::Status s = atb_llm::components::PatchEmbedGraph::Build(
         "TestPatchEmbed", 3, 2, 14, 1280, op);
-    TEST_ASSERT(IS_OK(s), "PatchEmbedGraph::Build succeeds");
-    TEST_ASSERT(op.get() != nullptr, "PatchEmbedGraph returns non-null");
+    CHECK(IS_OK(s));
+    CHECK(op.get() != nullptr);
 
     if (op) {
         // 3 inputs: pixels, w, b
-        TEST_ASSERT(op.get()->GetInputNum() == 3,
-                    "PatchEmbedGraph has 3 inputs");
-        TEST_ASSERT(op.get()->GetOutputNum() == 1,
-                    "PatchEmbedGraph has 1 output");
+        CHECK(op.get()->GetInputNum() == 3);
+        CHECK(op.get()->GetOutputNum() == 1);
     }
 
     LOG_INFO("PatchEmbedGraph test done");
 }
 
-void test_vision_merger_graph() {
+TEST_CASE("VisionMergerGraph") {
     LOG_INFO("=== Test: VisionMergerGraph ===");
 
     // Main merger
@@ -205,11 +186,10 @@ void test_vision_merger_graph() {
         atb_llm::OperationHandle op;
         atb_llm::Status s = atb_llm::components::VisionMergerGraph::Build(
             "TestMerger", 1280, 2, false, 1e-6f, op);
-        TEST_ASSERT(IS_OK(s), "VisionMergerGraph::Build(main) succeeds");
-        TEST_ASSERT(op.get() != nullptr, "VisionMergerGraph(main) returns non-null");
+        CHECK(IS_OK(s));
+        CHECK(op.get() != nullptr);
         if (op) {
-            TEST_ASSERT(op.get()->GetInputNum() == 7,
-                        "VisionMergerGraph has 7 inputs");
+            CHECK(op.get()->GetInputNum() == 7);
         }
     }
 
@@ -218,25 +198,24 @@ void test_vision_merger_graph() {
         atb_llm::OperationHandle op;
         atb_llm::Status s = atb_llm::components::VisionMergerGraph::Build(
             "TestDSMerger", 1280, 2, true, 1e-6f, op);
-        TEST_ASSERT(IS_OK(s), "VisionMergerGraph::Build(deepstack) succeeds");
-        TEST_ASSERT(op.get() != nullptr, "VisionMergerGraph(deepstack) returns non-null");
+        CHECK(IS_OK(s));
+        CHECK(op.get() != nullptr);
     }
 
     LOG_INFO("VisionMergerGraph test done");
 }
 
-void test_deepstack_graph() {
+TEST_CASE("DeepstackGraph") {
     LOG_INFO("=== Test: DeepstackGraph ===");
 
     atb_llm::OperationHandle op;
     atb_llm::Status s = atb_llm::components::DeepstackGraph::Build(
         "TestDeepstack", 1280, 2, 1e-6f, op);
-    TEST_ASSERT(IS_OK(s), "DeepstackGraph::Build succeeds");
-    TEST_ASSERT(op.get() != nullptr, "DeepstackGraph returns non-null");
+    CHECK(IS_OK(s));
+    CHECK(op.get() != nullptr);
 
     if (op) {
-        TEST_ASSERT(op.get()->GetInputNum() == 7,
-                    "DeepstackGraph has 7 inputs");
+        CHECK(op.get()->GetInputNum() == 7);
     }
 
     LOG_INFO("DeepstackGraph test done");
@@ -245,7 +224,7 @@ void test_deepstack_graph() {
 // ══════════════════════════════════════════════════════════
 // Test: Vision Model graph builds
 // ══════════════════════════════════════════════════════════
-void test_vision_model() {
+TEST_CASE("VisionModel") {
     LOG_INFO("=== Test: VisionModel ===");
 
     atb_llm::models::VisionModel::Config cfg;
@@ -259,22 +238,17 @@ void test_vision_model() {
 
     atb_llm::models::VisionModel model(cfg);
     atb_llm::Status s = model.Build();
-    TEST_ASSERT(IS_OK(s), "VisionModel::Build succeeds");
+    CHECK(IS_OK(s));
 
-    TEST_ASSERT(model.GetFirstLayerGraph().get() != nullptr,
-                "VisionModel first_layer_graph is non-null");
-    TEST_ASSERT(model.GetBlockGraph().get() != nullptr,
-                "VisionModel block_graph is non-null");
-    TEST_ASSERT(model.GetMergerGraph().get() != nullptr,
-                "VisionModel merger_graph is non-null");
-    TEST_ASSERT(model.GetDeepstackGraph().get() != nullptr,
-                "VisionModel deepstack_graph is non-null");
+    CHECK(model.GetFirstLayerGraph().get() != nullptr);
+    CHECK(model.GetBlockGraph().get() != nullptr);
+    CHECK(model.GetMergerGraph().get() != nullptr);
+    CHECK(model.GetDeepstackGraph().get() != nullptr);
 
     // Verify first layer input count
     if (model.GetFirstLayerGraph()) {
         // 19 inputs: pixels, pe_w, pe_b, pos, c, s, seq, + 12 block weights
-        TEST_ASSERT(model.GetFirstLayerGraph().get()->GetInputNum() == 19,
-                    "VisionFirstLayer has 19 inputs");
+        CHECK(model.GetFirstLayerGraph().get()->GetInputNum() == 19);
     }
 
     LOG_INFO("VisionModel test done");
@@ -283,7 +257,7 @@ void test_vision_model() {
 // ══════════════════════════════════════════════════════════
 // Test: MRoPE (CPU)
 // ══════════════════════════════════════════════════════════
-void test_mrope() {
+TEST_CASE("MRoPE") {
     LOG_INFO("=== Test: MRoPE ===");
 
     // Text MRoPE
@@ -305,33 +279,36 @@ void test_mrope() {
         // Verify cos/sin are not all zeros and cos(0) = 1
         bool has_nonzero = false;
         for (auto v : cos_out) {
-            if (v != 0.0f) { has_nonzero = true; break; }
+            if (v != 0.0f) {
+                has_nonzero = true;
+                break;
+            }
         }
-        TEST_ASSERT(has_nonzero, "MRoPE cos output is not all zeros");
+        CHECK(has_nonzero);
 
         // cos(0) should be ~1.0
-        TEST_ASSERT(std::fabs(cos_out[0] - 1.0f) < 0.01f,
-                    "MRoPE cos(0) is approximately 1.0");
+        CHECK(std::fabs(cos_out[0] - 1.0f) < 0.01f);
 
         // sin(0) should be ~0.0
-        TEST_ASSERT(std::fabs(sin_out[0]) < 0.01f,
-                    "MRoPE sin(0) is approximately 0.0");
+        CHECK(std::fabs(sin_out[0]) < 0.01f);
     }
 
     // VisionRotaryEmbedding
     {
         atb_llm::components::VisionRotaryEmbedding vre(80);
         auto table = vre.ComputeFreqTable(48);
-        TEST_ASSERT(!table.empty(), "VisionRotaryEmbedding freq table is not empty");
-        TEST_ASSERT(table.size() == static_cast<size_t>(48 * 80),
-                    "VisionRotaryEmbedding freq table size is 48*80");
+        CHECK(!table.empty());
+        CHECK(table.size() == static_cast<size_t>(48 * 80));
 
         // freq_table[0] should be all zeros (pos=0)
         bool all_zero = true;
         for (int d = 0; d < 80; d++) {
-            if (table[d] != 0.0f) { all_zero = false; break; }
+            if (table[d] != 0.0f) {
+                all_zero = false;
+                break;
+            }
         }
-        TEST_ASSERT(all_zero, "VisionRotaryEmbedding freq_table[0] is all zeros");
+        CHECK(all_zero);
     }
 
     // GetRopeIndex (text-only)
@@ -345,10 +322,13 @@ void test_mrope() {
         bool correct = true;
         for (int d = 0; d < 3; d++) {
             for (int s = 0; s < 5; s++) {
-                if (pos_ids[d * 5 + s] != s) { correct = false; break; }
+                if (pos_ids[d * 5 + s] != s) {
+                    correct = false;
+                    break;
+                }
             }
         }
-        TEST_ASSERT(correct, "GetRopeIndex(text-only) returns sequential positions");
+        CHECK(correct);
     }
 
     LOG_INFO("MRoPE test done");
@@ -357,12 +337,11 @@ void test_mrope() {
 // ══════════════════════════════════════════════════════════
 // Test: Vision component NPU execution
 // ══════════════════════════════════════════════════════════
-void test_vision_execute() {
+TEST_CASE("Vision Component Execute") {
     LOG_INFO("=== Test: Vision Component Execute on NPU ===");
 
     auto runtime = atb_llm::CreateRuntime(0, 5LL * 1024 * 1024 * 1024);
-    TEST_ASSERT(runtime != nullptr, "Runtime created for vision tests");
-    if (!runtime) return;
+    REQUIRE(runtime != nullptr);
 
     auto* alloc = runtime->GetAllocator();
     auto* ctx = runtime->GetContext();
@@ -371,8 +350,8 @@ void test_vision_execute() {
     {
         atb_llm::OperationHandle op;
         atb_llm::Status s = atb_llm::components::VisionMlpGraph::Build("ExecVisMLP", op);
-        TEST_ASSERT(IS_OK(s), "VisionMlpGraph build for execute");
-        TEST_ASSERT(op.get() != nullptr, "VisionMlpGraph non-null for execute");
+        CHECK(IS_OK(s));
+        CHECK(op.get() != nullptr);
 
         if (op) {
             int64_t seq = 4, hidden = 64, inter = 128;
@@ -402,7 +381,7 @@ void test_vision_execute() {
 
             uint64_t ws_size = 0;
             atb::Status atb_s = op.get()->Setup(vp, ws_size, ctx);
-            TEST_ASSERT(atb_s == atb::NO_ERROR, "VisionMLP Setup succeeds");
+            CHECK(atb_s == atb::NO_ERROR);
 
             if (atb_s == atb::NO_ERROR) {
                 uint8_t* ws_ptr = nullptr;
@@ -411,7 +390,7 @@ void test_vision_execute() {
                     ws_ptr = ws;
                 }
                 atb_s = op.get()->Execute(vp, ws_ptr, ws_size, ctx);
-                TEST_ASSERT(atb_s == atb::NO_ERROR, "VisionMLP Execute succeeds");
+                CHECK(atb_s == atb::NO_ERROR);
             }
 
             runtime->Synchronize();
@@ -421,9 +400,12 @@ void test_vision_execute() {
             alloc->CopyToHost(host_out.data(), output, host_out.size() * sizeof(uint16_t));
             bool non_zero = false;
             for (auto v : host_out) {
-                if (v != 0) { non_zero = true; break; }
+                if (v != 0) {
+                    non_zero = true;
+                    break;
+                }
             }
-            TEST_ASSERT(non_zero, "VisionMLP output is not all zeros");
+            CHECK(non_zero);
         }
     }
 
@@ -432,7 +414,7 @@ void test_vision_execute() {
         atb_llm::OperationHandle op;
         atb_llm::Status s = atb_llm::components::PatchEmbedGraph::Build(
             "ExecPatchEmbed", 3, 2, 14, 64, op);
-        TEST_ASSERT(IS_OK(s), "PatchEmbedGraph build for execute");
+        CHECK(IS_OK(s));
 
         if (op) {
             int64_t kernel_size = 3 * 2 * 14 * 14;  // 1176
@@ -459,7 +441,7 @@ void test_vision_execute() {
 
             uint64_t ws_size = 0;
             atb::Status atb_s = op.get()->Setup(vp, ws_size, ctx);
-            TEST_ASSERT(atb_s == atb::NO_ERROR, "PatchEmbed Setup succeeds");
+            CHECK(atb_s == atb::NO_ERROR);
 
             if (atb_s == atb::NO_ERROR) {
                 uint8_t* ws_ptr = nullptr;
@@ -468,7 +450,7 @@ void test_vision_execute() {
                     ws_ptr = ws;
                 }
                 atb_s = op.get()->Execute(vp, ws_ptr, ws_size, ctx);
-                TEST_ASSERT(atb_s == atb::NO_ERROR, "PatchEmbed Execute succeeds");
+                CHECK(atb_s == atb::NO_ERROR);
             }
 
             runtime->Synchronize();
@@ -477,9 +459,12 @@ void test_vision_execute() {
             alloc->CopyToHost(host_out.data(), output, host_out.size() * sizeof(uint16_t));
             bool non_zero = false;
             for (auto v : host_out) {
-                if (v != 0) { non_zero = true; break; }
+                if (v != 0) {
+                    non_zero = true;
+                    break;
+                }
             }
-            TEST_ASSERT(non_zero, "PatchEmbed output is not all zeros");
+            CHECK(non_zero);
         }
     }
 
@@ -489,18 +474,17 @@ void test_vision_execute() {
 // ══════════════════════════════════════════════════════════
 // Test: LayerNorm NPU execution
 // ══════════════════════════════════════════════════════════
-void test_layer_norm_execute() {
+TEST_CASE("LayerNorm Execute") {
     LOG_INFO("=== Test: LayerNorm Execute on NPU ===");
 
     auto runtime = atb_llm::CreateRuntime(0, 2LL * 1024 * 1024 * 1024);
-    TEST_ASSERT(runtime != nullptr, "Runtime created for LayerNorm test");
-    if (!runtime) return;
+    REQUIRE(runtime != nullptr);
 
     auto* alloc = runtime->GetAllocator();
     auto* ctx = runtime->GetContext();
 
     atb_llm::OperationHandle op = atb_llm::ops::LayerNormOp::Create(1e-5f);
-    TEST_ASSERT(op.get() != nullptr, "LayerNormOp created");
+    CHECK(op.get() != nullptr);
 
     if (op) {
         int64_t seq = 4, hidden = 64;
@@ -524,7 +508,7 @@ void test_layer_norm_execute() {
 
         uint64_t ws_size = 0;
         atb::Status atb_s = op.get()->Setup(vp, ws_size, ctx);
-        TEST_ASSERT(atb_s == atb::NO_ERROR, "LayerNorm Setup succeeds");
+        CHECK(atb_s == atb::NO_ERROR);
 
         if (atb_s == atb::NO_ERROR) {
             uint8_t* ws_ptr = nullptr;
@@ -533,7 +517,7 @@ void test_layer_norm_execute() {
                 ws_ptr = ws;
             }
             atb_s = op.get()->Execute(vp, ws_ptr, ws_size, ctx);
-            TEST_ASSERT(atb_s == atb::NO_ERROR, "LayerNorm Execute succeeds");
+            CHECK(atb_s == atb::NO_ERROR);
         }
 
         runtime->Synchronize();
@@ -542,48 +526,13 @@ void test_layer_norm_execute() {
         alloc->CopyToHost(host_out.data(), output, host_out.size() * sizeof(uint16_t));
         bool non_zero = false;
         for (auto v : host_out) {
-            if (v != 0) { non_zero = true; break; }
+            if (v != 0) {
+                non_zero = true;
+                break;
+            }
         }
-        TEST_ASSERT(non_zero, "LayerNorm output is not all zeros");
+        CHECK(non_zero);
     }
 
     LOG_INFO("LayerNorm Execute test done");
-}
-
-// ══════════════════════════════════════════════════════════
-// Main
-// ══════════════════════════════════════════════════════════
-int main(int argc, char** argv) {
-    LOG_INFO("=== atb_cpp_llm_engine Phase 3 Tests ===");
-
-    // Op creation
-    test_new_op_creation();
-
-    // Vision component graph builds
-    test_vision_attention_graph();
-    test_vision_mlp_graph();
-    test_vision_block_graph();
-    test_patch_embed_graph();
-    test_vision_merger_graph();
-    test_deepstack_graph();
-
-    // Vision Model
-    test_vision_model();
-
-    // MRoPE (CPU)
-    test_mrope();
-
-    // NPU execution tests
-    test_layer_norm_execute();
-    test_vision_execute();
-
-    LOG_INFO("=== Results: %d/%d passed ===", pass_count, test_count);
-
-    if (pass_count == test_count) {
-        LOG_INFO("ALL TESTS PASSED");
-        return 0;
-    } else {
-        LOG_ERROR("SOME TESTS FAILED");
-        return 1;
-    }
 }

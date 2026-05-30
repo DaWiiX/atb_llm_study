@@ -10,6 +10,9 @@
  * Requires: NPU device + ATB/ACL runtime.
  */
 
+#define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+#include "doctest.h"
+
 #include "atb_llm/types.h"
 #include "atb_llm/runtime.h"
 #include "core/raii.h"
@@ -25,26 +28,12 @@
 #include <vector>
 #include <cmath>
 
-static int test_count = 0;
-static int pass_count = 0;
-
-#define TEST_ASSERT(cond, msg)                                          \
-    do {                                                                \
-        test_count++;                                                   \
-        if (!(cond)) {                                                  \
-            LOG_ERROR("FAIL: %s (%s:%d)", msg, __FILE__, __LINE__);    \
-        } else {                                                        \
-            pass_count++;                                               \
-            LOG_INFO("PASS: %s", msg);                                 \
-        }                                                               \
-    } while (0)
-
 #define IS_OK(s) ((s) == atb_llm::STATUS_OK)
 
 // ══════════════════════════════════════════════════════════
 // Test: TextModel build
 // ══════════════════════════════════════════════════════════
-void test_text_model_build() {
+TEST_CASE("TextModel Build") {
     LOG_INFO("=== Test: TextModel Build ===");
 
     atb_llm::models::TextModel::Config cfg;
@@ -57,22 +46,18 @@ void test_text_model_build() {
 
     atb_llm::models::TextModel model(cfg);
     atb_llm::Status s = model.Build(8);  // seq_len=8
-    TEST_ASSERT(IS_OK(s), "TextModel::Build succeeds");
+    CHECK(IS_OK(s));
 
-    TEST_ASSERT(model.GetLayerGraph().get() != nullptr,
-                "TextModel layer_graph is non-null");
-    TEST_ASSERT(model.GetNormGraph().get() != nullptr,
-                "TextModel norm_graph is non-null");
+    CHECK(model.GetLayerGraph().get() != nullptr);
+    CHECK(model.GetNormGraph().get() != nullptr);
 
     if (model.GetLayerGraph()) {
         // 16 inputs: hidden + 4 proj + 2 qk_norm + 3 mlp + 2 ln + cos + sin + mask + seqlen
-        TEST_ASSERT(model.GetLayerGraph().get()->GetInputNum() == 16,
-                    "TextDecoderLayer has 16 inputs (with mask)");
+        CHECK(model.GetLayerGraph().get()->GetInputNum() == 16);
     }
 
     if (model.GetNormGraph()) {
-        TEST_ASSERT(model.GetNormGraph().get()->GetInputNum() == 2,
-                    "TextFinalNorm has 2 inputs");
+        CHECK(model.GetNormGraph().get()->GetInputNum() == 2);
     }
 
     LOG_INFO("TextModel Build test done");
@@ -81,7 +66,7 @@ void test_text_model_build() {
 // ══════════════════════════════════════════════════════════
 // Test: Causal mask
 // ══════════════════════════════════════════════════════════
-void test_causal_mask() {
+TEST_CASE("Causal Mask") {
     LOG_INFO("=== Test: Causal Mask ===");
 
     int32_t seq_len = 4;
@@ -100,7 +85,7 @@ void test_causal_mask() {
             }
         }
     }
-    TEST_ASSERT(correct, "Causal mask values are correct");
+    CHECK(correct);
 
     LOG_INFO("Causal Mask test done");
 }
@@ -108,12 +93,11 @@ void test_causal_mask() {
 // ══════════════════════════════════════════════════════════
 // Test: TextModel NPU execution (small dimensions)
 // ══════════════════════════════════════════════════════════
-void test_text_model_execute() {
+TEST_CASE("TextModel Execute") {
     LOG_INFO("=== Test: TextModel Execute on NPU ===");
 
     auto runtime = atb_llm::CreateRuntime(0, 5LL * 1024 * 1024 * 1024);
-    TEST_ASSERT(runtime != nullptr, "Runtime created for text model test");
-    if (!runtime) return;
+    REQUIRE(runtime != nullptr);
 
     auto* alloc = runtime->GetAllocator();
     auto* ctx = runtime->GetContext();
@@ -134,9 +118,9 @@ void test_text_model_execute() {
 
     atb_llm::models::TextModel model(cfg);
     atb_llm::Status s = model.Build(seq_len);
-    TEST_ASSERT(IS_OK(s), "TextModel build for execute test");
+    CHECK(IS_OK(s));
 
-    if (!model.GetLayerGraph()) return;
+    REQUIRE(model.GetLayerGraph().get() != nullptr);
 
     // Allocate inputs for decoder layer
     // Inputs: hidden_states, q_w, k_w, v_w, o_w, qn_w, kn_w,
@@ -170,7 +154,7 @@ void test_text_model_execute() {
     };
 
     fill_fp16(hidden_t, 0x3400);  // 0.25
-    fill_fp16(q_w, 0x3C00);      // 1.0
+    fill_fp16(q_w, 0x3C00);       // 1.0
     fill_fp16(k_w, 0x3C00);
     fill_fp16(v_w, 0x3C00);
     fill_fp16(o_w, 0x3C00);
@@ -181,9 +165,9 @@ void test_text_model_execute() {
     fill_fp16(down_w, 0x3C00);
     fill_fp16(iln_w, 0x3C00);
     fill_fp16(pln_w, 0x3C00);
-    fill_fp16(cos_t, 0x3C00);    // cos ~1.0
-    fill_fp16(sin_t, 0x0000);    // sin ~0.0
-    fill_fp16(mask_t, 0x0000);   // all attend
+    fill_fp16(cos_t, 0x3C00);   // cos ~1.0
+    fill_fp16(sin_t, 0x0000);   // sin ~0.0
+    fill_fp16(mask_t, 0x0000);  // all attend
 
     // seqlen: int32 value = seq_len * batch_size
     // Use hostData for the seqlen tensor (small, single int32)
@@ -199,13 +183,12 @@ void test_text_model_execute() {
     vp.inTensors = {
         hidden_t, q_w, k_w, v_w, o_w, qn_w, kn_w,
         gate_w, up_w, down_w, iln_w, pln_w,
-        cos_t, sin_t, mask_t, seqlen_t
-    };
+        cos_t, sin_t, mask_t, seqlen_t};
     vp.outTensors = {output_t};
 
     uint64_t ws_size = 0;
     atb::Status atb_s = model.GetLayerGraph().get()->Setup(vp, ws_size, ctx);
-    TEST_ASSERT(atb_s == atb::NO_ERROR, "TextDecoderLayer Setup succeeds");
+    CHECK(atb_s == atb::NO_ERROR);
 
     if (atb_s == atb::NO_ERROR) {
         uint8_t* ws_ptr = nullptr;
@@ -214,7 +197,7 @@ void test_text_model_execute() {
             ws_ptr = ws;
         }
         atb_s = model.GetLayerGraph().get()->Execute(vp, ws_ptr, ws_size, ctx);
-        TEST_ASSERT(atb_s == atb::NO_ERROR, "TextDecoderLayer Execute succeeds");
+        CHECK(atb_s == atb::NO_ERROR);
     }
 
     runtime->Synchronize();
@@ -224,9 +207,12 @@ void test_text_model_execute() {
     alloc->CopyToHost(host_out.data(), output_t, host_out.size() * sizeof(uint16_t));
     bool non_zero = false;
     for (auto v : host_out) {
-        if (v != 0) { non_zero = true; break; }
+        if (v != 0) {
+            non_zero = true;
+            break;
+        }
     }
-    TEST_ASSERT(non_zero, "TextDecoderLayer output is not all zeros");
+    CHECK(non_zero);
 
     // Test FinalNorm
     {
@@ -244,7 +230,7 @@ void test_text_model_execute() {
 
         ws_size = 0;
         atb_s = model.GetNormGraph().get()->Setup(norm_vp, ws_size, ctx);
-        TEST_ASSERT(atb_s == atb::NO_ERROR, "TextFinalNorm Setup succeeds");
+        CHECK(atb_s == atb::NO_ERROR);
 
         if (atb_s == atb::NO_ERROR) {
             uint8_t* ws_ptr = nullptr;
@@ -253,7 +239,7 @@ void test_text_model_execute() {
                 ws_ptr = ws;
             }
             atb_s = model.GetNormGraph().get()->Execute(norm_vp, ws_ptr, ws_size, ctx);
-            TEST_ASSERT(atb_s == atb::NO_ERROR, "TextFinalNorm Execute succeeds");
+            CHECK(atb_s == atb::NO_ERROR);
         }
 
         runtime->Synchronize();
@@ -262,9 +248,12 @@ void test_text_model_execute() {
         alloc->CopyToHost(norm_out.data(), norm_output, norm_out.size() * sizeof(uint16_t));
         non_zero = false;
         for (auto v : norm_out) {
-            if (v != 0) { non_zero = true; break; }
+            if (v != 0) {
+                non_zero = true;
+                break;
+            }
         }
-        TEST_ASSERT(non_zero, "TextFinalNorm output is not all zeros");
+        CHECK(non_zero);
     }
 
     LOG_INFO("TextModel Execute test done");
@@ -273,7 +262,7 @@ void test_text_model_execute() {
 // ══════════════════════════════════════════════════════════
 // Test: TextModel with GQA
 // ══════════════════════════════════════════════════════════
-void test_text_model_gqa() {
+TEST_CASE("TextModel GQA") {
     LOG_INFO("=== Test: TextModel GQA ===");
 
     atb_llm::models::TextModel::Config cfg;
@@ -285,34 +274,11 @@ void test_text_model_gqa() {
 
     atb_llm::models::TextModel model(cfg);
     atb_llm::Status s = model.Build(8);
-    TEST_ASSERT(IS_OK(s), "TextModel::Build(GQA) succeeds");
+    CHECK(IS_OK(s));
 
     if (model.GetLayerGraph()) {
-        TEST_ASSERT(model.GetLayerGraph().get()->GetInputNum() == 16,
-                    "TextDecoderLayer(GQA) has 16 inputs");
+        CHECK(model.GetLayerGraph().get()->GetInputNum() == 16);
     }
 
     LOG_INFO("TextModel GQA test done");
-}
-
-// ══════════════════════════════════════════════════════════
-// Main
-// ══════════════════════════════════════════════════════════
-int main(int argc, char** argv) {
-    LOG_INFO("=== atb_cpp_llm_engine Phase 3 Text Model Tests ===");
-
-    test_text_model_build();
-    test_causal_mask();
-    test_text_model_gqa();
-    test_text_model_execute();
-
-    LOG_INFO("=== Results: %d/%d passed ===", pass_count, test_count);
-
-    if (pass_count == test_count) {
-        LOG_INFO("ALL TESTS PASSED");
-        return 0;
-    } else {
-        LOG_ERROR("SOME TESTS FAILED");
-        return 1;
-    }
 }
