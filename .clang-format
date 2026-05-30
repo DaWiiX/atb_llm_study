@@ -1,0 +1,86 @@
+---
+# Clang-Format configuration for atb_llm
+# Based on observed code style: 4-space indent, K&R braces, PascalCase methods
+
+Language: Cpp
+Standard: c++17
+
+# ── Indentation ──────────────────────────────────────────
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+IndentCaseLabels: false
+IndentPPDirectives: None
+NamespaceIndentation: None
+AccessModifierOffset: -4
+ContinuationIndentWidth: 4
+
+# ── Braces (K&R / Attach style) ─────────────────────────
+BreakBeforeBraces: Attach
+
+# ── Column limit ────────────────────────────────────────
+# Set to 0 to let the formatter wrap only where necessary
+ColumnLimit: 0
+
+# ── Alignment ───────────────────────────────────────────
+AlignAfterOpenBracket: Align
+AlignConsecutiveAssignments: false
+AlignConsecutiveDeclarations: false
+AlignEscapedNewlines: Left
+AlignOperands: true
+AlignTrailingComments: true
+
+# ── Pointer / Reference ────────────────────────────────
+DerivePointerAlignment: false
+PointerAlignment: Left
+
+# ── Short forms ────────────────────────────────────────
+AllowShortBlocksOnASingleLine: Empty
+AllowShortCaseLabelsOnASingleLine: false
+AllowShortFunctionsOnASingleLine: Empty
+AllowShortIfStatementsOnASingleLine: WithoutElse
+AllowShortLoopsOnASingleLine: false
+
+# ── Line breaks ────────────────────────────────────────
+BinPackArguments: true
+BinPackParameters: true
+BreakBeforeBinaryOperators: None
+BreakBeforeTernaryOperators: true
+BreakConstructorInitializers: AfterColon
+BreakStringLiterals: true
+
+# ── Constructor initializer lists ──────────────────────
+ConstructorInitializerIndentWidth: 4
+PackConstructorInitializers: CurrentLine
+
+# ── Includes (preserve manual ordering) ────────────────
+SortIncludes: false
+IncludeBlocks: Preserve
+
+# ── Spaces ─────────────────────────────────────────────
+SpaceAfterCStyleCast: false
+SpaceAfterLogicalNot: false
+SpaceAfterTemplateKeyword: true
+SpaceBeforeAssignmentOperators: true
+SpaceBeforeCpp11BracedList: false
+SpaceBeforeCtorInitializerColon: true
+SpaceBeforeInheritanceColon: true
+SpaceBeforeParens: ControlStatements
+SpaceBeforeRangeBasedForLoopColon: true
+SpaceInEmptyBlock: false
+SpaceInEmptyParentheses: false
+SpacesBeforeTrailingComments: 2
+SpacesInAngles: false
+SpacesInCStyleCastParentheses: false
+SpacesInContainerLiterals: false
+SpacesInParentheses: false
+SpacesInSquareBrackets: false
+
+# ── Other ──────────────────────────────────────────────
+CompactNamespaces: false
+Cpp11BracedListStyle: true
+FixNamespaceComments: false
+MaxEmptyLinesToKeep: 2
+ReflowComments: false
+SortUsingDeclarations: false
+...

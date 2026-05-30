@@ -1,0 +1,45 @@
+# EditorConfig — https://editorconfig.org
+root = true
+
+# ── Defaults ────────────────────────────────────────────
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+
+# ── C/C++ source files ─────────────────────────────────
+[*.{cpp,cc,cxx,c,h,hpp,hxx,hh}]
+indent_style = space
+indent_size = 4
+
+# ── CMake ───────────────────────────────────────────────
+[CMakeLists.txt]
+indent_style = space
+indent_size = 4
+
+[*.cmake]
+indent_style = space
+indent_size = 4
+
+# ── Build / config files ────────────────────────────────
+[*.json]
+indent_style = space
+indent_size = 2
+
+[*.{yml,yaml}]
+indent_style = space
+indent_size = 2
+
+# ── Makefile (tabs required) ────────────────────────────
+[Makefile]
+indent_style = tab
+
+# ── Markdown / docs ─────────────────────────────────────
+[*.{md,rst}]
+trim_trailing_whitespace = false
+
+# ── Python (used for test scripts) ──────────────────────
+[*.py]
+indent_style = space
+indent_size = 4
