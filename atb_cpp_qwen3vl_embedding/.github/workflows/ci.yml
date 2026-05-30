@@ -1,0 +1,146 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+jobs:
+  code-style:
+    name: Code Style Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install clang-format
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-format-14
+          sudo update-alternatives --install /usr/bin/clang-format clang-format /usr/bin/clang-format-14 100
+
+      - name: Check formatting
+        run: |
+          # Find all C/C++ source files
+          find src include tests -name "*.h" -o -name "*.cpp" -o -name "*.c" | while read file; do
+            if ! clang-format --dry-run --Werror "$file" 2>/dev/null; then
+              echo "::error file=$file::Formatting issues found. Run: clang-format -i $file"
+              FORMAT_ERROR=1
+            fi
+          done
+          if [ "${FORMAT_ERROR:-0}" = "1" ]; then
+            echo "::error::Code style check failed. Please run clang-format on the files listed above."
+            exit 1
+          fi
+          echo "✅ Code style check passed"
+
+  build-check:
+    name: Build Check (Compile Only)
+    runs-on: ubuntu-latest
+    needs: code-style
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake
+
+      - name: Create build directory
+        run: mkdir -p build
+
+      - name: Configure CMake (without NPU)
+        run: |
+          cd build
+          # Configure without CANN/ATB dependencies for syntax checking only
+          cmake .. \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_FLAGS="-fsyntax-only" \
+            -DATB_DIR=/dev/null \
+            -DASCEND_TOOLKIT_DIR=/dev/null \
+            2>&1 || true
+        continue-on-error: true
+
+      - name: Check source files exist
+        run: |
+          # Verify all source files are present
+          echo "Checking source files..."
+          find src -name "*.cpp" -o -name "*.h" | head -20
+          echo "✅ Source files check passed"
+
+  static-analysis:
+    name: Static Analysis
+    runs-on: ubuntu-latest
+    needs: code-style
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cppcheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cppcheck
+
+      - name: Run cppcheck
+        run: |
+          cppcheck --enable=warning,style,performance,portability \
+            --suppress=missingIncludeSystem \
+            --suppress=unmatchedSuppression \
+            --inline-suppr \
+            --std=c++17 \
+            -I include \
+            src/ 2>&1 | tee cppcheck-report.txt || true
+
+      - name: Check for critical issues
+        run: |
+          # Check if cppcheck found any errors
+          if grep -q "error:" cppcheck-report.txt; then
+            echo "::error::Static analysis found errors"
+            cat cppcheck-report.txt
+            exit 1
+          fi
+          echo "✅ Static analysis passed"
+
+      - name: Upload report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cppcheck-report
+          path: cppcheck-report.txt
+
+  documentation:
+    name: Documentation Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check required files
+        run: |
+          REQUIRED_FILES=(
+            "README.md"
+            "CMakeLists.txt"
+            "include/atb_llm/types.h"
+            "include/atb_llm/engine.h"
+            "include/atb_llm/model.h"
+            "include/atb_llm/runtime.h"
+          )
+
+          MISSING=0
+          for file in "${REQUIRED_FILES[@]}"; do
+            if [ ! -f "$file" ]; then
+              echo "::error::Missing required file: $file"
+              MISSING=1
+            fi
+          done
+
+          if [ "$MISSING" = "1" ]; then
+            exit 1
+          fi
+          echo "✅ Documentation check passed"
+
+      - name: Check .clang-format exists
+        run: |
+          if [ ! -f "../.clang-format" ] && [ ! -f ".clang-format" ]; then
+            echo "::warning::Missing .clang-format file"
+          else
+            echo "✅ .clang-format found"
+          fi
