@@ -58,14 +58,15 @@ inline void LogMessage(LogLevel level, const char* file, int line, const char* f
     char time_str[32];
     strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", &tm_buf);
 
-    fprintf(stderr, "[%s][%s][%s:%d] ", time_str, LogLevelStr(level), filename, line);
-
+    // Format user message into buffer first to avoid interleaved output
+    char msg_buf[2048];
     va_list args;
     va_start(args, fmt);
-    vfprintf(stderr, fmt, args);
+    vsnprintf(msg_buf, sizeof(msg_buf), fmt, args);
     va_end(args);
 
-    fprintf(stderr, "\n");
+    // Single fprintf call — atomic from other threads' perspective
+    fprintf(stderr, "[%s][%s][%s:%d] %s\n", time_str, LogLevelStr(level), filename, line, msg_buf);
     fflush(stderr);
 }
 

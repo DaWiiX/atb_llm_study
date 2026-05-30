@@ -17,12 +17,17 @@ namespace ops {
 ///   seqlen: (batch,) int32
 /// Outputs (2): [ropeQ, ropeK]
 ///
-/// Uses LLAMA-style contiguous-half rotation: pairs (i, i+hd/2).
+/// Rotation pattern controlled by rotaryCoeff:
+///   2       — contiguous-half (LLAMA-style): pairs (i, i+hd/2). Qwen3VL default.
+///   4       — quarter rotation
+///   headDim/2 — full rotation
 class RopeOp {
 public:
-    /// Create a RoPE operation with half-rotation (rotary_coeff=2).
-    static OperationHandle Create();
+    /// Create a RoPE operation.
+    /// @param rotaryCoeff  Rotation coefficient (2=half, 4=quarter, headDim/2=full).
+    ///                     Default 2 matches Qwen3VL behavior.
+    static OperationHandle Create(int32_t rotaryCoeff = 2);
 };
 
-} // namespace ops
-} // namespace atb_llm
+}  // namespace ops
+}  // namespace atb_llm

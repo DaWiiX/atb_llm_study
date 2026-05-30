@@ -3,22 +3,37 @@
 
 namespace atb_llm {
 
-RuntimeImpl::RuntimeImpl(int device_id, int64_t buffer_size) {
-    Status s = ContextManager::Create(device_id, ctx_mgr_);
+RuntimeImpl::RuntimeImpl(int device_id, int64_t buffer_size)
+    : device_id_(device_id), buffer_size_(buffer_size) {}
+
+Status RuntimeImpl::Create(int device_id, int64_t buffer_size, std::unique_ptr<IRuntime>& out) {
+    auto impl = std::unique_ptr<RuntimeImpl>(new RuntimeImpl(device_id, buffer_size));
+
+    // Initialize ContextManager -- the critical resource that may fail on invalid device_id
+    Status s = ContextManager::Create(device_id, impl->ctx_mgr_);
     if (s != STATUS_OK) {
         LOG_ERROR("ContextManager::Create failed for device %d", device_id);
-        return;  // ctx_mgr_ is nullptr; GetContext()/GetStream() will return nullptr
+        out.reset();
+        return s;
     }
-    allocator_ = std::make_unique<TensorAllocator>(ctx_mgr_->GetContext(), ctx_mgr_->GetStream());
-    buffer_pool_ = std::make_unique<BufferPool>();
-    weight_loader_ = std::make_unique<WeightLoader>();
+
+    // Initialize remaining NPU resources
+    impl->allocator_ = std::make_unique<TensorAllocator>(
+        impl->ctx_mgr_->GetContext(), impl->ctx_mgr_->GetStream());
+    impl->buffer_pool_ = std::make_unique<BufferPool>();
+    impl->weight_loader_ = std::make_unique<WeightLoader>();
 
     if (buffer_size > 0) {
-        s = buffer_pool_->SetBufferSize(buffer_size);
+        s = impl->buffer_pool_->SetBufferSize(buffer_size);
         if (s != STATUS_OK) {
-            LOG_WARN("Failed to pre-allocate buffer pool: %ld bytes", static_cast<long>(buffer_size));
+            LOG_WARN("Failed to pre-allocate buffer pool: %ld bytes",
+                     static_cast<long>(buffer_size));
         }
     }
+
+    LOG_INFO("RuntimeImpl created for device %d", device_id);
+    out = std::move(impl);
+    return STATUS_OK;
 }
 
 RuntimeImpl::~RuntimeImpl() = default;
@@ -49,7 +64,12 @@ WeightLoader* RuntimeImpl::GetWeightLoader() {
 }
 
 std::unique_ptr<IRuntime> CreateRuntime(int device_id, int64_t buffer_size) {
-    return std::make_unique<RuntimeImpl>(device_id, buffer_size);
+    std::unique_ptr<IRuntime> rt;
+    Status s = RuntimeImpl::Create(device_id, buffer_size, rt);
+    if (s != STATUS_OK) {
+        LOG_ERROR("CreateRuntime failed: device_id=%d status=%d", device_id, static_cast<int>(s));
+    }
+    return rt;
 }
 
 } // namespace atb_llm

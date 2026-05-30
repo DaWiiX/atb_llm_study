@@ -12,13 +12,15 @@ namespace atb_llm {
 namespace layers {
 
 Status TextDecoderLayerGraph::Build(const std::string& name,
-                                     int32_t num_heads,
-                                     int32_t num_kv_heads,
-                                     int32_t head_dim,
-                                     int32_t seq_len,
-                                     float epsilon,
-                                     bool use_mask,
-                                     OperationHandle& out) {
+                                    int32_t num_heads,
+                                    int32_t num_kv_heads,
+                                    int32_t head_dim,
+                                    int32_t seq_len,
+                                    float epsilon,
+                                    bool use_mask,
+                                    OperationHandle& out,
+                                    bool use_qk_norm,
+                                    int32_t rotary_dim) {
     (void)seq_len;
 
     std::unique_ptr<GraphBuilder> builder;
@@ -32,8 +34,10 @@ Status TextDecoderLayerGraph::Build(const std::string& name,
     in_names.push_back("k_weight");
     in_names.push_back("v_weight");
     in_names.push_back("o_weight");
-    in_names.push_back("q_norm_weight");
-    in_names.push_back("k_norm_weight");
+    if (use_qk_norm) {
+        in_names.push_back("q_norm_weight");
+        in_names.push_back("k_norm_weight");
+    }
     in_names.push_back("gate_weight");
     in_names.push_back("up_weight");
     in_names.push_back("down_weight");
@@ -74,68 +78,62 @@ Status TextDecoderLayerGraph::Build(const std::string& name,
     // 2. Attention (inline, matching text_attention.py)
     // ══════════════════════════════════════════════════════════
 
-    // Q: Linear -> Reshape(3D) -> RMSNorm -> Reshape(2D)
+    // Q: Linear -> [optional: Reshape(3D) -> RMSNorm -> Reshape(2D)]
     s = add_op(ops::LinearOp::Create(),
                {"normed", "q_weight"}, {"q_lin_out"});
     if (s != STATUS_OK) return s;
 
-    builder->Reshape("q_lin_out",
-        [nh, hd](const atb::Dims& o, atb::Dims& n) {
-            n.dimNum = 3; n.dims[0] = o.dims[0]; n.dims[1] = nh; n.dims[2] = hd;
-        }, "q_3d");
+    std::string q_pre_rope = "q_lin_out";
+    if (use_qk_norm) {
+        builder->Reshape("q_lin_out", [nh, hd](const atb::Dims& o, atb::Dims& n) {
+                n.dimNum = 3; n.dims[0] = o.dims[0]; n.dims[1] = nh; n.dims[2] = hd; }, "q_3d");
 
-    s = add_op(ops::RmsNormOp::Create(epsilon),
-               {"q_3d", "q_norm_weight"}, {"q_normed"});
-    if (s != STATUS_OK) return s;
+        s = add_op(ops::RmsNormOp::Create(epsilon),
+                   {"q_3d", "q_norm_weight"}, {"q_normed"});
+        if (s != STATUS_OK) return s;
 
-    builder->Reshape("q_normed",
-        [nh, hd](const atb::Dims& o, atb::Dims& n) {
-            n.dimNum = 2; n.dims[0] = o.dims[0]; n.dims[1] = nh * hd;
-        }, "q_flat");
+        builder->Reshape("q_normed", [nh, hd](const atb::Dims& o, atb::Dims& n) {
+                n.dimNum = 2; n.dims[0] = o.dims[0]; n.dims[1] = nh * hd; }, "q_flat");
+        q_pre_rope = "q_flat";
+    }
 
-    // K: Linear -> Reshape(3D) -> RMSNorm -> Reshape(2D)
+    // K: Linear -> [optional: Reshape(3D) -> RMSNorm -> Reshape(2D)]
     s = add_op(ops::LinearOp::Create(),
                {"normed", "k_weight"}, {"k_lin_out"});
     if (s != STATUS_OK) return s;
 
-    builder->Reshape("k_lin_out",
-        [kv_nh, hd](const atb::Dims& o, atb::Dims& n) {
-            n.dimNum = 3; n.dims[0] = o.dims[0]; n.dims[1] = kv_nh; n.dims[2] = hd;
-        }, "k_3d");
+    std::string k_pre_rope = "k_lin_out";
+    if (use_qk_norm) {
+        builder->Reshape("k_lin_out", [kv_nh, hd](const atb::Dims& o, atb::Dims& n) {
+                n.dimNum = 3; n.dims[0] = o.dims[0]; n.dims[1] = kv_nh; n.dims[2] = hd; }, "k_3d");
 
-    s = add_op(ops::RmsNormOp::Create(epsilon),
-               {"k_3d", "k_norm_weight"}, {"k_normed"});
-    if (s != STATUS_OK) return s;
+        s = add_op(ops::RmsNormOp::Create(epsilon),
+                   {"k_3d", "k_norm_weight"}, {"k_normed"});
+        if (s != STATUS_OK) return s;
 
-    builder->Reshape("k_normed",
-        [kv_nh, hd](const atb::Dims& o, atb::Dims& n) {
-            n.dimNum = 2; n.dims[0] = o.dims[0]; n.dims[1] = kv_nh * hd;
-        }, "k_flat");
+        builder->Reshape("k_normed", [kv_nh, hd](const atb::Dims& o, atb::Dims& n) {
+                n.dimNum = 2; n.dims[0] = o.dims[0]; n.dims[1] = kv_nh * hd; }, "k_flat");
+        k_pre_rope = "k_flat";
+    }
 
     // V: Linear -> Reshape(3D)
     s = add_op(ops::LinearOp::Create(),
                {"normed", "v_weight"}, {"v_lin_out"});
     if (s != STATUS_OK) return s;
 
-    builder->Reshape("v_lin_out",
-        [kv_nh, hd](const atb::Dims& o, atb::Dims& n) {
-            n.dimNum = 3; n.dims[0] = o.dims[0]; n.dims[1] = kv_nh; n.dims[2] = hd;
-        }, "v_3d");
+    builder->Reshape("v_lin_out", [kv_nh, hd](const atb::Dims& o, atb::Dims& n) {
+            n.dimNum = 3; n.dims[0] = o.dims[0]; n.dims[1] = kv_nh; n.dims[2] = hd; }, "v_3d");
 
     // RoPE
-    s = add_op(ops::RopeOp::Create(),
-               {"q_flat", "k_flat", "cos", "sin", "seqlen"},
+    s = add_op(ops::RopeOp::Create(rotary_dim),
+               {q_pre_rope, k_pre_rope, "cos", "sin", "seqlen"},
                {"q_rope_flat", "k_rope_flat"});
     if (s != STATUS_OK) return s;
 
-    builder->Reshape("q_rope_flat",
-        [nh, hd](const atb::Dims& o, atb::Dims& n) {
-            n.dimNum = 3; n.dims[0] = o.dims[0]; n.dims[1] = nh; n.dims[2] = hd;
-        }, "q_rope");
-    builder->Reshape("k_rope_flat",
-        [kv_nh, hd](const atb::Dims& o, atb::Dims& n) {
-            n.dimNum = 3; n.dims[0] = o.dims[0]; n.dims[1] = kv_nh; n.dims[2] = hd;
-        }, "k_rope");
+    builder->Reshape("q_rope_flat", [nh, hd](const atb::Dims& o, atb::Dims& n) {
+            n.dimNum = 3; n.dims[0] = o.dims[0]; n.dims[1] = nh; n.dims[2] = hd; }, "q_rope");
+    builder->Reshape("k_rope_flat", [kv_nh, hd](const atb::Dims& o, atb::Dims& n) {
+            n.dimNum = 3; n.dims[0] = o.dims[0]; n.dims[1] = kv_nh; n.dims[2] = hd; }, "k_rope");
 
     // SelfAttention
     OperationHandle sa = ops::SelfAttentionOp::Create(num_heads, num_kv_heads, head_dim, use_mask);
@@ -149,14 +147,12 @@ Status TextDecoderLayerGraph::Build(const std::string& name,
     sa_in.push_back("seqlen");
 
     s = builder->AddOperation(sa.release(), sa_in,
-        atb::SVector<std::string>{"sa_out"});
+                              atb::SVector<std::string>{"sa_out"});
     if (s != STATUS_OK) return s;
 
     // Reshape SA output: [B*S, nh, hd] -> [B*S, nh*hd]
-    builder->Reshape("sa_out",
-        [](const atb::Dims& o, atb::Dims& n) {
-            n.dimNum = 2; n.dims[0] = o.dims[0]; n.dims[1] = o.dims[1] * o.dims[2];
-        }, "sa_flat");
+    builder->Reshape("sa_out", [](const atb::Dims& o, atb::Dims& n) {
+            n.dimNum = 2; n.dims[0] = o.dims[0]; n.dims[1] = o.dims[1] * o.dims[2]; }, "sa_flat");
 
     // O projection
     s = add_op(ops::LinearOp::Create(),
@@ -217,5 +213,5 @@ Status TextDecoderLayerGraph::Build(const std::string& name,
     return STATUS_OK;
 }
 
-} // namespace layers
-} // namespace atb_llm
+}  // namespace layers
+}  // namespace atb_llm

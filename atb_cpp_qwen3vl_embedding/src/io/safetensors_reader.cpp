@@ -5,32 +5,25 @@
 
 namespace atb_llm {
 
-SafetensorsReader::SafetensorsReader() : st_(new safetensors::safetensors_t()) {}
+SafetensorsReader::SafetensorsReader() : st_(std::make_unique<safetensors::safetensors_t>()) {}
 
-SafetensorsReader::~SafetensorsReader() {
-    delete st_;
-    st_ = nullptr;
-}
+SafetensorsReader::~SafetensorsReader() = default;
 
-SafetensorsReader::SafetensorsReader(SafetensorsReader&& other) noexcept : st_(other.st_) {
-    other.st_ = nullptr;
-}
+SafetensorsReader::SafetensorsReader(SafetensorsReader&& other) noexcept : st_(std::move(other.st_)) {}
 
 SafetensorsReader& SafetensorsReader::operator=(SafetensorsReader&& other) noexcept {
     if (this != &other) {
-        delete st_;
-        st_ = other.st_;
-        other.st_ = nullptr;
+        st_ = std::move(other.st_);
     }
     return *this;
 }
 
 Status SafetensorsReader::LoadFromFile(const std::string& path) {
     if (!st_) {
-        st_ = new safetensors::safetensors_t();
+        st_ = std::make_unique<safetensors::safetensors_t>();
     }
     std::string warn, err;
-    bool ok = safetensors::load_from_file(path, st_, &warn, &err);
+    bool ok = safetensors::load_from_file(path, st_.get(), &warn, &err);
     if (!warn.empty()) {
         LOG_WARN("safetensors warning: %s", warn.c_str());
     }

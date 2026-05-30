@@ -1,5 +1,6 @@
 #pragma once
 #include "atb_llm/types.h"
+#include <memory>
 #include <string>
 #include <vector>
 #include <cstdint>
@@ -54,7 +55,7 @@ public:
     size_t NumTensors() const;
 
 private:
-    safetensors::safetensors_t* st_ = nullptr;
+    std::unique_ptr<safetensors::safetensors_t> st_;
 };
 
 } // namespace atb_llm

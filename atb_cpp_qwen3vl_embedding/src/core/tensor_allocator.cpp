@@ -67,8 +67,8 @@ Status TensorAllocator::AllocTensor(atb::Tensor& tensor, std::vector<int64_t> sh
     tensor.hostData = nullptr;
     tensor.dataSize = raw_size;  // must match ATB's inferred size (shape * element_size), not aligned alloc
 
-    // Track allocation
-    allocations_.push_back({dev_ptr, alloc_size});
+    // Track allocation (keyed by device pointer for O(1) lookup)
+    allocations_.emplace(dev_ptr, Allocation{dev_ptr, alloc_size});
 
     return STATUS_OK;
 }
@@ -118,20 +118,15 @@ Status TensorAllocator::CopyToHost(void* host_data, const atb::Tensor& tensor, s
 void TensorAllocator::Free(atb::Tensor& tensor) {
     if (tensor.deviceData) {
         aclrtFree(tensor.deviceData);
-        // Remove from tracked allocations to prevent double-free in FreeAll()
-        for (auto it = allocations_.begin(); it != allocations_.end(); ++it) {
-            if (it->device_ptr == tensor.deviceData) {
-                allocations_.erase(it);
-                break;
-            }
-        }
+        // O(1) removal from tracked allocations to prevent double-free in FreeAll()
+        allocations_.erase(tensor.deviceData);
         tensor.deviceData = nullptr;
         tensor.dataSize = 0;
     }
 }
 
 void TensorAllocator::FreeAll() {
-    for (auto& alloc : allocations_) {
+    for (auto& [ptr, alloc] : allocations_) {
         if (alloc.device_ptr) {
             aclrtFree(alloc.device_ptr);
             alloc.device_ptr = nullptr;

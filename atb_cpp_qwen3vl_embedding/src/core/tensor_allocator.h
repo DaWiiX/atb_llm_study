@@ -1,7 +1,7 @@
 #pragma once
 #include "atb_llm/types.h"
 #include "atb/types.h"
-#include <vector>
+#include <unordered_map>
 #include <cstdint>
 #include <acl/acl.h>
 
@@ -54,7 +54,7 @@ private:
         void* device_ptr = nullptr;
         size_t size = 0;
     };
-    std::vector<Allocation> allocations_;
+    std::unordered_map<void*, Allocation> allocations_;
 
     Status AllocTensor(atb::Tensor& tensor, std::vector<int64_t> shape,
                        aclDataType dtype, size_t element_size);

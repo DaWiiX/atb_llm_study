@@ -10,10 +10,20 @@ namespace atb_llm {
 
 /// Concrete implementation of IRuntime.
 /// Owns all NPU resources: Context, Stream, Allocator, BufferPool, WeightLoader.
+/// Use the static Create() factory method -- the constructor is private
+/// to prevent partially-initialized objects on construction failure.
 class RuntimeImpl : public IRuntime {
 public:
-    RuntimeImpl(int device_id, int64_t buffer_size);
     ~RuntimeImpl() override;
+
+    // Non-copyable, non-movable (owns NPU resources)
+    RuntimeImpl(const RuntimeImpl&) = delete;
+    RuntimeImpl& operator=(const RuntimeImpl&) = delete;
+
+    /// Factory: creates a fully-initialized RuntimeImpl.
+    /// Returns STATUS_OK on success, or an error code on failure.
+    /// On failure, `out` is set to nullptr.
+    static Status Create(int device_id, int64_t buffer_size, std::unique_ptr<IRuntime>& out);
 
     // IRuntime interface
     atb::Context* GetContext() override;
@@ -24,13 +34,17 @@ public:
     WeightLoader* GetWeightLoader() override;
 
 private:
+    RuntimeImpl(int device_id, int64_t buffer_size);
+    int device_id_;
+    int64_t buffer_size_;
     std::unique_ptr<ContextManager> ctx_mgr_;
     std::unique_ptr<TensorAllocator> allocator_;
     std::unique_ptr<BufferPool> buffer_pool_;
     std::unique_ptr<WeightLoader> weight_loader_;
 };
 
-/// Factory function to create a Runtime
+/// Factory function to create a Runtime.
+/// Returns nullptr on failure (e.g. invalid device_id).
 std::unique_ptr<IRuntime> CreateRuntime(int device_id, int64_t buffer_size);
 
 } // namespace atb_llm

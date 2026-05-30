@@ -4,9 +4,9 @@
 namespace atb_llm {
 namespace ops {
 
-OperationHandle RopeOp::Create() {
+OperationHandle RopeOp::Create(int32_t rotaryCoeff) {
     atb::infer::RopeParam param;
-    param.rotaryCoeff = 2;  // half-rotation (LLAMA-style)
+    param.rotaryCoeff = rotaryCoeff;
 
     atb::Operation* op = nullptr;
     atb::Status s = atb::CreateOperation(param, &op);
@@ -17,5 +17,5 @@ OperationHandle RopeOp::Create() {
     return OperationHandle(op);
 }
 
-} // namespace ops
-} // namespace atb_llm
+}  // namespace ops
+}  // namespace atb_llm
