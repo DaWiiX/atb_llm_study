@@ -6,9 +6,8 @@ Runs ATB and torch_npu benchmarks separately to avoid NPU memory contention.
 Usage:
     python tests/benchmark_simple.py
 """
-import sys, os, time
+import os, time
 os.environ['TRANSFORMERS_VERBOSITY'] = 'error'
-sys.path.insert(0, '/mnt/workspace/gitCode/transformers/src')
 
 import torch
 import torch_npu  # noqa: required for .npu() ops
@@ -18,6 +17,7 @@ from PIL import Image
 
 from atb_python_qwen3vl_embedding.utils import set_atb_buffer_size
 from atb_python_qwen3vl_embedding.engine import Qwen3VLEngine
+from atb_python_qwen3vl_embedding.env import QWEN3VL_EMB_MODEL_DIR
 from atb_python_qwen3vl_embedding.preprocess import preprocess_image
 
 set_atb_buffer_size(20000 * 1024 * 1024)
@@ -98,7 +98,7 @@ def benchmark_torch_forward(ref_model, input_ids, pv_tf, grid_thw, n_warmup=5, n
 
 
 if __name__ == "__main__":
-    rp = '/mnt/workspace/gitCode/models/Qwen3-VL-Embedding-2B'
+    rp = QWEN3VL_EMB_MODEL_DIR
 
     resolutions = [
         (416, 672),

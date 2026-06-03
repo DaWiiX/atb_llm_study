@@ -1,6 +1,5 @@
 """Test Qwen3VLVisionMLP: transformers vs ATB graph."""
-import sys, os, torch, torch_npu, torch.nn.functional as F
-sys.path.insert(0, '/mnt/workspace/gitCode/transformers/src')
+import os, torch, torch_npu, torch.nn.functional as F
 from atb_python_qwen3vl_embedding.vision_mlp import build_vision_mlp
 from atb_python_qwen3vl_embedding.utils import set_atb_buffer_size, compare_tensors
 from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLVisionMLP

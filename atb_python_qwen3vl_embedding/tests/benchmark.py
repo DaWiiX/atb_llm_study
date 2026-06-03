@@ -18,9 +18,8 @@ Stages:
 Usage:
     python benchmark.py  [--iter N]  [--warmup M]
 """
-import sys, os, time, argparse
+import os, time, argparse
 os.environ['TRANSFORMERS_VERBOSITY'] = 'error'
-sys.path.insert(0, '/mnt/workspace/gitCode/transformers/src')
 
 import torch
 import torch_npu
@@ -30,6 +29,7 @@ from PIL import Image
 
 from atb_python_qwen3vl_embedding.utils import set_atb_buffer_size
 from atb_python_qwen3vl_embedding.engine import Qwen3VLEngine
+from atb_python_qwen3vl_embedding.env import QWEN3VL_EMB_MODEL_DIR
 set_atb_buffer_size(20000 * 1024 * 1024)  # 20GB for large sequences
 
 
@@ -338,7 +338,7 @@ def print_report(resolution, S, atb_e2e, torch_e2e, atb_stages, torch_stages):
 # ═════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    rp = '/mnt/workspace/gitCode/models/Qwen3-VL-Embedding-2B'
+    rp = QWEN3VL_EMB_MODEL_DIR
     print("Loading ATB engine...")
     atb = Qwen3VLEngine(rp)
 

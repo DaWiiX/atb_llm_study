@@ -1,6 +1,5 @@
 """Test Qwen3VLVisionPatchEmbed: ATB vs transformers."""
-import sys, os, torch, torch_npu, torch_atb, torch.nn.functional as F, warnings
-sys.path.insert(0, '/mnt/workspace/gitCode/transformers/src')
+import os, torch, torch_npu, torch_atb, torch.nn.functional as F, warnings
 os.environ['TRANSFORMERS_VERBOSITY'] = 'error'; warnings.filterwarnings('ignore')
 from atb_python_qwen3vl_embedding.utils import set_atb_buffer_size, compare_tensors
 from atb_python_qwen3vl_embedding.vision_patch_embed import build_patch_embed

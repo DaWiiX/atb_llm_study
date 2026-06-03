@@ -1,6 +1,5 @@
 """Test Qwen3VLVisionBlock: transformers vs ATB graph."""
-import sys, os, torch, torch_npu, torch.nn.functional as F
-sys.path.insert(0, '/mnt/workspace/gitCode/transformers/src')
+import os, torch, torch_npu, torch.nn.functional as F
 import warnings; warnings.filterwarnings('ignore')
 from atb_python_qwen3vl_embedding.vision_block import build_vision_block
 from atb_python_qwen3vl_embedding.utils import set_atb_buffer_size, compare_tensors
