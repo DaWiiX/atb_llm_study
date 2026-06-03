@@ -30,6 +30,36 @@ def get_atb_builder(name: str):
     return torch_atb.Builder(name)
 
 
+# ── Tensor placement helpers ────────────────────────────────────────
+
+def to_npu_half(t: torch.Tensor) -> torch.Tensor:
+    """Return tensor as float16 on NPU.
+
+    If the tensor is already NPU float16 this is a no-op. Callers keep
+    sequence-length tensors separate because ATB attention expects them on CPU.
+    """
+    if t.device.type == "npu" and t.dtype == torch.float16:
+        return t
+    return t.half().npu()
+
+
+def to_cpu_float(t: torch.Tensor) -> torch.Tensor:
+    """Return tensor as float32 on CPU."""
+    if t.device.type == "cpu" and t.dtype == torch.float32:
+        return t
+    return t.cpu().float()
+
+
+def prepare_npu_weights(weights):
+    """Convert a weight list to NPU float16, preserving order."""
+    return [to_npu_half(w) for w in weights]
+
+
+def make_seqlen_tensor(ntokens: int) -> torch.Tensor:
+    """Create the CPU int32 sequence-length tensor required by ATB attention."""
+    return torch.tensor([ntokens], dtype=torch.int32)
+
+
 # ── ATB parameter factories ─────────────────────────────────────────
 
 def make_linear(has_bias: bool = False):

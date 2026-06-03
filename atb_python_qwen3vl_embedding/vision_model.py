@@ -13,6 +13,7 @@ import torch
 import torch_atb
 from .utils import (
     make_layer_norm, make_linear, make_elewise_add, get_atb_builder,
+    make_seqlen_tensor, prepare_npu_weights, to_cpu_float, to_npu_half,
 )
 from .vision_block import add_vision_block_graph
 from .vision_patch_embed import add_patch_embed_graph
@@ -163,87 +164,72 @@ def collect_merger_weights(merger):
 # Runners
 # ═════════════════════════════════════════════════════════════════════
 
-def run_first_layer(graph, pixel_values, pe_w, pe_b, pos_embeds, cos, sin,
-                    block0_weights):
-    """Execute patch_embed + pos_embed + block 0 on ATB NPU.
-
-    Args:
-        pixel_values: (N, C*tp*p*p) or (N*C*tp*p*p,) float.
-        pe_w, pe_b:   patch_embed Linear weights.
-        pos_embeds:   (N, hidden) position embeddings.
-        cos, sin:     (N, nh*hd) rotary embeddings.
-        block0_weights: 12 block 0 weight tensors.
-
-    Returns (N, hidden) float on CPU.
-    """
+def _first_layer_inputs(pixel_values, pe_w, pe_b, pos_embeds, cos, sin,
+                        block0_weights):
+    """Build first-layer graph inputs in ATB order."""
     pv = pixel_values.reshape(-1) if pixel_values.ndim == 2 else pixel_values
     npatches = pos_embeds.shape[0]
-    inputs = [pv.half().npu(),
-              pe_w.half().npu(), pe_b.half().npu(),
-              pos_embeds.half().npu(),
-              cos.half().npu(), sin.half().npu(),
-              torch.tensor([npatches], dtype=torch.int32)]
-    inputs.extend(block0_weights)  # already NPU
-    return graph.forward(inputs)[0].cpu().float()
+    inputs = [
+        to_npu_half(pv),
+        to_npu_half(pe_w), to_npu_half(pe_b),
+        to_npu_half(pos_embeds),
+        to_npu_half(cos), to_npu_half(sin),
+        make_seqlen_tensor(npatches),
+    ]
+    inputs.extend(prepare_npu_weights(block0_weights))
+    return inputs
+
+
+def _block_inputs(hidden, block_weights, cos, sin):
+    """Build VisionBlock graph inputs in ATB order."""
+    npatches = hidden.shape[0]
+    inputs = [to_npu_half(hidden)]
+    inputs.extend(prepare_npu_weights(block_weights))
+    inputs.extend([to_npu_half(cos), to_npu_half(sin),
+                   make_seqlen_tensor(npatches)])
+    return inputs
+
+
+def _merger_inputs(hidden, merger_weights):
+    """Build PatchMerger graph inputs in ATB order."""
+    inputs = [to_npu_half(hidden)]
+    inputs.extend(prepare_npu_weights(merger_weights))
+    return inputs
+
+
+def run_first_layer(graph, pixel_values, pe_w, pe_b, pos_embeds, cos, sin,
+                    block0_weights):
+    """Execute patch_embed + pos_embed + block 0 and return CPU float."""
+    return to_cpu_float(graph.forward(_first_layer_inputs(
+        pixel_values, pe_w, pe_b, pos_embeds, cos, sin, block0_weights))[0])
 
 
 def run_first_layer_npu(graph, pixel_values, pe_w, pe_b, pos_embeds, cos, sin,
                         block0_weights):
-    """Like run_first_layer but returns NPU-resident output."""
-    pv = pixel_values.reshape(-1) if pixel_values.ndim == 2 else pixel_values
-    npatches = pos_embeds.shape[0]
-    inputs = [pv.half().npu(),
-              pe_w, pe_b,
-              pos_embeds.half().npu(),
-              cos.half().npu(), sin.half().npu(),
-              torch.tensor([npatches], dtype=torch.int32)]
-    inputs.extend(block0_weights)
-    return graph.forward(inputs)[0]
+    """Execute patch_embed + pos_embed + block 0 and keep output on NPU."""
+    return graph.forward(_first_layer_inputs(
+        pixel_values, pe_w, pe_b, pos_embeds, cos, sin, block0_weights))[0]
 
 
 def run_block(graph, hidden, block_weights, cos, sin):
-    """Execute one VisionBlock on ATB NPU.
-
-    Args:
-        hidden:       (N, hidden) float on CPU.
-        block_weights: 12 weight tensors for this block (NPU float16).
-        cos, sin:     (N, nh*hd) rotary embeddings.
-
-    Returns (N, hidden) float on CPU.
-    """
-    npatches = hidden.shape[0]
-    inputs = [hidden.half().npu()]
-    inputs.extend(block_weights)
-    inputs.extend([cos.half().npu(), sin.half().npu(),
-                   torch.tensor([npatches], dtype=torch.int32)])
-    return graph.forward(inputs)[0].cpu().float()
+    """Execute one VisionBlock and return CPU float."""
+    return to_cpu_float(graph.forward(_block_inputs(
+        hidden, block_weights, cos, sin))[0])
 
 
 def run_block_npu(graph, hidden_npu, block_weights, cos, sin):
-    """Like run_block but hidden and output stay on NPU."""
-    npatches = hidden_npu.shape[0]
-    inputs = [hidden_npu]
-    inputs.extend(block_weights)
-    inputs.extend([cos.half().npu(), sin.half().npu(),
-                   torch.tensor([npatches], dtype=torch.int32)])
-    return graph.forward(inputs)[0]
+    """Execute one VisionBlock and keep output on NPU."""
+    return graph.forward(_block_inputs(hidden_npu, block_weights, cos, sin))[0]
 
 
 def run_merger(graph, hidden, merger_weights):
-    """Execute PatchMerger on ATB NPU.
-
-    Returns (N_out, out_hidden_size) float on CPU.
-    """
-    inputs = [hidden.half().npu()]
-    inputs.extend(merger_weights)
-    return graph.forward(inputs)[0].cpu().float()
+    """Execute PatchMerger and return CPU float."""
+    return to_cpu_float(graph.forward(_merger_inputs(hidden, merger_weights))[0])
 
 
 def run_merger_npu(graph, hidden_npu, merger_weights):
-    """Like run_merger but input and output stay on NPU."""
-    inputs = [hidden_npu]
-    inputs.extend(merger_weights)
-    return graph.forward(inputs)[0]
+    """Execute PatchMerger and keep output on NPU."""
+    return graph.forward(_merger_inputs(hidden_npu, merger_weights))[0]
 
 
 def run_vision_model(vision_model, pixel_values, pos_embeds, cos, sin,
@@ -251,34 +237,42 @@ def run_vision_model(vision_model, pixel_values, pos_embeds, cos, sin,
                      graph_deepstack=None):
     """Run full Qwen3VLVisionModel through ATB graphs.
 
-    Args:
-        vision_model:   Qwen3VLVisionModel instance (for weights).
-        pixel_values:   (N, C*tp*p*p) from preprocess_image.
-        pos_embeds:     (N, hidden) position embeddings.
-        cos, sin:       (N, nh*hd) rotary embeddings.
-        graph_first/graph_block/graph_merger: pre-built ATB graphs.
-        graph_deepstack: optional deepstack merger graph.
-
-    Returns (merged_output, deepstack_feature_list).
+    The public API is CPU-facing and returns CPU float tensors, while the block
+    loop stays NPU-resident. Collected Transformers weights are CPU tensors and
+    are converted once before graph execution.
     """
     vm = vision_model
     cfg = vm.config
     ds_indexes = cfg.deepstack_visual_indexes
-    pe_w, pe_b = collect_patch_embed_weight(vm)
 
-    h = run_first_layer(graph_first, pixel_values, pe_w, pe_b,
-                        pos_embeds, cos, sin,
-                        collect_block_weights(vm.blocks[0]))
+    pe_w, pe_b = collect_patch_embed_weight(vm)
+    pe_w, pe_b = to_npu_half(pe_w), to_npu_half(pe_b)
+    block_weights = [
+        prepare_npu_weights(collect_block_weights(vm.blocks[li]))
+        for li in range(cfg.depth)
+    ]
+    merger_weights = prepare_npu_weights(collect_merger_weights(vm.merger))
+    ds_weights = []
+    if graph_deepstack is not None:
+        ds_weights = [
+            prepare_npu_weights(collect_merger_weights(merger))
+            for merger in vm.deepstack_merger_list
+        ]
+
+    pos_npu = to_npu_half(pos_embeds)
+    cos_npu = to_npu_half(cos)
+    sin_npu = to_npu_half(sin)
+
+    h = run_first_layer_npu(graph_first, pixel_values, pe_w, pe_b,
+                            pos_npu, cos_npu, sin_npu, block_weights[0])
 
     deepstack_features = []
     for li in range(1, cfg.depth):
-        h = run_block(graph_block, h, collect_block_weights(vm.blocks[li]),
-                      cos, sin)
+        h = run_block_npu(graph_block, h, block_weights[li], cos_npu, sin_npu)
         if li in ds_indexes and graph_deepstack is not None:
-            ds_weights = collect_merger_weights(
-                vm.deepstack_merger_list[ds_indexes.index(li)])
-            ds_out = run_merger(graph_deepstack, h, ds_weights)
-            deepstack_features.append(ds_out)
+            ds_idx = ds_indexes.index(li)
+            ds_out = run_merger_npu(graph_deepstack, h, ds_weights[ds_idx])
+            deepstack_features.append(to_cpu_float(ds_out))
 
-    merged = run_merger(graph_merger, h, collect_merger_weights(vm.merger))
-    return merged, deepstack_features
+    merged = run_merger_npu(graph_merger, h, merger_weights)
+    return to_cpu_float(merged), deepstack_features
