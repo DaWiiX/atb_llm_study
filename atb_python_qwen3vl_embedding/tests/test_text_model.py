@@ -1,6 +1,5 @@
 """Test Qwen3VLTextModel: transformers vs ATB (split-graph loop)."""
-import sys, os, torch, torch.nn.functional as F
-sys.path.insert(0, '/mnt/workspace/gitCode/transformers/src')
+import os, torch, torch.nn.functional as F
 
 from atb_python_qwen3vl_embedding.utils import set_atb_buffer_size, compare_tensors
 from atb_python_qwen3vl_embedding.text_model import (

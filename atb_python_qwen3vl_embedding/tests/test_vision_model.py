@@ -2,8 +2,7 @@
 
 Uses 3 subgraphs (first_layer, per_block, merger) and loops blocks at runtime.
 """
-import sys, os, torch, torch.nn.functional as F
-sys.path.insert(0, '/mnt/workspace/gitCode/transformers/src')
+import os, torch, torch.nn.functional as F
 
 from atb_python_qwen3vl_embedding.utils import set_atb_buffer_size, compare_tensors
 from atb_python_qwen3vl_embedding.vision_model import (

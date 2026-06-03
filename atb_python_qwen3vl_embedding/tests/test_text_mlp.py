@@ -1,6 +1,5 @@
 """Test Qwen3VLTextMLP: transformers vs ATB graph."""
-import sys, os
-sys.path.insert(0, '/mnt/workspace/gitCode/transformers/src')
+import os
 import torch
 import torch_npu  # noqa: needed for .npu()
 

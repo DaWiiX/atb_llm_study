@@ -1,13 +1,13 @@
 # ============================================================
 # Pure ATB Engine E2E Test — zero transformers in inference path
 # ============================================================
-import sys, os; os.environ['TRANSFORMERS_VERBOSITY'] = 'error'
-sys.path.insert(0, '/mnt/workspace/gitCode/transformers/src')
+import os; os.environ['TRANSFORMERS_VERBOSITY'] = 'error'
 import torch, torch_npu, torch_atb
 from atb_python_qwen3vl_embedding.utils import set_atb_buffer_size
 set_atb_buffer_size(15000 * 1024 * 1024)
 
 from atb_python_qwen3vl_embedding.engine import Qwen3VLEngine
+from atb_python_qwen3vl_embedding.env import QWEN3VL_EMB_MODEL_DIR
 from atb_python_qwen3vl_embedding.preprocess import preprocess_image
 from atb_python_qwen3vl_embedding.engine_utils import (
     TextRotaryEmbedding, get_rope_index, get_embed_weight,
@@ -22,7 +22,7 @@ import numpy as np
 from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLModel
 from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLConfig
 from transformers import AutoProcessor
-rp = '/mnt/workspace/gitCode/models/Qwen3-VL-Embedding-2B'
+rp = QWEN3VL_EMB_MODEL_DIR
 # Load transformers reference — must NOT use dtype override, or weights won't load from checkpoint
 # Load transformers reference — manually load state dict from safetensors (model has 'model.' prefix)
 from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLModel

@@ -1,10 +1,10 @@
 """Test preprocessing: pure Python vs transformers Processor."""
-import sys, os, torch, torch.nn.functional as F
-sys.path.insert(0, '/mnt/workspace/gitCode/transformers/src')
+import os, torch, torch.nn.functional as F
 import warnings; warnings.filterwarnings('ignore')
 os.environ['TRANSFORMERS_VERBOSITY'] = 'error'
 
 from atb_python_qwen3vl_embedding.preprocess import preprocess_image
+from atb_python_qwen3vl_embedding.env import QWEN3VL_EMB_MODEL_DIR
 
 def test_preprocess():
     print("\n=== Image Preprocessing ===")
@@ -12,7 +12,7 @@ def test_preprocess():
     from PIL import Image
     import numpy as np
 
-    proc = AutoProcessor.from_pretrained('/mnt/workspace/gitCode/models/Qwen3-VL-Embedding-2B')
+    proc = AutoProcessor.from_pretrained(QWEN3VL_EMB_MODEL_DIR)
     ip = proc.image_processor
     p = ip.patch_size; tp = ip.temporal_patch_size; m = ip.merge_size
     min_px = ip.min_pixels; max_px = ip.max_pixels

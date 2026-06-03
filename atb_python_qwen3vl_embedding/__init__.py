@@ -8,6 +8,7 @@ Production modules:
     preprocess.py              CPU-side image preprocessing (pure Python, no Processor)
     engine.py                  Qwen3VLEngine — full E2E inference engine (zero transformers)
     engine_utils.py            Weight loading, MRoPE, get_rope_index, vision embeddings
+    env.py                     Central config: .env loader + project-wide variables
     text_attention.py          Qwen3VLTextAttention ATB graph
     text_mlp.py                Qwen3VLTextMLP ATB graph (SwiGLU)
     text_decoder_layer.py      Qwen3VLTextDecoderLayer ATB graph
@@ -24,12 +25,3 @@ Test infrastructure:
     tests/test_engine.py       Engine E2E test (text/image/text+image)
     tests/test_*.py            Unit tests for individual ATB components
 """
-import sys
-import os
-
-_pkg_dir = os.path.dirname(os.path.abspath(__file__))
-
-# Add external dependencies (for test reference only)
-_transformers_src = os.path.join(os.path.dirname(_pkg_dir), "transformers", "src")
-if os.path.isdir(_transformers_src) and _transformers_src not in sys.path:
-    sys.path.insert(0, _transformers_src)

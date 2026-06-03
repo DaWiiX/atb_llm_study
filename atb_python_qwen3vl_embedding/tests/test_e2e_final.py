@@ -2,17 +2,17 @@
 # E2E: ATB Qwen3VL-Embedding vs TF manual (same inputs)
 # 三种输入：纯文本 / 纯图片 / 图片+文本
 # ============================================================
-import sys, os; os.environ['TRANSFORMERS_VERBOSITY'] = 'error'
-sys.path.insert(0, '/mnt/workspace/gitCode/transformers/src')
+import os; os.environ['TRANSFORMERS_VERBOSITY'] = 'error'
 import torch, torch_npu, torch_atb
 import torch.nn.functional as F
 from atb_python_qwen3vl_embedding.utils import set_atb_buffer_size
+from atb_python_qwen3vl_embedding.env import QWEN3VL_EMB_MODEL_DIR
 set_atb_buffer_size(5000 * 1024 * 1024)
 
 from transformers import AutoModel, AutoProcessor
 from PIL import Image; import numpy as np
 
-rp = '/mnt/workspace/gitCode/models/Qwen3-VL-Embedding-2B'
+rp = QWEN3VL_EMB_MODEL_DIR
 model = AutoModel.from_pretrained(rp, trust_remote_code=True, torch_dtype=torch.float32)
 model.eval(); model.config._attn_implementation = "eager"
 tm = model.language_model; tm.config._attn_implementation = "eager"; vm = model.visual

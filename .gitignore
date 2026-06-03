@@ -49,3 +49,6 @@ Thumbs.db
 
 # Data dumps
 extra-info/data-dump/
+
+# Local env (machine-specific paths; copy .env.example to .env to bootstrap)
+.env

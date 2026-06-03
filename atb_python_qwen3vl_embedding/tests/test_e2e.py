@@ -6,13 +6,13 @@ Pipeline:
     3. ATB VisionModel (first_layer → loop blocks → merger)
     4. Compare with transformers reference
 """
-import sys, os, torch, torch.nn.functional as F, warnings
+import os, torch, torch.nn.functional as F, warnings
 warnings.filterwarnings('ignore')
 
-sys.path.insert(0, '/mnt/workspace/gitCode/transformers/src')
 os.environ['TRANSFORMERS_VERBOSITY'] = 'error'
 
 from atb_python_qwen3vl_embedding.utils import set_atb_buffer_size, compare_tensors
+from atb_python_qwen3vl_embedding.env import QWEN3VL_EMB_MODEL_DIR
 from atb_python_qwen3vl_embedding.vision_model import (
     build_vision_first_layer, build_vision_merger, run_vision_model,
 )
@@ -27,7 +27,7 @@ def test_e2e():
     from PIL import Image
     import numpy as np
 
-    real_path = '/mnt/workspace/gitCode/models/Qwen3-VL-Embedding-2B'
+    real_path = QWEN3VL_EMB_MODEL_DIR
     rm = AutoModel.from_pretrained(real_path, trust_remote_code=True,
                                    torch_dtype=torch.float32)
     rm.eval()

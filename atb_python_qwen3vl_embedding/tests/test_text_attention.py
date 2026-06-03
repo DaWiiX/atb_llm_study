@@ -7,8 +7,7 @@ Usage:
   python tests/test_decoder_layer.py
   python tests/test_text_model.py
 """
-import sys, os
-sys.path.insert(0, '/mnt/workspace/gitCode/transformers/src')
+import os
 import torch
 import torch_npu  # noqa: needed for .npu()
 
