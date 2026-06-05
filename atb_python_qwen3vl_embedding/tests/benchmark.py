@@ -95,6 +95,8 @@ def make_inputs(engine, processor, w: int, h: int):
         'w': w, 'h': h, 'img_arr': img_arr,
         'pv_raw': pv_raw, 'grid_thw': grid_thw,
         'input_ids': tf_in['input_ids'],
+        'attention_mask': tf_in.get('attention_mask',
+                                    torch.ones_like(tf_in['input_ids'])),
         'tf_pixel_values': tf_in.get('pixel_values'),
         'tf_grid_thw': tf_in.get('image_grid_thw'),
     }
@@ -255,12 +257,39 @@ def load_tf_ref(model_dir: str):
 
 def benchmark_tf_e2e(ref, inputs, n_warmup, n_iter):
     input_ids = inputs['input_ids'].npu()
+    attn_mask = inputs['attention_mask'].npu()
     pv = inputs['tf_pixel_values'].half().npu()
     gth = inputs['tf_grid_thw'].npu()
 
     def _call():
         with torch.no_grad():
-            ref(input_ids=input_ids, pixel_values=pv, image_grid_thw=gth)
+            ref(use_cache=False, input_ids=input_ids,
+                attention_mask=attn_mask,
+                pixel_values=pv, image_grid_thw=gth)
+
+    for _ in range(n_warmup):
+        _call()
+    sync()
+
+    results = []
+    for _ in range(n_iter):
+        sync(); t0 = now()
+        _call()
+        sync()
+        results.append(now() - t0)
+
+    # Accuracy check: compare last_hidden_state vs ATB output
+    with torch.no_grad():
+        tf_out = ref(use_cache=False, input_ids=input_ids,
+                     attention_mask=attn_mask,
+                     pixel_values=pv, image_grid_thw=gth
+                     ).last_hidden_state.cpu().float()
+    accuracy = None
+    if inputs.get('atb_output') is not None:
+        a = inputs['atb_output'].flatten()
+        t = tf_out.flatten()
+        accuracy = F.cosine_similarity(a.unsqueeze(0), t.unsqueeze(0)).item()
+    return results, accuracy
 
     for _ in range(n_warmup):
         _call()
@@ -308,13 +337,14 @@ def print_atb_report(resolution, S, n_vis_tokens, stages, atb_e2e):
 
 def print_atb_vs_tf_table(all_results):
     """Final ATB-vs-TF comparison table across all resolutions."""
-    print(f"\n{'=' * 80}")
+    print(f"\n{'=' * 90}")
     print(f"{'Resolution':<14}{'S':>6}{'VisTok':>9}"
-          f"{'ATB E2E (ms)':>18}{'TF E2E (ms)':>18}{'Ratio':>8}")
-    print(f"{'─' * 80}")
+          f"{'ATB E2E (ms)':>18}{'TF E2E (ms)':>18}{'Ratio':>8}{'Cosine':>9}")
+    print(f"{'─' * 90}")
     for (w, h), r in all_results.items():
         atb_arr = ms(r['atb_e2e'])
         tf_arr = ms(r['tf_e2e']) if r.get('tf_e2e') else None
+        acc = r.get('accuracy')
         atb_str = f"{atb_arr.mean():>8.1f} ± {atb_arr.std():<5.1f}"
         if tf_arr is not None:
             tf_str = f"{tf_arr.mean():>8.1f} ± {tf_arr.std():<5.1f}"
@@ -322,9 +352,10 @@ def print_atb_vs_tf_table(all_results):
         else:
             tf_str = "(skipped)"
             ratio = "—"
+        acc_str = f"{acc:.4f}" if acc is not None else "—"
         print(f"{w}x{h:<8}{r['S']:>6}{r['n_vis']:>9}"
-              f"{atb_str:>18}{tf_str:>18}{ratio:>8}")
-    print(f"{'=' * 80}")
+              f"{atb_str:>18}{tf_str:>18}{ratio:>8}{acc_str:>9}")
+    print(f"{'=' * 90}")
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -386,11 +417,18 @@ def main(argv: Optional[list] = None) -> int:
 
         stages = benchmark_atb_staged(engine, inputs, args.warmup, args.iter)
         atb_e2e = benchmark_atb_e2e(engine, inputs, args.warmup, args.iter)
+
+        # Save one ATB output for accuracy comparison against TF
+        atb_output = engine.forward(inputs['input_ids'],
+                                    inputs['pv_raw'], inputs['grid_thw'])
+        inputs['atb_output'] = atb_output
+
         print_atb_report((w, h), S, n_vis, stages, atb_e2e)
 
         all_results[(w, h)] = {
             'S': S, 'n_vis': n_vis, 'inputs': inputs,
             'stages': stages, 'atb_e2e': atb_e2e, 'tf_e2e': None,
+            'accuracy': None,
         }
 
     del engine
@@ -403,10 +441,11 @@ def main(argv: Optional[list] = None) -> int:
         print("[TF] Loaded")
         for (w, h), r in all_results.items():
             print(f"\n[TF] Benchmarking {w}x{h} ...")
-            r['tf_e2e'] = benchmark_tf_e2e(
+            r['tf_e2e'], r['accuracy'] = benchmark_tf_e2e(
                 ref, r['inputs'], args.warmup, args.iter)
             tf_arr = ms(r['tf_e2e'])
-            print(f"[TF]  E2E: {tf_arr.mean():.2f} ± {tf_arr.std():.2f} ms")
+            acc_str = f"  cosine={r['accuracy']:.6f}" if r['accuracy'] is not None else ""
+            print(f"[TF]  E2E: {tf_arr.mean():.2f} ± {tf_arr.std():.2f} ms{acc_str}")
         del ref
         torch.npu.empty_cache()
 
