@@ -7,7 +7,10 @@ from atb_python_qwen3vl_embedding.text_model import (
 )
 
 
-def test_text_model(B=1, S=8, num_layers=2, seed=42):
+def test_text_model(B=1, S=16, num_layers=2, seed=42):
+    # S=16 chosen so the (S, S) causal mask's last dim (16*2=32 bytes) meets
+    # the ATB 32-byte last-dim alignment requirement. The real engine always
+    # runs with S well above this threshold.
     print(f"\n=== Qwen3VLTextModel ({num_layers} layers, split-graph) ===")
     from atb_python_qwen3vl_embedding import data_utils
     from atb_python_qwen3vl_embedding.transformers_runner import run_text_model as run_tf

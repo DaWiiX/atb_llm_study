@@ -27,7 +27,6 @@ from .engine_utils import (
 )
 from .vision_model import (
     build_vision_first_layer, build_vision_merger, build_deepstack_merger,
-    run_first_layer, run_block, run_merger,
     run_first_layer_npu, run_block_npu, run_merger_npu,
 )
 from .vision_block import build_vision_block
@@ -121,20 +120,6 @@ class Qwen3VLEngine:
         # ── Build ATB graphs ────────────────────────────────────────
         self._build_graphs()
 
-    def _build_graphs(self):
-        """Build all ATB graphs."""
-        # Vision
-        self.g_v_first = build_vision_first_layer(self._make_vision_config())
-        _, self.g_v_block, _ = build_vision_block(self.nh_v, self.hd_v, "VisBlock")
-        self.g_v_merger = build_vision_merger(self._make_vision_config())
-        self.g_v_ds = build_deepstack_merger(self._make_vision_config())
-
-        # Text
-        self.g_t_norm = build_text_norm_graph(self.hidden_t)
-        self._text_S = None
-        self.g_t_layer = None
-        self._cached_mask = None
-
     def _make_vision_config(self):
         """Create a config-like object for ATB vision graph builders."""
         return VisionConfigWrapper(self.v_cfg)
@@ -223,7 +208,9 @@ class Qwen3VLEngine:
                                         cos_npu, sin_npu, S,
                                         causal_mask=self._cached_mask)
             if deepstack_features and li < len(deepstack_features):
-                hidden[0, visual_mask, :] += deepstack_features[li]
+                # clone + add + writeback (matches TF _deepstack_process)
+                local = hidden[0, visual_mask, :].clone() + deepstack_features[li]
+                hidden[0, visual_mask, :] = local
 
         return run_text_norm_npu(self.g_t_norm, hidden, self.norm_w).cpu().float()
 

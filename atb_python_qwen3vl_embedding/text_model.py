@@ -7,7 +7,10 @@ normalization.
 This avoids building a giant 28-layer graph that would cause OOM.
 """
 import torch
-from .utils import make_rms_norm, get_atb_builder
+from .utils import (
+    make_rms_norm, get_atb_builder,
+    make_seqlen_tensor, prepare_npu_weights, to_cpu_float, to_npu_half,
+)
 from .text_decoder_layer import build_decoder_layer
 
 
@@ -69,115 +72,86 @@ def make_causal_mask(S, device='cpu'):
 
 # ── Runners ──────────────────────────────────────────────────────────
 
+def _text_layer_inputs(hidden, layer_weights, cos, sin, causal_mask=None):
+    """Build DecoderLayer inputs in graph order.
+
+    The final sequence-length tensor is intentionally kept on CPU int32 because
+    ATB Rope/SelfAttention expect a host-side length tensor.
+    """
+    ntoken = hidden.shape[0] * hidden.shape[1]
+    inputs = [to_npu_half(hidden)]
+    inputs.extend(prepare_npu_weights(layer_weights))
+    inputs.extend([to_npu_half(cos), to_npu_half(sin)])
+    if causal_mask is not None:
+        inputs.append(to_npu_half(causal_mask))
+    inputs.append(make_seqlen_tensor(ntoken))
+    return inputs
+
+
 def run_text_layer(graph, hidden_states, layer_weights, cos, sin, seqlen,
                    causal_mask=None):
-    """Execute one DecoderLayer through ATB on NPU.
+    """Execute one DecoderLayer and return CPU float output.
 
-    Args:
-        graph:         the shared DecoderLayer ATB graph.
-        hidden_states: (B, S, hidden_size) float tensor on CPU.
-        layer_weights: list of 11 weight tensors for this layer (NPU float16).
-        cos, sin:      (B*S, head_dim) float position embeddings on CPU.
-        seqlen:        int, total tokens (B*S).
-        causal_mask:   (S, S) float causal mask on NPU (optional).
-
-    Returns (B, S, hidden_size) float tensor on CPU.
+    This CPU-facing wrapper accepts ordinary CPU tensors (including weights and
+    masks), prepares ATB inputs, and preserves the public signature. ``seqlen``
+    is retained for compatibility; the graph length is derived from
+    ``hidden_states`` and passed as a CPU int32 tensor.
     """
-    ntoken = hidden_states.shape[0] * hidden_states.shape[1]
-    inputs = [hidden_states.half().npu()]
-    inputs.extend(layer_weights)  # already NPU float16
-    inputs.extend([cos.half().npu(), sin.half().npu()])
-    if causal_mask is not None:
-        inputs.append(causal_mask)
-    inputs.append(torch.tensor([ntoken], dtype=torch.int32))
-    return graph.forward(inputs)[0].cpu().float()
+    inputs = _text_layer_inputs(hidden_states, layer_weights, cos, sin,
+                                causal_mask=causal_mask)
+    return to_cpu_float(graph.forward(inputs)[0])
 
 
 def run_text_layer_fast(graph, hidden_states, layer_weights, cos_npu, sin_npu,
                          seqlen, causal_mask=None):
-    """Execute one DecoderLayer — cos/sin already NPU fp16.
-
-    Args:
-        graph:         the shared DecoderLayer ATB graph.
-        hidden_states: (B, S, hidden_size) float tensor on CPU.
-        layer_weights: list of 11 weight tensors (NPU float16).
-        cos_npu, sin_npu: (B*S, head_dim) float16 on NPU (pre-transferred).
-        seqlen:        int, total tokens (B*S).
-        causal_mask:   (S, S) float causal mask on NPU (optional).
-
-    Returns (B, S, hidden_size) float tensor on CPU.
-    """
-    ntoken = hidden_states.shape[0] * hidden_states.shape[1]
-    inputs = [hidden_states.half().npu()]
-    inputs.extend(layer_weights)
-    inputs.extend([cos_npu, sin_npu])
-    if causal_mask is not None:
-        inputs.append(causal_mask)
-    inputs.append(torch.tensor([ntoken], dtype=torch.int32))
-    return graph.forward(inputs)[0].cpu().float()
+    """Compatibility wrapper for callers that pre-transfer cos/sin to NPU."""
+    return run_text_layer(graph, hidden_states, layer_weights, cos_npu, sin_npu,
+                          seqlen, causal_mask=causal_mask)
 
 
 def run_text_layer_npu(graph, hidden_npu, layer_weights, cos_npu, sin_npu,
                         seqlen, causal_mask=None):
-    """Execute one DecoderLayer on NPU — hidden stays on NPU (no copy).
+    """Execute one DecoderLayer and keep output on NPU.
 
-    Args:
-        graph:         the shared DecoderLayer ATB graph.
-        hidden_npu:    (B, S, hidden_size) float16 on NPU.
-        layer_weights: list of 11 weight tensors (NPU float16).
-        cos_npu, sin_npu: (B*S, head_dim) float16 on NPU.
-        seqlen:        int, total tokens.
-        causal_mask:   (S, S) float16 on NPU (optional).
-
-    Returns (B, S, hidden_size) float16 on NPU.
+    Inputs may already be NPU-resident; placement helpers are no-op-safe. The
+    ``seqlen`` argument is kept for API compatibility and the actual CPU int32
+    graph input is derived from ``hidden_npu``.
     """
-    ntoken = hidden_npu.shape[0] * hidden_npu.shape[1]
-    inputs = [hidden_npu]
-    inputs.extend(layer_weights)
-    inputs.extend([cos_npu, sin_npu])
-    if causal_mask is not None:
-        inputs.append(causal_mask)
-    inputs.append(torch.tensor([ntoken], dtype=torch.int32))
+    inputs = _text_layer_inputs(hidden_npu, layer_weights, cos_npu, sin_npu,
+                                causal_mask=causal_mask)
     return graph.forward(inputs)[0]
 
 
 def run_text_norm(graph, hidden_states, norm_weight):
-    """Execute final RMSNorm on ATB NPU.
-
-    Returns (B, S, hidden_size) float tensor on CPU.
-    """
-    inputs = [hidden_states.half().npu(), norm_weight.half().npu()]
-    return graph.forward(inputs)[0].cpu().float()
+    """Execute final RMSNorm and return CPU float output."""
+    inputs = [to_npu_half(hidden_states), to_npu_half(norm_weight)]
+    return to_cpu_float(graph.forward(inputs)[0])
 
 
 def run_text_norm_npu(graph, hidden_npu, norm_weight):
-    """Execute final RMSNorm on ATB NPU — input and output stay on NPU."""
-    inputs = [hidden_npu, norm_weight]
+    """Execute final RMSNorm and keep output on NPU."""
+    inputs = [to_npu_half(hidden_npu), to_npu_half(norm_weight)]
     return graph.forward(inputs)[0]
 
 
 def run_text_model(text_model, hidden_states, cos, sin, seqlen,
                     layer_graph, norm_graph, use_mask=True):
-    """Run full Qwen3VLTextModel through ATB graphs (loop over layers).
+    """Run full Qwen3VLTextModel through ATB graphs.
 
-    Args:
-        text_model:     Qwen3VLTextModel instance (for weight access).
-        hidden_states:  (B, S, hidden_size) float tensor.
-        cos, sin:       (B*S, head_dim) float position embeddings.
-        seqlen:         int, total tokens.
-        layer_graph:    pre-built DecoderLayer ATB graph.
-        norm_graph:     pre-built FinalNorm ATB graph.
-        use_mask:       whether layer_graph was built with MASK_TYPE_NORM.
-
-    Returns (B, S, hidden_size) float tensor on CPU.
+    The public API is CPU-facing and returns CPU float output, but the layer
+    loop stays NPU-resident to avoid repeated transfers. ``seqlen`` is retained
+    for compatibility; per-layer graph lengths are derived from ``hidden``.
     """
     S = hidden_states.shape[1]
-    causal_mask = make_causal_mask(S) if use_mask else None
+    hidden = to_npu_half(hidden_states)
+    cos_npu = to_npu_half(cos)
+    sin_npu = to_npu_half(sin)
+    causal_mask = to_npu_half(make_causal_mask(S)) if use_mask else None
 
     for layer in text_model.layers:
-        w = collect_text_layer_weights(layer)
-        hidden_states = run_text_layer(layer_graph, hidden_states, w,
-                                       cos, sin, seqlen,
-                                       causal_mask=causal_mask)
+        w = prepare_npu_weights(collect_text_layer_weights(layer))
+        hidden = run_text_layer_npu(layer_graph, hidden, w, cos_npu, sin_npu,
+                                    seqlen, causal_mask=causal_mask)
 
-    return run_text_norm(norm_graph, hidden_states, text_model.norm.weight.data)
+    normed = run_text_norm_npu(norm_graph, hidden, text_model.norm.weight.data)
+    return to_cpu_float(normed)
