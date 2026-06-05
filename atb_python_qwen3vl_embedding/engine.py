@@ -208,7 +208,9 @@ class Qwen3VLEngine:
                                         cos_npu, sin_npu, S,
                                         causal_mask=self._cached_mask)
             if deepstack_features and li < len(deepstack_features):
-                hidden[0, visual_mask, :] += deepstack_features[li]
+                # clone + add + writeback (matches TF _deepstack_process)
+                local = hidden[0, visual_mask, :].clone() + deepstack_features[li]
+                hidden[0, visual_mask, :] = local
 
         return run_text_norm_npu(self.g_t_norm, hidden, self.norm_w).cpu().float()
 

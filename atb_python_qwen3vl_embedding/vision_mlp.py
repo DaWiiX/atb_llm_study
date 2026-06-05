@@ -32,7 +32,7 @@ def add_vision_mlp_graph(builder, inp_hidden,
     return fc2.get_output(0)
 
 
-def build_vision_mlp(config, name="VisionMLP"):
+def build_vision_mlp(hidden_size, intermediate_size, name="VisionMLP"):
     """Build standalone Qwen3VLVisionMLP ATB graph for testing.
 
     Returns (builder, graph_op, input_names).

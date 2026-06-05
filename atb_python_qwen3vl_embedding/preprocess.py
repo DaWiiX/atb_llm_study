@@ -77,7 +77,7 @@ def preprocess_image(image: torch.Tensor,
     new_h, new_w = smart_resize(h, w, factor=factor,
                                 min_pixels=min_pixels, max_pixels=max_pixels)
     image = F.interpolate(image.unsqueeze(0), size=(new_h, new_w),
-                          mode='bilinear', align_corners=False).squeeze(0)
+                          mode='bicubic', align_corners=False).squeeze(0)
 
     # Rescale to [0, 1] and normalize
     image = image / 255.0
