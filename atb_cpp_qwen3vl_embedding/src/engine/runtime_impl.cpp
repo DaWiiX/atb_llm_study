@@ -59,6 +59,11 @@ std::pair<uint8_t*, Status> RuntimeImpl::GetWorkspace(uint64_t required_size) {
     return buffer_pool_->GetWorkspace(required_size);
 }
 
+Status RuntimeImpl::SetBufferSize(uint64_t size_bytes) {
+    if (!buffer_pool_) return ERROR_NPU_MEMORY;
+    return buffer_pool_->SetBufferSize(static_cast<int64_t>(size_bytes));
+}
+
 WeightLoader* RuntimeImpl::GetWeightLoader() {
     return weight_loader_.get();
 }

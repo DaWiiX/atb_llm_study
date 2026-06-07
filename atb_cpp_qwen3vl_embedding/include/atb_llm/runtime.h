@@ -32,6 +32,11 @@ public:
     virtual TensorAllocator* GetAllocator() = 0;
     virtual std::pair<uint8_t*, Status> GetWorkspace(uint64_t required_size) = 0;
 
+    /// 设置 ATB buffer 大小（用于图执行的工作空间）
+    /// 应在模型 Load() 之前调用
+    /// @param size_bytes  buffer 大小（字节），0 = 自动
+    virtual Status SetBufferSize(uint64_t size_bytes) = 0;
+
     // ── 权重加载 ─────────────────────────────────────────
     virtual WeightLoader* GetWeightLoader() = 0;
 };

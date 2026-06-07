@@ -31,6 +31,7 @@ public:
     Status Synchronize() override;
     TensorAllocator* GetAllocator() override;
     std::pair<uint8_t*, Status> GetWorkspace(uint64_t required_size) override;
+    Status SetBufferSize(uint64_t size_bytes) override;
     WeightLoader* GetWeightLoader() override;
 
 private:

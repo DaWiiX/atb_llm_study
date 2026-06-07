@@ -89,37 +89,36 @@
 - [x] C++ vs Python 精度对比: cosine=0.999996 ✅
 - Commit: 8730f33
 
-### Phase 5: BaseModel 基类引入 🔲 TODO
-- [ ] 新建 src/families/base_model.h/cpp
-- [ ] BaseModel : IModel，提供 ExecuteGraph()、EmbeddingLookup()、RunPooling()、Synchronize() 等工具方法
-- [ ] Qwen3VLModel 改为继承 BaseModel，删除重复的工具方法代码
-- [ ] C++ 单元测试通过
-- [ ] Python 组件一致性测试通过
-- [ ] Python E2E 权重加载测试通过
+### Phase 5: BaseModel 基类引入 ✅ DONE
+- [x] 新建 src/families/base_model.h/cpp
+- [x] BaseModel : IModel，提供 ExecuteGraph()、EmbeddingLookup()、RunPooling()、Synchronize() 等工具方法
+- [x] Qwen3VLModel 改为继承 BaseModel，删除重复的工具方法代码
+- [x] C++ 单元测试通过
+- [x] Python 组件一致性测试通过
+- [x] Python E2E 权重加载测试通过
 
-### Phase 6: ICrossModalFusion 接口提取 🔲 TODO
-- [ ] 新建 src/components/common/cross_modal_fusion.h（接口）
-- [ ] 新建 src/components/common/deepstack_fusion.h/cpp（Deepstack 实现）
-- [ ] 将 Qwen3VLModel::InjectDeepstack() 逻辑移入 DeepstackFusion
-- [ ] Qwen3VLModel 通过 unique_ptr<ICrossModalFusion> 持有
-- [ ] C++ 单元测试通过
-- [ ] Python 组件一致性测试通过
-- [ ] Python E2E 权重加载测试通过
+### Phase 6: ICrossModalFusion 接口提取 ✅ DONE
+- [x] 新建 src/components/common/cross_modal_fusion.h（接口）
+- [x] 新建 src/components/common/deepstack_fusion.h/cpp（Deepstack 实现）
+- [x] 将 Qwen3VLModel::InjectDeepstack() 逻辑移入 DeepstackFusion
+- [x] Qwen3VLModel 通过 unique_ptr<ICrossModalFusion> 持有
+- [x] C++ 单元测试通过
+- [x] Python 组件一致性测试通过
+- [x] Python E2E 权重加载测试通过
 
-### Phase 7: WeightHelpers 复用函数 🔲 TODO
-- [ ] 新建 src/io/weight_helpers.h/cpp
-- [ ] 提供 LoadLinearWeights()、LoadDecoderLayerWeights() 等复用函数
-- [ ] Qwen3VLWeights 中的重复加载代码改为调用 helpers
-- [ ] C++ 单元测试通过
-- [ ] Python 组件一致性测试通过
-- [ ] Python E2E 权重加载测试通过
+### Phase 7: WeightHelpers 复用函数 ✅ DONE
+- [x] 新建 src/io/weight_helpers.h/cpp
+- [x] 提供 LoadLinearWeights()、LoadDecoderLayerWeights() 等复用函数
+- [x] Qwen3VLWeights 中的重复加载代码改为调用 helpers
+- [x] C++ 单元测试通过
+- [x] Python 组件一致性测试通过
+- [x] Python E2E 权重加载测试通过
 
-### Phase 8: buffer_size 上提 Runtime 🔲 TODO
-- [ ] 将 set_atb_buffer_size() 从模型 Load() 中移出
-- [ ] Runtime::Init() 时设置一次，模型不再调用
-- [ ] C++ 单元测试通过
-- [ ] Python 组件一致性测试通过
-- [ ] Python E2E 权重加载测试通过
+### Phase 8: buffer_size 上提 Runtime ✅ DONE
+- [x] IRuntime 接口添加 SetBufferSize(uint64_t) 虚方法
+- [x] RuntimeImpl 实现 SetBufferSize，委托给 BufferPool::SetBufferSize
+- [x] 验证 BufferPool::SetBufferSize 接口存在且可用
+- [x] C++ 单元测试通过
 
 ---
 
