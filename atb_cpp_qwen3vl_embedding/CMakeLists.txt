@@ -80,6 +80,7 @@ set(ENGINE_SRCS
     src/components/common/swiglu_mlp_graph.cpp
     src/components/common/rms_norm_graph.cpp
     src/components/common/mrope.cpp
+    src/components/common/deepstack_fusion.cpp
     # components/text
     src/components/text/decoder_layer_graph.cpp
     # components/vision

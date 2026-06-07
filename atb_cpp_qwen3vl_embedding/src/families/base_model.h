@@ -12,8 +12,9 @@ namespace families {
 /// 模型基类 -- 提供多模型共享的工具方法
 ///
 /// 继承 IModel，添加 ExecuteGraph、EmbeddingLookup、FindImageTokenPositions、
-/// RunPooling、InjectDeepstack 等通用工具。子类（如 Qwen3VLModel）继承 BaseModel，
+/// RunPooling 等通用工具。子类（如 Qwen3VLModel）继承 BaseModel，
 /// 不再重复实现这些方法。
+/// Deepstack 注入逻辑已移至 components::DeepstackFusion。
 class BaseModel : public IModel {
 public:
     BaseModel() = default;
@@ -52,15 +53,6 @@ protected:
                       int64_t hidden_size, bool normalize,
                       PoolingStrategy strategy,
                       InferResult& result);
-
-    // ── Deepstack 注入 ────────────────────────────────────
-    /// 将 deepstack 特征加法注入到 hidden states 的特定位置
-    void InjectDeepstack(NpuTensor& hidden_npu,
-                         const std::vector<uint16_t>& ds_feat,
-                         const std::vector<int64_t>& positions,
-                         int64_t seq_len, int64_t hidden_size,
-                         int64_t feat_dim,
-                         IRuntime* runtime);
 };
 
 }  // namespace families

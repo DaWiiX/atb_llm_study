@@ -109,12 +109,34 @@ Status Qwen3VLModel::BuildGraphs() {
         return s;
     }
 
+    // Build deepstack merger graph and create DeepstackFusion component
+    OperationHandle deepstack_graph;
     s = components::DeepstackGraph::Build(
         "DeepstackMerger", config_.vis_hidden_size, config_.vis_spatial_merge_size,
-        config_.vis_epsilon, vis_deepstack_graph_);
+        config_.vis_epsilon, deepstack_graph);
     if (s != STATUS_OK) {
         LOG_ERROR("Failed to build DeepstackMerger graph");
         return s;
+    }
+
+    components::DeepstackFusion::Config ds_cfg;
+    ds_cfg.vis_hidden_size = config_.vis_hidden_size;
+    ds_cfg.vis_out_hidden_size = config_.vis_out_hidden_size;
+    ds_cfg.spatial_merge_size = config_.vis_spatial_merge_size;
+    ds_cfg.deepstack_visual_indexes = config_.vis_deepstack_visual_indexes;
+    deepstack_fusion_ = std::make_unique<components::DeepstackFusion>(ds_cfg, std::move(deepstack_graph));
+
+    // Set merger weights from loaded weights
+    for (size_t i = 0; i < weights_.deepstack_mergers.size(); i++) {
+        const auto& mw = weights_.deepstack_mergers[i];
+        components::DeepstackMergerWeights ds_w;
+        ds_w.norm_weight = mw.norm_weight;
+        ds_w.norm_bias = mw.norm_bias;
+        ds_w.fc1_weight = mw.fc1_weight;
+        ds_w.fc1_bias = mw.fc1_bias;
+        ds_w.fc2_weight = mw.fc2_weight;
+        ds_w.fc2_bias = mw.fc2_bias;
+        deepstack_fusion_->SetMergerWeights(i, ds_w);
     }
 
     // Text norm graph
@@ -331,7 +353,7 @@ Status Qwen3VLModel::RunTextDecoder(uint16_t* hidden_states, int32_t seq_len,
         h_npu = std::move(h_out);
         if (li < static_cast<int32_t>(ds_features.size()) &&
             !ds_features[li].empty() && !image_token_positions.empty()) {
-            BaseModel::InjectDeepstack(h_npu, ds_features[li], image_token_positions, n, hs, ved, runtime_);
+            deepstack_fusion_->InjectFeatures(h_npu, ds_features[li], image_token_positions, n, hs, ved, runtime_);
         }
     }
     NpuTensor norm_out = AllocNpuFloat16({n, hs});
@@ -464,35 +486,14 @@ Status Qwen3VLModel::RunVision(const uint16_t* pixel_values, int64_t num_patches
         h_npu = std::move(h_out);
 
         // Check if this layer produces deepstack features
-        auto it = std::find(config_.vis_deepstack_visual_indexes.begin(),
-                            config_.vis_deepstack_visual_indexes.end(), li);
-        if (it != config_.vis_deepstack_visual_indexes.end()) {
-            size_t ds_idx = std::distance(config_.vis_deepstack_visual_indexes.begin(), it);
-            const auto& mw = weights_.deepstack_mergers[ds_idx];
-
-            int64_t merged_tokens = total_tokens / (merge_size * merge_size);
-            NpuTensor ds_out = AllocNpuFloat16({merged_tokens, config_.vis_out_hidden_size});
-
-            atb::VariantPack ds_vp;
-            ds_vp.inTensors = {
-                *h_npu.Get(),
-                mw.norm_weight, mw.norm_bias,
-                mw.fc1_weight, mw.fc1_bias,
-                mw.fc2_weight, mw.fc2_bias};
-            ds_vp.outTensors = {*ds_out.Get()};
-
-            s = ExecuteGraph(vis_deepstack_graph_, ds_vp);
-            if (s != STATUS_OK) {
-                LOG_ERROR("DeepstackMerger %zu execution failed", ds_idx);
-                return s;
+        size_t fusion_idx = 0;
+        if (deepstack_fusion_->IsDeepstackLayer(li, fusion_idx)) {
+            Status ds_s = deepstack_fusion_->ExtractFeatures(
+                h_npu, total_tokens, li, fusion_idx, runtime_, ds_features);
+            if (ds_s != STATUS_OK) {
+                LOG_ERROR("DeepstackMerger %zu execution failed", fusion_idx);
+                return ds_s;
             }
-
-            // Copy deepstack features to host
-            size_t ds_bytes = static_cast<size_t>(merged_tokens) *
-                              config_.vis_out_hidden_size * sizeof(uint16_t);
-            ds_features[ds_idx].resize(merged_tokens * config_.vis_out_hidden_size);
-            alloc->CopyToHost(ds_features[ds_idx].data(), *ds_out.Get(), ds_bytes);
-            // ds_out auto-freed at end of block
         }
     }
 

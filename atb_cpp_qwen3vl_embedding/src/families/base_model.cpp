@@ -149,31 +149,5 @@ Status BaseModel::RunPooling(const uint16_t* hidden_states, int64_t seq_len,
     return STATUS_OK;
 }
 
-// ═════════════════════════════════════════════════════════════════════
-// InjectDeepstack
-// ═════════════════════════════════════════════════════════════════════
-
-void BaseModel::InjectDeepstack(NpuTensor& hidden_npu,
-                                const std::vector<uint16_t>& ds_feat,
-                                const std::vector<int64_t>& positions,
-                                int64_t seq_len, int64_t hidden_size,
-                                int64_t feat_dim,
-                                IRuntime* runtime) {
-    auto* alloc = runtime->GetAllocator();
-    size_t h_bytes = static_cast<size_t>(seq_len) * hidden_size * sizeof(uint16_t);
-    std::vector<uint16_t> h_host(seq_len * hidden_size);
-    alloc->CopyToHost(h_host.data(), *hidden_npu.Get(), h_bytes);
-    int64_t ds_tokens = ds_feat.size() / feat_dim;
-    for (int64_t t = 0; t < ds_tokens && t < static_cast<int64_t>(positions.size()); t++) {
-        int64_t pos = positions[t];
-        for (int64_t d = 0; d < feat_dim; d++) {
-            float h = atb_llm::Fp16ToF32(h_host[pos * hidden_size + d]);
-            float ds = atb_llm::Fp16ToF32(ds_feat[t * feat_dim + d]);
-            h_host[pos * hidden_size + d] = atb_llm::Fp32ToFp16(h + ds);
-        }
-    }
-    alloc->CopyToDevice(*hidden_npu.Get(), h_host.data(), h_bytes);
-}
-
 }  // namespace families
 }  // namespace atb_llm

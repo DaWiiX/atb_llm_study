@@ -7,6 +7,7 @@
 #include "core/raii.h"
 #include "core/npu_tensor.h"
 #include "components/common/mrope.h"
+#include "components/common/deepstack_fusion.h"
 #include <cstdint>
 #include <memory>
 #include <vector>
@@ -52,9 +53,11 @@ private:
     OperationHandle vis_first_layer_graph_;
     OperationHandle vis_block_graph_;
     OperationHandle vis_merger_graph_;
-    OperationHandle vis_deepstack_graph_;
     OperationHandle text_decoder_graph_;
     OperationHandle text_norm_graph_;
+
+    // ── Cross-modal fusion ────────────────────────────────
+    std::unique_ptr<components::DeepstackFusion> deepstack_fusion_;
 
     int32_t cached_text_seq_len_ = 0;
 
