@@ -1,4 +1,4 @@
-#include "models/vision_model.h"
+#include "runners/vision_runner.h"
 #include "components/vision/vision_block_graph.h"
 #include "components/vision/patch_embed_graph.h"
 #include "components/vision/vision_merger_graph.h"
@@ -8,11 +8,11 @@
 #include "log/logger.h"
 
 namespace atb_llm {
-namespace models {
+namespace runners {
 
-VisionModel::VisionModel(const Config& cfg) : cfg_(cfg) {}
+VisionRunner::VisionRunner(const Config& cfg) : cfg_(cfg) {}
 
-Status VisionModel::Build() {
+Status VisionRunner::Build() {
     int32_t nh = cfg_.num_heads;
     int32_t hd = cfg_.hidden_size / nh;
 
@@ -49,12 +49,12 @@ Status VisionModel::Build() {
         return s;
     }
 
-    LOG_INFO("VisionModel built: depth=%d, nh=%d, hd=%d, hs=%d",
+    LOG_INFO("VisionRunner built: depth=%d, nh=%d, hd=%d, hs=%d",
              cfg_.depth, nh, hd, cfg_.hidden_size);
     return STATUS_OK;
 }
 
-Status BuildVisionFirstLayer(const VisionModel::Config& cfg, OperationHandle& out) {
+Status BuildVisionFirstLayer(const VisionRunner::Config& cfg, OperationHandle& out) {
     int32_t nh = cfg.num_heads;
     int32_t hd = cfg.hidden_size / nh;
 
@@ -81,7 +81,6 @@ Status BuildVisionFirstLayer(const VisionModel::Config& cfg, OperationHandle& ou
     };
 
     // ── Patch Embed: pixels -> flat -> Linear -> patched ──
-    // Build as a sub-graph
     OperationHandle pe_graph;
     s = components::PatchEmbedGraph::Build(
         "PatchEmbed", cfg.in_channels, cfg.temporal_patch_size,
@@ -120,5 +119,5 @@ Status BuildVisionFirstLayer(const VisionModel::Config& cfg, OperationHandle& ou
     return STATUS_OK;
 }
 
-} // namespace models
+} // namespace runners
 } // namespace atb_llm

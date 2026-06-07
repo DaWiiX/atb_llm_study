@@ -89,9 +89,9 @@ set(ENGINE_SRCS
     src/components/vision/vision_attention_graph.cpp
     src/components/vision/patch_embed_graph.cpp
     src/components/vision/deepstack_graph.cpp
-    # models
-    src/models/vision_model.cpp
-    src/models/text_model.cpp
+    # runners
+    src/runners/vision_runner.cpp
+    src/runners/text_runner.cpp
     # adapters
     src/adapters/qwen3vl_embedding/qwen3vl_model.cpp
     src/adapters/qwen3vl_embedding/qwen3vl_weights.cpp

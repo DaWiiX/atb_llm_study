@@ -45,7 +45,7 @@
 #include "components/vision/deepstack_graph.h"
 
 // Vision Model
-#include "models/vision_model.h"
+#include "runners/vision_runner.h"
 
 // Position
 #include "components/common/mrope.h"
@@ -227,7 +227,7 @@ TEST_CASE("DeepstackGraph") {
 TEST_CASE("VisionModel") {
     LOG_INFO("=== Test: VisionModel ===");
 
-    atb_llm::models::VisionModel::Config cfg;
+    atb_llm::runners::VisionRunner::Config cfg;
     cfg.hidden_size = 1280;
     cfg.num_heads = 16;
     cfg.depth = 24;
@@ -236,7 +236,7 @@ TEST_CASE("VisionModel") {
     cfg.patch_size = 14;
     cfg.spatial_merge_size = 2;
 
-    atb_llm::models::VisionModel model(cfg);
+    atb_llm::runners::VisionRunner model(cfg);
     atb_llm::Status s = model.Build();
     CHECK(IS_OK(s));
 

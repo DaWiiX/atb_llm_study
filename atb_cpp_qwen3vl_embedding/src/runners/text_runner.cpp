@@ -1,22 +1,25 @@
-#include "models/text_model.h"
+#include "runners/text_runner.h"
 #include "components/common/rms_norm_graph.h"
 #include "components/text/decoder_layer_graph.h"
 #include "log/logger.h"
-#include <cstring>
-#include <limits>
 
 namespace atb_llm {
-namespace models {
+namespace runners {
 
-TextModel::TextModel(const Config& cfg) : cfg_(cfg) {}
+TextRunner::TextRunner(const Config& cfg) : cfg_(cfg) {}
 
-Status TextModel::Build(int32_t seq_len) {
-    // Build the shared decoder layer graph (built once, looped 28 times)
+Status TextRunner::EnsureBuilt(int32_t seq_len) {
+    // No-op if already built for this sequence length
+    if (cached_seq_len_ == seq_len && layer_graph_) {
+        return STATUS_OK;
+    }
+
+    // Build the shared decoder layer graph (built once, looped N times)
     Status s = components::text::TextDecoderLayerGraph::Build(
         "TextDecoderLayer",
         cfg_.num_heads, cfg_.num_kv_heads, cfg_.head_dim,
-        seq_len, cfg_.epsilon, /*use_mask=*/true,
-        layer_graph_);
+        seq_len, cfg_.epsilon, cfg_.use_mask,
+        layer_graph_, cfg_.use_qk_norm, cfg_.rotary_dim);
     if (s != STATUS_OK) {
         LOG_ERROR("Failed to build TextDecoderLayer graph");
         return s;
@@ -29,7 +32,8 @@ Status TextModel::Build(int32_t seq_len) {
         return s;
     }
 
-    LOG_INFO("TextModel built: %d layers, nh=%d, kv_nh=%d, hd=%d, S=%d",
+    cached_seq_len_ = seq_len;
+    LOG_INFO("TextRunner built: %d layers, nh=%d, kv_nh=%d, hd=%d, S=%d",
              cfg_.num_layers, cfg_.num_heads, cfg_.num_kv_heads,
              cfg_.head_dim, seq_len);
     return STATUS_OK;
@@ -46,5 +50,5 @@ void MakeCausalMask(int32_t seq_len, float* mask_out) {
     }
 }
 
-} // namespace models
+} // namespace runners
 } // namespace atb_llm

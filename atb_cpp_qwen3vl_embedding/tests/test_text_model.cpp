@@ -19,7 +19,7 @@
 #include "core/graph_builder.h"
 #include "core/context_manager.h"
 #include "core/tensor_allocator.h"
-#include "models/text_model.h"
+#include "runners/text_runner.h"
 #include "engine/runtime_impl.h"
 #include "log/logger.h"
 
@@ -36,7 +36,7 @@
 TEST_CASE("TextModel Build") {
     LOG_INFO("=== Test: TextModel Build ===");
 
-    atb_llm::models::TextModel::Config cfg;
+    atb_llm::runners::TextRunner::Config cfg;
     cfg.num_heads = 12;
     cfg.num_kv_heads = 12;
     cfg.head_dim = 64;
@@ -44,8 +44,8 @@ TEST_CASE("TextModel Build") {
     cfg.num_layers = 28;
     cfg.epsilon = 1e-6f;
 
-    atb_llm::models::TextModel model(cfg);
-    atb_llm::Status s = model.Build(8);  // seq_len=8
+    atb_llm::runners::TextRunner model(cfg);
+    atb_llm::Status s = model.EnsureBuilt(8);  // seq_len=8
     CHECK(IS_OK(s));
 
     CHECK(model.GetLayerGraph().get() != nullptr);
@@ -71,7 +71,7 @@ TEST_CASE("Causal Mask") {
 
     int32_t seq_len = 4;
     std::vector<float> mask(seq_len * seq_len);
-    atb_llm::models::MakeCausalMask(seq_len, mask.data());
+    atb_llm::runners::MakeCausalMask(seq_len, mask.data());
 
     // Upper triangle should be -65504, lower triangle + diagonal should be 0
     bool correct = true;
@@ -103,7 +103,7 @@ TEST_CASE("TextModel Execute") {
     auto* ctx = runtime->GetContext();
 
     // Small dimensions for testing
-    atb_llm::models::TextModel::Config cfg;
+    atb_llm::runners::TextRunner::Config cfg;
     cfg.num_heads = 4;
     cfg.num_kv_heads = 4;
     cfg.head_dim = 32;
@@ -116,8 +116,8 @@ TEST_CASE("TextModel Execute") {
     int32_t hd = cfg.head_dim;
     int32_t hidden = nh * hd;
 
-    atb_llm::models::TextModel model(cfg);
-    atb_llm::Status s = model.Build(seq_len);
+    atb_llm::runners::TextRunner model(cfg);
+    atb_llm::Status s = model.EnsureBuilt(seq_len);
     CHECK(IS_OK(s));
 
     REQUIRE(model.GetLayerGraph().get() != nullptr);
@@ -265,15 +265,15 @@ TEST_CASE("TextModel Execute") {
 TEST_CASE("TextModel GQA") {
     LOG_INFO("=== Test: TextModel GQA ===");
 
-    atb_llm::models::TextModel::Config cfg;
+    atb_llm::runners::TextRunner::Config cfg;
     cfg.num_heads = 12;
     cfg.num_kv_heads = 2;  // GQA: 12 query heads, 2 KV heads
     cfg.head_dim = 64;
     cfg.intermediate_size = 256;
     cfg.num_layers = 28;
 
-    atb_llm::models::TextModel model(cfg);
-    atb_llm::Status s = model.Build(8);
+    atb_llm::runners::TextRunner model(cfg);
+    atb_llm::Status s = model.EnsureBuilt(8);
     CHECK(IS_OK(s));
 
     if (model.GetLayerGraph()) {

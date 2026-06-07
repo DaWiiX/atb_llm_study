@@ -8,8 +8,8 @@
 #include "components/vision/patch_embed_graph.h"
 #include "components/common/rms_norm_graph.h"
 #include "components/text/decoder_layer_graph.h"
-#include "models/text_model.h"
-#include "models/vision_model.h"
+#include "runners/text_runner.h"
+#include "runners/vision_runner.h"
 #include "core/graph_builder.h"
 #include "core/tensor_allocator.h"
 #include "core/npu_tensor.h"
@@ -72,9 +72,9 @@ Status Qwen3VLModel::BuildGraphs() {
     int32_t vis_hd = config_.vis_head_dim();
 
     // Vision graphs
-    Status s = models::BuildVisionFirstLayer(
+    Status s = runners::BuildVisionFirstLayer(
         [&]() {
-            models::VisionModel::Config vc;
+            runners::VisionRunner::Config vc;
             vc.hidden_size = config_.vis_hidden_size;
             vc.num_heads = config_.vis_num_heads;
             vc.intermediate_size = config_.vis_intermediate_size;
@@ -259,7 +259,7 @@ Status Qwen3VLModel::PrepareInputs(const InferRequest& request,
 
     // Causal mask
     mask.resize(seq_len * seq_len);
-    models::MakeCausalMask(seq_len, mask.data());
+    runners::MakeCausalMask(seq_len, mask.data());
     return STATUS_OK;
 }
 

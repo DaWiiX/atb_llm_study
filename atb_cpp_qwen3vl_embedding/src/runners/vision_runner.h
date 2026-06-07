@@ -6,9 +6,9 @@
 #include <vector>
 
 namespace atb_llm {
-namespace models {
+namespace runners {
 
-/// Qwen3VL Vision Model runner.
+/// Vision Runner — manages ATB graph lifecycle for vision encoder.
 ///
 /// Split-graph strategy:
 ///   1. first_layer: patch_embed + pos_embed + block 0  (built once)
@@ -16,10 +16,11 @@ namespace models {
 ///   3. merger:      LayerNorm -> reshape -> fc1 -> GELU -> fc2
 ///   4. deepstack:   reshape -> LayerNorm -> fc1 -> GELU -> fc2
 ///
-/// Equivalent to Python vision_model.py.
-class VisionModel {
+/// This runner only manages graph building.
+/// Execution orchestration is the responsibility of the adapter/family layer.
+class VisionRunner {
 public:
-    /// Vision model configuration.
+    /// Vision runner configuration.
     struct Config {
         int32_t hidden_size = 1280;
         int32_t num_heads = 16;
@@ -35,7 +36,7 @@ public:
     };
 
     /// Constructor.
-    explicit VisionModel(const Config& cfg);
+    explicit VisionRunner(const Config& cfg);
 
     /// Build all required ATB graphs.
     /// @return STATUS_OK on success
@@ -68,7 +69,7 @@ private:
 /// @param cfg  Vision config
 /// @param out  Output: RAII operation handle
 /// @return STATUS_OK on success
-Status BuildVisionFirstLayer(const VisionModel::Config& cfg, OperationHandle& out);
+Status BuildVisionFirstLayer(const VisionRunner::Config& cfg, OperationHandle& out);
 
-} // namespace models
+} // namespace runners
 } // namespace atb_llm
