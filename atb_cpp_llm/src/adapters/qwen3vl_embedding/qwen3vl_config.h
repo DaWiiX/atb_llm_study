@@ -15,6 +15,7 @@ namespace adapters {
 struct Qwen3VLConfig {
     // ── Top-level ──────────────────────────────────────────
     int64_t image_token_id = 151655;
+    int64_t vision_start_token_id = 151652;
 
     // ── Text config ────────────────────────────────────────
     int32_t text_hidden_size = 2048;

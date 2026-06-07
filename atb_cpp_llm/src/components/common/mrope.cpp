@@ -109,13 +109,13 @@ VisionRotaryEmbedding::VisionRotaryEmbedding(int32_t dim) : dim_(dim) {
 }
 
 std::vector<float> VisionRotaryEmbedding::ComputeFreqTable(int32_t max_hw) const {
-    // freq_table[pos, i] = pos * inv_freq[i]
-    // Shape: (max_hw, dim)
+    // Python: einsum("i,j->ij", t, inv_freq) -> (max_hw, dim//2)
+    // inv_freq has dim//2 elements, so output has dim//2 columns
     int32_t half = dim_ / 2;
-    std::vector<float> table(max_hw * dim_);
+    std::vector<float> table(max_hw * half);
     for (int32_t p = 0; p < max_hw; p++) {
         for (int32_t i = 0; i < half; i++) {
-            table[p * dim_ + i] = static_cast<float>(p) * inv_freq_[i];
+            table[p * half + i] = static_cast<float>(p) * inv_freq_[i];
         }
     }
     return table;
@@ -143,9 +143,11 @@ int64_t ComputeVisionRotPosEmb(const int64_t* grid_thw, int64_t num_images,
                                 const std::vector<float>& freq_table,
                                 float* out_cos, float* out_sin) {
     int32_t dim = rotary_emb.Dim();
-    // freq_table shape: (max_hw, dim)
-    // We need to compute position IDs (row_idx, col_idx) for each token,
-    // then look up freq_table and produce cos/sin.
+    int32_t half = dim / 2;
+    // freq_table shape: (max_hw, half) — matches Python einsum output
+    // rope = Concat(row_freq, col_freq) -> (half*2,) = (dim,)
+    // emb = Concat(rope, rope) -> (dim*2,)
+    // cos/sin per token: dim*2 elements = vis_hd
 
     // First pass: compute total tokens
     int64_t total_tokens = 0;
@@ -175,26 +177,29 @@ int64_t ComputeVisionRotPosEmb(const int64_t* grid_thw, int64_t num_images,
                             int64_t col_idx = bc * merge_size + ic;
 
                             // Look up freq_table for row and col
-                            const float* row_freq = freq_table.data() + row_idx * dim;
-                            const float* col_freq = freq_table.data() + col_idx * dim;
+                            // freq_table is (max_hw, half), stride = half
+                            const float* row_freq = freq_table.data() + row_idx * half;
+                            const float* col_freq = freq_table.data() + col_idx * half;
 
-                            // Concatenate: [row_freq..., col_freq...] -> (dim*2,)
-                            // Then cos/sin. But output is (total_tokens, dim*2) in Python.
-                            // Actually in Python: freq_table[pos_ids].flatten(1) -> (total, dim*2)
-                            // pos_ids has shape (total, 2) with (row_idx, col_idx)
-                            // freq_table[pos_ids] -> (total, 2, dim) -> flatten -> (total, 2*dim)
-                            float* cos_row = out_cos + offset * dim * 2;
-                            float* sin_row = out_sin + offset * dim * 2;
-                            for (int32_t d = 0; d < dim; d++) {
-                                // row component
+                            // Python: rope = Concat(row_freq, col_freq) -> (half*2,)
+                            //         emb = Concat(rope, rope) -> (half*4,)
+                            //         cos_out = Cos(emb), sin_out = Sin(emb)
+                            // Output per token: half*4 = dim*2 elements
+                            int32_t out_dim = half * 4;  // = dim * 2
+                            float* cos_row = out_cos + offset * out_dim;
+                            float* sin_row = out_sin + offset * out_dim;
+                            // First half: [row, col] -> half*2 elements
+                            for (int32_t d = 0; d < half; d++) {
                                 cos_row[d] = std::cos(row_freq[d]);
                                 sin_row[d] = std::sin(row_freq[d]);
                             }
-                            for (int32_t d = 0; d < dim; d++) {
-                                // col component
-                                cos_row[dim + d] = std::cos(col_freq[d]);
-                                sin_row[dim + d] = std::sin(col_freq[d]);
+                            for (int32_t d = 0; d < half; d++) {
+                                cos_row[half + d] = std::cos(col_freq[d]);
+                                sin_row[half + d] = std::sin(col_freq[d]);
                             }
+                            // Second half: duplicate [row, col]
+                            std::memcpy(cos_row + half * 2, cos_row, half * 2 * sizeof(float));
+                            std::memcpy(sin_row + half * 2, sin_row, half * 2 * sizeof(float));
 
                             offset++;
                         }
@@ -214,15 +219,36 @@ int64_t ComputeVisionRotPosEmb(const int64_t* grid_thw, int64_t num_images,
 void GetRopeIndex(const int64_t* input_ids,
                   int64_t batch_size, int64_t seq_len,
                   const int64_t* image_grid_thw, int64_t num_images,
-                  int64_t image_token_id, int64_t spatial_merge_size,
+                  int64_t image_token_id, int64_t vision_start_token_id,
+                  int64_t spatial_merge_size,
                   int64_t* position_ids_out) {
-    // position_ids_out: (3, B, S) int64
-    // For text-only case (no images): sequential positions for all 3 dims
-    if (image_grid_thw == nullptr || num_images == 0) {
+    // position_ids_out: (3, B, S) int64, stored as contiguous [3][B][S]
+
+    // Count image segments: look for vision_start_token_id followed by image_token_id.
+    // Matches Python: vision_start_indices = argwhere(ids == vision_start_token_id)
+    //                 vision_tokens = ids[vision_start_indices + 1]
+    //                 image_nums = (vision_tokens == image_token_id).sum()
+    int64_t image_nums = 0;
+    if (image_grid_thw != nullptr && num_images > 0) {
+        for (int64_t b = 0; b < batch_size; b++) {
+            const int64_t* ids = input_ids + b * seq_len;
+            for (int64_t s = 0; s < seq_len - 1; s++) {
+                if (ids[s] == vision_start_token_id &&
+                    ids[s + 1] == image_token_id) {
+                    image_nums++;
+                    if (image_nums >= num_images) break;
+                }
+            }
+            if (image_nums >= num_images) break;
+        }
+    }
+
+    // No image segments detected: use sequential positions for all tokens.
+    // This matches Python's fallback for inputs without vision_start_token_id.
+    if (image_nums == 0) {
         for (int64_t b = 0; b < batch_size; b++) {
             for (int64_t s = 0; s < seq_len; s++) {
                 int64_t pos = s;
-                // All 3 dims get the same sequential position
                 position_ids_out[0 * batch_size * seq_len + b * seq_len + s] = pos;
                 position_ids_out[1 * batch_size * seq_len + b * seq_len + s] = pos;
                 position_ids_out[2 * batch_size * seq_len + b * seq_len + s] = pos;
@@ -231,35 +257,38 @@ void GetRopeIndex(const int64_t* input_ids,
         return;
     }
 
-    // With images: visual tokens get 2D grid positions, text tokens sequential
-    // Simplified implementation for batch_size=1 (common for embedding models)
-    int64_t image_index = 0;
-    int64_t st = 0;
-    int64_t pos_counter = 0;
+    // Process batches with image segments. For each batch:
+    //   1. Find image segments (marked by image_token_id after vision_start_token_id)
+    //   2. Text before each image: sequential positions
+    //   3. Image tokens: 2D grid positions (T,H,W dims)
+    //   4. Text after last image: sequential positions
+    for (int64_t b = 0; b < batch_size; b++) {
+        const int64_t* ids = input_ids + b * seq_len;
+        int64_t* pid = position_ids_out + b * seq_len;  // points to (3, S) for this batch
+        int64_t stride_bs = batch_size * seq_len;  // stride between T/H/W dims
 
-    const int64_t* ids = input_ids;  // batch 0
+        int64_t image_index = 0;
+        int64_t st = 0;          // current position in the sequence
+        int64_t pos_counter = 0; // next position index for text tokens
 
-    // Count image tokens
-    int64_t image_count = 0;
-    for (int64_t s = 0; s < seq_len; s++) {
-        if (ids[s] == image_token_id) image_count++;
-    }
+        for (int64_t iter = 0; iter < image_nums; iter++) {
+            // Find first image_token_id at or after st (this is the start of image segment)
+            int64_t ed = st;
+            while (ed < seq_len && ids[ed] != image_token_id) {
+                ed++;
+            }
+            if (ed >= seq_len) break;
 
-    // Process text segments and image regions
-    int64_t remaining_images = image_count;
-
-    for (int64_t s = 0; s < seq_len && remaining_images > 0; s++) {
-        if (ids[s] == image_token_id) {
-            // Text tokens before this image token
-            int64_t text_len = s - st;
+            // Text tokens before this image segment: all 3 dims get sequential values
+            int64_t text_len = ed - st;
             for (int64_t t = 0; t < text_len; t++) {
                 int64_t idx = st + t;
-                for (int d = 0; d < 3; d++) {
-                    position_ids_out[d * batch_size * seq_len + idx] = pos_counter + t;
-                }
+                int64_t val = pos_counter + t;
+                pid[0 * stride_bs + idx] = val;
+                pid[1 * stride_bs + idx] = val;
+                pid[2 * stride_bs + idx] = val;
             }
             pos_counter += text_len;
-            st = s;
 
             // Image tokens: 2D grid positions
             if (image_index < num_images) {
@@ -267,35 +296,37 @@ void GetRopeIndex(const int64_t* input_ids,
                 int64_t h_dim = image_grid_thw[image_index * 3 + 1] / spatial_merge_size;
                 int64_t w_dim = image_grid_thw[image_index * 3 + 2] / spatial_merge_size;
 
-                int64_t img_tokens = t_dim * h_dim * w_dim;
                 int64_t img_offset = 0;
-                for (int64_t ti = 0; ti < t_dim && st + img_offset < seq_len; ti++) {
-                    for (int64_t hi = 0; hi < h_dim && st + img_offset < seq_len; hi++) {
-                        for (int64_t wi = 0; wi < w_dim && st + img_offset < seq_len; wi++) {
-                            int64_t idx = st + img_offset;
-                            position_ids_out[0 * batch_size * seq_len + idx] = pos_counter + ti;
-                            position_ids_out[1 * batch_size * seq_len + idx] = pos_counter + hi;
-                            position_ids_out[2 * batch_size * seq_len + idx] = pos_counter + wi;
+                for (int64_t ti = 0; ti < t_dim; ti++) {
+                    for (int64_t hi = 0; hi < h_dim; hi++) {
+                        for (int64_t wi = 0; wi < w_dim; wi++) {
+                            int64_t idx = ed + img_offset;
+                            if (idx >= seq_len) break;
+                            pid[0 * stride_bs + idx] = pos_counter + ti;
+                            pid[1 * stride_bs + idx] = pos_counter + hi;
+                            pid[2 * stride_bs + idx] = pos_counter + wi;
                             img_offset++;
                         }
                     }
                 }
 
-                st += img_offset;
+                st = ed + t_dim * h_dim * w_dim;
                 pos_counter += std::max({t_dim, h_dim, w_dim});
                 image_index++;
+            } else {
+                st = ed;
             }
-            remaining_images--;
         }
-    }
 
-    // Remaining text tokens after last image
-    if (st < seq_len) {
-        int64_t text_len = seq_len - st;
-        for (int64_t t = 0; t < text_len; t++) {
-            int64_t idx = st + t;
-            for (int d = 0; d < 3; d++) {
-                position_ids_out[d * batch_size * seq_len + idx] = pos_counter + t;
+        // Remaining text after last image segment
+        if (st < seq_len) {
+            int64_t text_len = seq_len - st;
+            for (int64_t t = 0; t < text_len; t++) {
+                int64_t idx = st + t;
+                int64_t val = pos_counter + t;
+                pid[0 * stride_bs + idx] = val;
+                pid[1 * stride_bs + idx] = val;
+                pid[2 * stride_bs + idx] = val;
             }
         }
     }

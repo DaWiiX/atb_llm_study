@@ -16,6 +16,7 @@ Status LoadQwen3VLConfig(const std::string& model_dir, Qwen3VLConfig& config) {
 
     // Top-level
     config.image_token_id = cfg.GetInt("image_token_id", 151655);
+    config.vision_start_token_id = cfg.GetInt("vision_start_token_id", 151652);
 
     // Text config
     auto text_cfg = cfg.GetSubConfig("text_config");
@@ -50,7 +51,7 @@ Status LoadQwen3VLConfig(const std::string& model_dir, Qwen3VLConfig& config) {
         config.vis_num_position_embeddings = vis_cfg.GetInt("num_position_embeddings", 2304);
         config.vis_out_hidden_size = vis_cfg.GetInt("out_hidden_size", 2048);
         config.vis_deepstack_visual_indexes = vis_cfg.GetIntArray("deepstack_visual_indexes");
-        config.vis_epsilon = vis_cfg.GetFloat("initializer_range", 1e-6f);
+        config.vis_epsilon = vis_cfg.GetFloat("layer_norm_eps", 1e-6f);
     }
 
     // ── Load preprocessor_config.json ─────────────────────

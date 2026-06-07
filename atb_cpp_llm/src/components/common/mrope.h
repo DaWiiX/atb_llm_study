@@ -105,18 +105,20 @@ int64_t ComputeVisionRotPosEmb(const int64_t* grid_thw, int64_t num_images,
 /// Equivalent to Python engine_utils.py: get_rope_index.
 /// Computes 3D MRoPE position IDs for text tokens and image tokens.
 ///
-/// @param input_ids          Token IDs (B, S)
-/// @param batch_size         Batch size B
-/// @param seq_len            Sequence length S
-/// @param image_grid_thw     Image grid dimensions (N, 3) or nullptr
-/// @param num_images         Number of images N
-/// @param image_token_id     Image token ID (151655)
-/// @param spatial_merge_size Spatial merge size (2)
-/// @param position_ids_out   Output: (3, B, S) int64, pre-allocated
+/// @param input_ids            Token IDs (B, S)
+/// @param batch_size           Batch size B
+/// @param seq_len              Sequence length S
+/// @param image_grid_thw       Image grid dimensions (N, 3) or nullptr
+/// @param num_images           Number of images N
+/// @param image_token_id       Image token ID (151655)
+/// @param vision_start_token_id Vision start token ID (151652)
+/// @param spatial_merge_size   Spatial merge size (2)
+/// @param position_ids_out     Output: (3, B, S) int64, pre-allocated
 void GetRopeIndex(const int64_t* input_ids,
                   int64_t batch_size, int64_t seq_len,
                   const int64_t* image_grid_thw, int64_t num_images,
-                  int64_t image_token_id, int64_t spatial_merge_size,
+                  int64_t image_token_id, int64_t vision_start_token_id,
+                  int64_t spatial_merge_size,
                   int64_t* position_ids_out);
 
 } // namespace components

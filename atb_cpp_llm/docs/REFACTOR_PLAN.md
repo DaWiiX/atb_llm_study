@@ -51,7 +51,7 @@
 |------|------|--------|
 | InjectFeatures 纯 NPU 实现 | 当前仍为 CPU 侧加法 + partial-copy；ATB SetValue/Gather 是否支持任意索引 scatter-add 需查文档验证；若支持可实现纯 NPU 操作消除所有 NPU-Host 传输 | 中（性能优化） |
 | Debug 模式 -DDEBUG 与 LogLevel::DEBUG 冲突 | CMakeLists.txt 中 `-DDEBUG` 宏与 logger.h 中的 `LogLevel::DEBUG` 枚举值冲突，导致 Debug 构建编译失败 | 低（仅影响 Debug 构建） |
-| ~~test_accuracy 视觉路径 NPU 流同步失败~~ | ~~VisionBlock 2 执行时 Stream synchronization failed: 507057~~ → 根因: GRAPH_LAUNCH_MODE 导致流状态异常，已禁用修复 | ✅ 已修复 (f636e48) |
+| ~~C++ vs Python 精度偏差 (cos < 0.99)~~ | ~~IMAGE_ONLY cos=0.844, IMAGE_AND_TEXT cos=0.987~~ → 根因: GetRopeIndex 缺少 vision_start_token_id 检查，LayerNorm epsilon 读错 key。修复后三模式 cos ≥ 0.999 ✅ | ✅ 已修复 |
 
 ---
 
@@ -239,11 +239,101 @@
 | 图像 token 数量验证错误 | 比较 image_token_positions.size() 与 num_patches（原始 patches），应比较 merged_tokens | 修正为 merged_tokens = num_patches / (merge_size^2) | f636e48 |
 | 注入循环越界 | 循环上界为 np（patches 数），但 image_token_positions 只有 merged_tokens 个 | 改为 image_token_positions.size() | f636e48 |
 | IMAGE_ONLY 精度低 (cosine=0.83) | 64x64 极小图像仅产生 4 个 merged tokens，数值不稳定 | 非代码 bug，测试用例问题；实际使用不会出现此场景 | — |
+| SmartResize 舍入偏差 | C++ std::round(22.5)=23 (四舍五入)，Python round(22.5)=22 (银行家舍入) | 实现 BankersRound() 替换 std::round | — |
+| Bf16ToFp16 截断偏差 | 旧实现位操作清零 fp16 低3位尾数 (截断)，Python bf16→f32→f16 (四舍五入到偶) | 改用 CANN aclFloatToFloat16 API | — |
+| 权重加载双截断 | f32→bf16(移位)→fp16 两次精度损失 | 改为 f32→fp16 直接转换 (Fp32ToFp16) | — |
+| **🔴 Vision LayerNorm epsilon 读错** | C++ 从 `"initializer_range"` 读取 epsilon=0.02，Python 默认 1e-6 | 改为 `GetFloat("layer_norm_eps", 1e-6f)` + beginNormAxis 设为 1 | 待提交 |
+| **🔴 GetRopeIndex 位置编码逻辑错误** | C++ 直接按 image_token_id 生成 2D 网格位置；Python 必须先看到 vision_start_token_id 才识别图像段落。导致 IMAGE_ONLY 和 IMAGE_AND_TEXT 位置编码与 Python 完全不同 | 新增 vision_start_token_id 参数；image_nums==0 时回退到顺序位置编码 | 待提交 |
 
 ### Baseline 性能数据 (2026-06-07)
 
 **Text-Only (S=64)**: E2E 12.28 ms ± 0.08 ms
 **Multimodal (416x672, S=285, 273 vis_tokens)**: E2E 202.08 ms ± 1.42 ms
+
+---
+
+## Phase 17: 逐模块精度验证（自底向上）✅ DONE
+
+### 背景
+
+初始精度状态（720×1280 统一输入）：
+- TEXT_ONLY: cosine=1.000000 ✅
+- IMAGE_ONLY: cosine=0.835649 ❌
+- IMAGE_AND_TEXT: cosine=0.985674 ❌
+
+**最终结果**：两个根因修复后，所有三模式 cos ≥ 0.99：
+- TEXT_ONLY: 1.000000 ✅
+- IMAGE_ONLY: 0.999086 ✅
+- IMAGE_AND_TEXT: 0.999805 ✅
+
+### 精度差异根因分析
+
+发现两个独立 bug，按影响大小排序：
+
+| # | 根因 | 影响 | 修复 |
+|---|------|------|------|
+| **1** | **GetRopeIndex 缺少 vision_start_token_id 检查** — C++ 直接按 image_token_id 生成 2D 网格位置，Python 必须先看到 vision_start_token_id 才识别图像段落 | IMAGE_ONLY cos 0.844, IMAGE_AND_TEXT cos 0.987 | 新增 vision_start_token_id 参数，匹配 Python 的段落检测逻辑 |
+| 2 | Vision LayerNorm epsilon 读错 JSON key — 从 "initializer_range" (0.02) 读取而非 "layer_norm_eps" (1e-6) | Vision block 输出微小偏差 | 改为 GetFloat("layer_norm_eps", 1e-6f) |
+
+**调试方法**：编写 `diag_pipeline.py` 逐阶段保存 Python 中间结果，与 C++ 对应输出对比，快速锁定 GetRopeIndex 输出差异。
+
+### 验证层级（Level 0 → Level 9，逐级通过）
+
+#### Level 0: 预处理 (Preprocessing) ✅ PASS
+- cosine=1.001, MaxDiff=0.074 — pixel_values 匹配
+
+#### Level 1: Patch Embedding — 未单独测试（见 Level 2）
+
+#### Level 2: Position Embedding ✅ PASS
+- Python NPU fp16 vs CPU f32: cosine=1.001 — pos_embed 非差异来源
+
+#### Level 3: Vision RoPE ✅ PASS
+- NPU fp16 vs C++ fp16: cos=0.9999, sin=1.0000 — RoPE 非差异来源
+
+#### Level 4: First Layer (patch_embed + pos_embed + block_0) ⚠️ WARN
+- cosine=0.9996, MaxDiff=0.37 — 刚过 0.999 阈值，但已有可观误差基底
+
+#### 🔴🔴 根因定位 #2: GetRopeIndex 位置编码逻辑与 Python 不一致（主因）
+
+**这是导致 IMAGE_ONLY cos=0.844 和 IMAGE_AND_TEXT cos=0.987 的真正根因。**
+
+- **Bug**: C++ `GetRopeIndex` 缺少 `vision_start_token_id` 参数，直接按 `image_token_id` 识别图像 token 并生成 2D 网格位置
+- **Python 行为**: `get_rope_index` 依赖 `vision_start_token_id` (151652) 来识别视觉段落。检查每个 `vision_start_token_id` 后紧跟的 token 是否为 `image_token_id`，只有匹配时才将后续 token 视为图像 token 并生成 2D 网格位置。**没有任何 `vision_start_token_id` 的输入（包括当前测试用例的 IMAGE_ONLY 和 IMAGE_AND_TEXT）全部使用顺序位置 [0, 1, 2, ...]**
+- **C++ 旧行为**: 直接遍历所有 input_ids，找到 `image_token_id` 就给 2D 网格位置——完全跳过了 `vision_start_token_id` 检查
+- **影响**:
+  - IMAGE_ONLY: 全部 880 tokens 位置编码不同 → cos=0.844（灾难性差异）
+  - IMAGE_AND_TEXT: 880/884 tokens 位置编码不同（仅 4 个纯文本 token 不受影响） → cos=0.987
+  - TEXT_ONLY: 无图像 token，不受影响 → cos=1.000
+- **修复**:
+  1. `mrope.h/cpp`: `GetRopeIndex` 新增 `vision_start_token_id` 参数；先统计 `vision_start_token_id` + `image_token_id` 的图像段落数；`image_nums == 0` 时全部使用顺序位置编码
+  2. `qwen3vl_config.h/cpp`: 新增 `vision_start_token_id` 配置项 (默认 151652)
+  3. `qwen3vl_model.cpp`: 更新 2 处 `GetRopeIndex` 调用传入 `vision_start_token_id`
+- **修复后精度**: TEXT_ONLY cos=1.000000, IMAGE_ONLY cos=0.999086, IMAGE_AND_TEXT cos=0.999805 ✅
+
+#### 🔴 根因定位 #1: Vision LayerNorm epsilon 读错 JSON key（次要）
+- **Bug**: `qwen3vl_config.cpp:53` 读取 `"initializer_range"` (值=0.02) 而非 `"layer_norm_eps"` (缺失，默认 1e-6)
+- **影响**: C++ VisionBlock 的 LayerNorm epsilon=0.02，Python epsilon=1e-6 — **20000 倍差异**
+- **修复**: 改为 `vis_cfg.GetFloat("layer_norm_eps", 1e-6f)`
+- **注意**: 此修复单独只改善 cos ~0.01，主因是上面的 GetRopeIndex bug
+
+### 工作分工
+
+| 角色 | 职责 |
+|------|------|
+| **Architect** (主线程) | 制定验证层级、审查结论、更新本计划 |
+| **Coder** (subagent) | 编写 Python 参考数据生成脚本 + C++ 逐模块测试代码 |
+| **Reviewer** (subagent) | 审查 C++ vs Python 对比结果、确认修复正确性 |
+
+### 实施步骤
+
+- [x] L0: 预处理验证 ✅ cosine=1.001
+- [x] L2: Position Embedding 验证 ✅ cosine=1.001
+- [x] L3: Vision RoPE 验证 ✅ cosine=0.9999
+- [x] L4: First Layer 验证 ✅ cosine=0.999977 (epsilon 修复后)
+- [x] **L5-L8: 全流水线验证** ✅ 所有三模式 cos ≥ 0.99
+  - TEXT_ONLY: 1.000000 ✅
+  - IMAGE_ONLY: 0.999086 ✅
+  - IMAGE_AND_TEXT: 0.999805 ✅
 
 ---
 
