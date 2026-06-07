@@ -1,6 +1,7 @@
 #pragma once
 #include "atb_llm/types.h"
 #include "atb_llm/runtime.h"
+#include <chrono>
 #include <functional>
 #include <memory>
 #include <string>
@@ -29,6 +30,12 @@ public:
     /// 推理入口：接受 InferRequest，输出 InferResult
     /// 模型自行决定内部流程
     virtual Status Forward(const InferRequest& request, InferResult& result) = 0;
+
+    /// Forward with per-stage timing breakdown.
+    /// Default implementation: wraps Forward() with e2e timer only.
+    virtual Status ForwardWithTiming(const InferRequest& request,
+                                      InferResult& result,
+                                      StageTimings& timings);
 
     // ── 元信息（可选，用于引擎层的优化决策） ─────────────
     virtual const char* GetName() const { return "unknown"; }

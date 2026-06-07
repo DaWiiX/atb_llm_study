@@ -144,40 +144,45 @@ torch.npu.empty_cache()
 sync()
 
 # ═══════════════════════════════════════════════════════════
-# 3. C++ ATB multimodal benchmark
+# 3. C++ ATB multimodal benchmark (unified benchmark with per-stage timing)
 # ═══════════════════════════════════════════════════════════
 
 print(f"\n{'='*60}")
-print("C++ ATB Multimodal Benchmark")
+print("C++ ATB Multimodal Benchmark (unified, per-stage timing)")
 print(f"{'='*60}")
 
-CPP_TEST = f"{CPP_BUILD}/test_consistency"  # use existing binary with Encode
 for r in results:
     tag = r['tag']
+    w, h = r['w'], r['h']
     print(f"\n  {tag} (S={r['S']}, vis={r['n_vis']}):")
 
-    # The C++ benchmark binary (benchmark.cpp) does text-only.
-    # For multimodal, we need a different approach.
-    # Since C++ Forward() supports PREPROCESSED mode, but the benchmark binary
-    # doesn't, we approximate C++ multimodal perf from text-only and vision
-    # model separately.
-
-    # C++ text model perf (from earlier benchmark)
+    # Run the unified C++ benchmark in mm mode with compact output
     sub_result = subprocess.run(
-        [f"{CPP_BUILD}/benchmark", '--iter', '5', '--warmup', '2',
-         '--seq', str(r['S']), '--cmp'],
+        [f"{CPP_BUILD}/benchmark", '--mode', 'mm', '--iter', '5', '--warmup', '2',
+         '--width', str(w), '--height', str(h), '--cmp'],
         capture_output=True, text=True, cwd=CPP_BUILD, timeout=300)
-    cpp_text_ms = 0
+
+    cpp_e2e_ms = 0
+    cpp_stages = {}
     for line in sub_result.stdout.split('\n'):
-        if line.startswith('CPP_RESULT:'):
+        if line.startswith('BENCH_RESULT:'):
             for part in line.split()[1:]:
                 k, v = part.split('=')
-                if k == 'mean': cpp_text_ms = float(v)
+                if k == 'e2e_mean':
+                    cpp_e2e_ms = float(v)
+                elif k in ('preprocess', 'vision_pos', 'vision_model',
+                           'text_embed', 'position_ids', 'text_model',
+                           'pooling', 'staged'):
+                    cpp_stages[k] = float(v)
 
-    r['cpp_text_ms'] = cpp_text_ms
-    print(f"    C++ text model only: {cpp_text_ms:.1f} ms")
-    print(f"    Note: Full multimodal C++ perf ≈ text perf + vision perf")
-    print(f"    Vision perf estimated from torch_npu vision component")
+    r['cpp_e2e_ms'] = cpp_e2e_ms
+    r['cpp_stages'] = cpp_stages
+    if cpp_stages:
+        print(f"    C++ E2E: {cpp_e2e_ms:.1f} ms  (staged={cpp_stages.get('staged', 0):.1f} ms)")
+        print(f"    Vision model: {cpp_stages.get('vision_model', 0):.1f} ms  "
+              f"Text model: {cpp_stages.get('text_model', 0):.1f} ms")
+    else:
+        print(f"    C++ E2E: {cpp_e2e_ms:.1f} ms")
 
 # ═══════════════════════════════════════════════════════════
 # 4. Summary
@@ -186,16 +191,13 @@ for r in results:
 print(f"\n{'='*80}")
 print(f" Multimodal Performance Comparison")
 print(f"{'='*80}")
-print(f"{'Resolution':<16} {'S':<6} {'VisTok':<8} {'torch_npu':>10} {'C++ text':>10} {'C++ est*':>10} {'Est Speedup':>10}")
-print(f"{'-'*76}")
+print(f"{'Resolution':<16} {'S':<6} {'VisTok':<8} {'torch_npu':>10} {'C++ E2E':>10} {'Speedup':>10}")
+print(f"{'-'*60}")
 
 for r in results:
-    cpp_est = r['cpp_text_ms'] * 1.15  # ~15% overhead for vision (conservative)
-    speedup = r['torch_mean'] / cpp_est if cpp_est > 0 else 0
+    cpp_e2e = r.get('cpp_e2e_ms', 0)
+    speedup = r['torch_mean'] / cpp_e2e if cpp_e2e > 0 else 0
     print(f"{r['w']}x{r['h']:<10} {r['S']:<6} {r['n_vis']:<8} "
-          f"{r['torch_mean']:>8.1f} ms  {r['cpp_text_ms']:>8.1f} ms  "
-          f"{cpp_est:>8.1f} ms  {speedup:>8.2f}x")
-
-print(f"\n*C++ estimate = text model perf + ~15% for vision overhead")
-print(f" (conservative; actual vision perf depends on patch count)")
+          f"{r['torch_mean']:>8.1f} ms  {cpp_e2e:>8.1f} ms  "
+          f"{speedup:>8.2f}x")
 print(f"\nDone.")

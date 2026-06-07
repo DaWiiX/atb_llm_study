@@ -1,7 +1,20 @@
 #include "engine/llm_engine.h"
 #include "log/logger.h"
+#include <chrono>
 
 namespace atb_llm {
+
+// ── IModel default: ForwardWithTiming wraps Forward with e2e timer ──
+
+Status IModel::ForwardWithTiming(const InferRequest& request,
+                                  InferResult& result,
+                                  StageTimings& timings) {
+    auto t0 = std::chrono::high_resolution_clock::now();
+    Status s = Forward(request, result);
+    auto t1 = std::chrono::high_resolution_clock::now();
+    timings.e2e_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    return s;
+}
 
 // ── LLMEngine::Impl ─────────────────────────────────────
 
@@ -49,6 +62,11 @@ Status LLMEngine::Impl::Encode(const InferRequest& req, InferResult& res) {
     return model_->Forward(req, res);  // For embedding models, Encode == Forward
 }
 
+Status LLMEngine::Impl::EncodeWithTiming(const InferRequest& req, InferResult& res,
+                                          StageTimings& timings) {
+    return model_->ForwardWithTiming(req, res, timings);
+}
+
 // ── LLMEngine ───────────────────────────────────────────
 
 LLMEngine::LLMEngine() : impl_(std::make_unique<Impl>()) {}
@@ -79,6 +97,13 @@ Status LLMEngine::Forward(const InferRequest& request, InferResult& result) {
 Status LLMEngine::Encode(const InferRequest& request, InferResult& result) {
     if (!impl_) return ERROR_INVALID_PARAM;
     return impl_->Encode(request, result);
+}
+
+Status LLMEngine::EncodeWithTiming(const InferRequest& request,
+                                    InferResult& result,
+                                    StageTimings& timings) {
+    if (!impl_) return ERROR_INVALID_PARAM;
+    return impl_->EncodeWithTiming(request, result, timings);
 }
 
 } // namespace atb_llm

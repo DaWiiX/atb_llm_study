@@ -186,7 +186,6 @@ add_test(NAME test_io_adapters COMMAND test_io_adapters)
 
 # Benchmarks (not registered as CTest tests)
 add_atb_test(benchmark                 tests/benchmark.cpp)
-add_atb_test(bench_mm                  tests/bench_mm.cpp)
 
 # ── Install ───────────────────────────────────────────────
 install(TARGETS atb_llm_engine

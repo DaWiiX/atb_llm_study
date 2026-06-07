@@ -41,6 +41,9 @@ public:
     // IModel interface
     Status Load(const std::string& model_dir, IRuntime* runtime) override;
     Status Forward(const InferRequest& request, InferResult& result) override;
+    Status ForwardWithTiming(const InferRequest& request,
+                              InferResult& result,
+                              StageTimings& timings) override;
     const char* GetName() const override {
         return "qwen3vl_embedding";
     }

@@ -221,6 +221,16 @@
 - [ ] MakeCausalMask 支持 batch 维度
 - [ ] C++ 编译通过，batch=1 测试不退化
 
+### Phase 16: 统一 Benchmark + 分阶段计时 ✅ DONE
+- [x] StageTimings 结构体（types.h）：preprocess/vision_pos/vision_model/text_embed/position_ids/text_model/pooling/e2e
+- [x] IModel::ForwardWithTiming 虚方法（默认实现：包裹 Forward + e2e 计时）
+- [x] LLMEngine::EncodeWithTiming 公开接口
+- [x] Qwen3VLModel::ForwardWithTiming 实现：7 阶段精确计时（sync at boundaries）
+- [x] 统一 benchmark.cpp：支持 --mode text|mm|both，分阶段报告，--cmp 紧凑格式
+- [x] 删除 bench_mm.cpp，从 CMakeLists.txt 移除
+- [x] 更新 compare_multimodal.py 使用新 benchmark 的 --mode mm --cmp
+- [x] C++ 编译通过，全部 target 构建成功
+
 ---
 
 ## 环境变量（运行 Python 测试需要）

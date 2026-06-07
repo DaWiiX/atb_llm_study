@@ -11,6 +11,9 @@ public:
                          std::unique_ptr<LLMEngine>& engine);
     Status Forward(const InferRequest& request, InferResult& result);
     Status Encode(const InferRequest& request, InferResult& result);
+    Status EncodeWithTiming(const InferRequest& request,
+                             InferResult& result,
+                             StageTimings& timings);
     ~LLMEngine();
 
 private:

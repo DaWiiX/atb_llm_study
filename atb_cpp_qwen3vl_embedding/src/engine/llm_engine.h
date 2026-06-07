@@ -12,6 +12,7 @@ public:
     Status Init(const EngineConfig& config);
     Status Forward(const InferRequest& req, InferResult& res);
     Status Encode(const InferRequest& req, InferResult& res);
+    Status EncodeWithTiming(const InferRequest& req, InferResult& res, StageTimings& timings);
 
 private:
     std::unique_ptr<IRuntime> runtime_;
