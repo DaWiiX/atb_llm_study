@@ -1,10 +1,8 @@
 #include "layers/text_decoder_layer.h"
 #include "core/graph_builder.h"
-#include "ops/linear_op.h"
-#include "ops/rms_norm_op.h"
-#include "ops/rope_op.h"
-#include "ops/self_attention_op.h"
-#include "ops/activation_op.h"
+#include "components/attention/self_attention_graph.h"
+#include "components/mlp/swiglu_mlp_graph.h"
+#include "components/norm/rms_norm_graph.h"
 #include "ops/elewise_op.h"
 #include "log/logger.h"
 
@@ -54,159 +52,100 @@ Status TextDecoderLayerGraph::Build(const std::string& name,
     s = builder->Init(name, nullptr, in_names, out_names);
     if (s != STATUS_OK) return s;
 
-    // Helper: create op, add to graph, release ownership
-    auto add_op = [&](OperationHandle&& op_h,
-                      const atb::SVector<std::string>& ins,
-                      const atb::SVector<std::string>& outs) -> Status {
-        if (!op_h) return ERROR_GRAPH_BUILD;
-        atb::Operation* raw = op_h.release();
-        return builder->AddOperation(raw, ins, outs);
-    };
-
-    int32_t nh = num_heads;
-    int32_t kv_nh = num_kv_heads;
-    int32_t hd = head_dim;
-
     // ══════════════════════════════════════════════════════════
     // 1. Input LayerNorm: hidden_states + input_ln_weight -> normed
     // ══════════════════════════════════════════════════════════
-    s = add_op(ops::RmsNormOp::Create(epsilon),
-               {"hidden_states", "input_ln_weight"}, {"normed"});
-    if (s != STATUS_OK) return s;
-
-    // ══════════════════════════════════════════════════════════
-    // 2. Attention (inline, matching text_attention.py)
-    // ══════════════════════════════════════════════════════════
-
-    // Q: Linear -> [optional: Reshape(3D) -> RMSNorm -> Reshape(2D)]
-    s = add_op(ops::LinearOp::Create(),
-               {"normed", "q_weight"}, {"q_lin_out"});
-    if (s != STATUS_OK) return s;
-
-    std::string q_pre_rope = "q_lin_out";
-    if (use_qk_norm) {
-        builder->Reshape("q_lin_out", [nh, hd](const atb::Dims& o, atb::Dims& n) {
-                n.dimNum = 3; n.dims[0] = o.dims[0]; n.dims[1] = nh; n.dims[2] = hd; }, "q_3d");
-
-        s = add_op(ops::RmsNormOp::Create(epsilon),
-                   {"q_3d", "q_norm_weight"}, {"q_normed"});
+    {
+        OperationHandle norm_graph;
+        s = components::RmsNormGraph::Build(name + "_InputNorm", epsilon, norm_graph);
         if (s != STATUS_OK) return s;
 
-        builder->Reshape("q_normed", [nh, hd](const atb::Dims& o, atb::Dims& n) {
-                n.dimNum = 2; n.dims[0] = o.dims[0]; n.dims[1] = nh * hd; }, "q_flat");
-        q_pre_rope = "q_flat";
+        s = builder->AddOperation(norm_graph.release(),
+                                  {"hidden_states", "input_ln_weight"}, {"normed"});
+        if (s != STATUS_OK) return s;
     }
 
-    // K: Linear -> [optional: Reshape(3D) -> RMSNorm -> Reshape(2D)]
-    s = add_op(ops::LinearOp::Create(),
-               {"normed", "k_weight"}, {"k_lin_out"});
-    if (s != STATUS_OK) return s;
-
-    std::string k_pre_rope = "k_lin_out";
-    if (use_qk_norm) {
-        builder->Reshape("k_lin_out", [kv_nh, hd](const atb::Dims& o, atb::Dims& n) {
-                n.dimNum = 3; n.dims[0] = o.dims[0]; n.dims[1] = kv_nh; n.dims[2] = hd; }, "k_3d");
-
-        s = add_op(ops::RmsNormOp::Create(epsilon),
-                   {"k_3d", "k_norm_weight"}, {"k_normed"});
+    // ══════════════════════════════════════════════════════════
+    // 2. Self-Attention (composed from SelfAttentionGraph)
+    // ══════════════════════════════════════════════════════════
+    {
+        OperationHandle attn_graph;
+        s = components::SelfAttentionGraph::Build(
+            name + "_Attn", num_heads, num_kv_heads, head_dim, seq_len,
+            epsilon, use_mask, attn_graph, use_qk_norm, rotary_dim);
         if (s != STATUS_OK) return s;
 
-        builder->Reshape("k_normed", [kv_nh, hd](const atb::Dims& o, atb::Dims& n) {
-                n.dimNum = 2; n.dims[0] = o.dims[0]; n.dims[1] = kv_nh * hd; }, "k_flat");
-        k_pre_rope = "k_flat";
+        // Wire attention inputs from decoder layer inputs
+        atb::SVector<std::string> attn_in;
+        attn_in.push_back("normed");           // hidden_states -> normed
+        attn_in.push_back("q_weight");
+        attn_in.push_back("k_weight");
+        attn_in.push_back("v_weight");
+        attn_in.push_back("o_weight");
+        if (use_qk_norm) {
+            attn_in.push_back("q_norm_weight");
+            attn_in.push_back("k_norm_weight");
+        }
+        attn_in.push_back("cos");
+        attn_in.push_back("sin");
+        if (use_mask) {
+            attn_in.push_back("mask");
+        }
+        attn_in.push_back("seqlen");
+
+        s = builder->AddOperation(attn_graph.release(), attn_in,
+                                  atb::SVector<std::string>{"attn_out"});
+        if (s != STATUS_OK) return s;
     }
-
-    // V: Linear -> Reshape(3D)
-    s = add_op(ops::LinearOp::Create(),
-               {"normed", "v_weight"}, {"v_lin_out"});
-    if (s != STATUS_OK) return s;
-
-    builder->Reshape("v_lin_out", [kv_nh, hd](const atb::Dims& o, atb::Dims& n) {
-            n.dimNum = 3; n.dims[0] = o.dims[0]; n.dims[1] = kv_nh; n.dims[2] = hd; }, "v_3d");
-
-    // RoPE
-    s = add_op(ops::RopeOp::Create(rotary_dim),
-               {q_pre_rope, k_pre_rope, "cos", "sin", "seqlen"},
-               {"q_rope_flat", "k_rope_flat"});
-    if (s != STATUS_OK) return s;
-
-    builder->Reshape("q_rope_flat", [nh, hd](const atb::Dims& o, atb::Dims& n) {
-            n.dimNum = 3; n.dims[0] = o.dims[0]; n.dims[1] = nh; n.dims[2] = hd; }, "q_rope");
-    builder->Reshape("k_rope_flat", [kv_nh, hd](const atb::Dims& o, atb::Dims& n) {
-            n.dimNum = 3; n.dims[0] = o.dims[0]; n.dims[1] = kv_nh; n.dims[2] = hd; }, "k_rope");
-
-    // SelfAttention
-    OperationHandle sa = ops::SelfAttentionOp::Create(num_heads, num_kv_heads, head_dim, use_mask);
-    if (!sa) return ERROR_GRAPH_BUILD;
-
-    atb::SVector<std::string> sa_in;
-    sa_in.push_back("q_rope");
-    sa_in.push_back("k_rope");
-    sa_in.push_back("v_3d");
-    if (use_mask) sa_in.push_back("mask");
-    sa_in.push_back("seqlen");
-
-    s = builder->AddOperation(sa.release(), sa_in,
-                              atb::SVector<std::string>{"sa_out"});
-    if (s != STATUS_OK) return s;
-
-    // Reshape SA output: [B*S, nh, hd] -> [B*S, nh*hd]
-    builder->Reshape("sa_out", [](const atb::Dims& o, atb::Dims& n) {
-            n.dimNum = 2; n.dims[0] = o.dims[0]; n.dims[1] = o.dims[1] * o.dims[2]; }, "sa_flat");
-
-    // O projection
-    s = add_op(ops::LinearOp::Create(),
-               {"sa_flat", "o_weight"}, {"attn_out"});
-    if (s != STATUS_OK) return s;
 
     // ══════════════════════════════════════════════════════════
     // 3. Residual add: hidden_states + attn_out -> h1
     // ══════════════════════════════════════════════════════════
-    s = add_op(ops::ElewiseOp::MakeAdd(),
-               {"hidden_states", "attn_out"}, {"h1"});
-    if (s != STATUS_OK) return s;
+    {
+        OperationHandle add_op = ops::ElewiseOp::MakeAdd();
+        if (!add_op) return ERROR_GRAPH_BUILD;
+        s = builder->AddOperation(add_op.release(),
+                                  {"hidden_states", "attn_out"}, {"h1"});
+        if (s != STATUS_OK) return s;
+    }
 
     // ══════════════════════════════════════════════════════════
     // 4. Post-Attention LayerNorm: h1 + post_ln_weight -> normed_h1
     // ══════════════════════════════════════════════════════════
-    s = add_op(ops::RmsNormOp::Create(epsilon),
-               {"h1", "post_ln_weight"}, {"normed_h1"});
-    if (s != STATUS_OK) return s;
+    {
+        OperationHandle norm_graph;
+        s = components::RmsNormGraph::Build(name + "_PostNorm", epsilon, norm_graph);
+        if (s != STATUS_OK) return s;
+
+        s = builder->AddOperation(norm_graph.release(),
+                                  {"h1", "post_ln_weight"}, {"normed_h1"});
+        if (s != STATUS_OK) return s;
+    }
 
     // ══════════════════════════════════════════════════════════
-    // 5. SwiGLU MLP (inline, matching text_mlp.py)
+    // 5. SwiGLU MLP (composed from SwiGluMlpGraph)
     // ══════════════════════════════════════════════════════════
+    {
+        OperationHandle mlp_graph;
+        s = components::SwiGluMlpGraph::Build(name + "_MLP", mlp_graph);
+        if (s != STATUS_OK) return s;
 
-    // gate_proj -> SiLU
-    s = add_op(ops::LinearOp::Create(),
-               {"normed_h1", "gate_weight"}, {"gate_out"});
-    if (s != STATUS_OK) return s;
-
-    s = add_op(ops::ActivationOp::MakeSiLU(),
-               {"gate_out"}, {"act_out"});
-    if (s != STATUS_OK) return s;
-
-    // up_proj
-    s = add_op(ops::LinearOp::Create(),
-               {"normed_h1", "up_weight"}, {"up_out"});
-    if (s != STATUS_OK) return s;
-
-    // Element-wise multiply
-    s = add_op(ops::ElewiseOp::MakeMul(),
-               {"act_out", "up_out"}, {"mul_out"});
-    if (s != STATUS_OK) return s;
-
-    // down_proj
-    s = add_op(ops::LinearOp::Create(),
-               {"mul_out", "down_weight"}, {"mlp_out"});
-    if (s != STATUS_OK) return s;
+        s = builder->AddOperation(mlp_graph.release(),
+                                  {"normed_h1", "gate_weight", "up_weight", "down_weight"},
+                                  atb::SVector<std::string>{"mlp_out"});
+        if (s != STATUS_OK) return s;
+    }
 
     // ══════════════════════════════════════════════════════════
     // 6. Residual add: h1 + mlp_out -> output
     // ══════════════════════════════════════════════════════════
-    s = add_op(ops::ElewiseOp::MakeAdd(),
-               {"h1", "mlp_out"}, {"output"});
-    if (s != STATUS_OK) return s;
+    {
+        OperationHandle add_op = ops::ElewiseOp::MakeAdd();
+        if (!add_op) return ERROR_GRAPH_BUILD;
+        s = builder->AddOperation(add_op.release(),
+                                  {"h1", "mlp_out"}, {"output"});
+        if (s != STATUS_OK) return s;
+    }
 
     out = builder->Build();
     if (!out) return ERROR_GRAPH_BUILD;

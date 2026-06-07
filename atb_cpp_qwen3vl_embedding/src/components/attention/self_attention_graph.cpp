@@ -16,7 +16,9 @@ Status SelfAttentionGraph::Build(const std::string& name,
                                   int32_t seq_len,
                                   float epsilon,
                                   bool use_mask,
-                                  OperationHandle& out) {
+                                  OperationHandle& out,
+                                  bool use_qk_norm,
+                                  int32_t rotary_dim) {
     (void)seq_len;
 
     std::unique_ptr<GraphBuilder> builder;
@@ -30,8 +32,10 @@ Status SelfAttentionGraph::Build(const std::string& name,
     in_names.push_back("k_weight");
     in_names.push_back("v_weight");
     in_names.push_back("o_weight");
-    in_names.push_back("q_norm_weight");
-    in_names.push_back("k_norm_weight");
+    if (use_qk_norm) {
+        in_names.push_back("q_norm_weight");
+        in_names.push_back("k_norm_weight");
+    }
     in_names.push_back("cos");
     in_names.push_back("sin");
     if (use_mask) {
@@ -56,57 +60,65 @@ Status SelfAttentionGraph::Build(const std::string& name,
     int32_t kv_nh = num_kv_heads;
     int32_t hd = head_dim;
 
-    // ── Q path: Linear -> Reshape(3D) -> RMSNorm -> Reshape(2D) ──
+    // ── Q path: Linear -> [optional: Reshape(3D) -> RMSNorm -> Reshape(2D)] ──
     s = add_op(ops::LinearOp::Create(),
                {"hidden_states", "q_weight"}, {"q_lin_out"});
     if (s != STATUS_OK) return s;
 
-    builder->Reshape("q_lin_out",
-        [nh, hd](const atb::Dims& old_shape, atb::Dims& new_shape) {
-            new_shape.dimNum = 3;
-            new_shape.dims[0] = old_shape.dims[0];  // B*S
-            new_shape.dims[1] = nh;
-            new_shape.dims[2] = hd;
-        },
-        "q_3d");
+    std::string q_pre_rope = "q_lin_out";
+    if (use_qk_norm) {
+        builder->Reshape("q_lin_out",
+            [nh, hd](const atb::Dims& old_shape, atb::Dims& new_shape) {
+                new_shape.dimNum = 3;
+                new_shape.dims[0] = old_shape.dims[0];  // B*S
+                new_shape.dims[1] = nh;
+                new_shape.dims[2] = hd;
+            },
+            "q_3d");
 
-    s = add_op(ops::RmsNormOp::Create(epsilon),
-               {"q_3d", "q_norm_weight"}, {"q_normed"});
-    if (s != STATUS_OK) return s;
+        s = add_op(ops::RmsNormOp::Create(epsilon),
+                   {"q_3d", "q_norm_weight"}, {"q_normed"});
+        if (s != STATUS_OK) return s;
 
-    builder->Reshape("q_normed",
-        [nh, hd](const atb::Dims& old_shape, atb::Dims& new_shape) {
-            new_shape.dimNum = 2;
-            new_shape.dims[0] = old_shape.dims[0];  // B*S
-            new_shape.dims[1] = nh * hd;
-        },
-        "q_flat");
+        builder->Reshape("q_normed",
+            [nh, hd](const atb::Dims& old_shape, atb::Dims& new_shape) {
+                new_shape.dimNum = 2;
+                new_shape.dims[0] = old_shape.dims[0];  // B*S
+                new_shape.dims[1] = nh * hd;
+            },
+            "q_flat");
+        q_pre_rope = "q_flat";
+    }
 
-    // ── K path: Linear -> Reshape(3D) -> RMSNorm -> Reshape(2D) ──
+    // ── K path: Linear -> [optional: Reshape(3D) -> RMSNorm -> Reshape(2D)] ──
     s = add_op(ops::LinearOp::Create(),
                {"hidden_states", "k_weight"}, {"k_lin_out"});
     if (s != STATUS_OK) return s;
 
-    builder->Reshape("k_lin_out",
-        [kv_nh, hd](const atb::Dims& old_shape, atb::Dims& new_shape) {
-            new_shape.dimNum = 3;
-            new_shape.dims[0] = old_shape.dims[0];  // B*S
-            new_shape.dims[1] = kv_nh;
-            new_shape.dims[2] = hd;
-        },
-        "k_3d");
+    std::string k_pre_rope = "k_lin_out";
+    if (use_qk_norm) {
+        builder->Reshape("k_lin_out",
+            [kv_nh, hd](const atb::Dims& old_shape, atb::Dims& new_shape) {
+                new_shape.dimNum = 3;
+                new_shape.dims[0] = old_shape.dims[0];  // B*S
+                new_shape.dims[1] = kv_nh;
+                new_shape.dims[2] = hd;
+            },
+            "k_3d");
 
-    s = add_op(ops::RmsNormOp::Create(epsilon),
-               {"k_3d", "k_norm_weight"}, {"k_normed"});
-    if (s != STATUS_OK) return s;
+        s = add_op(ops::RmsNormOp::Create(epsilon),
+                   {"k_3d", "k_norm_weight"}, {"k_normed"});
+        if (s != STATUS_OK) return s;
 
-    builder->Reshape("k_normed",
-        [kv_nh, hd](const atb::Dims& old_shape, atb::Dims& new_shape) {
-            new_shape.dimNum = 2;
-            new_shape.dims[0] = old_shape.dims[0];  // B*S
-            new_shape.dims[1] = kv_nh * hd;
-        },
-        "k_flat");
+        builder->Reshape("k_normed",
+            [kv_nh, hd](const atb::Dims& old_shape, atb::Dims& new_shape) {
+                new_shape.dimNum = 2;
+                new_shape.dims[0] = old_shape.dims[0];  // B*S
+                new_shape.dims[1] = kv_nh * hd;
+            },
+            "k_flat");
+        k_pre_rope = "k_flat";
+    }
 
     // ── V path: Linear -> Reshape(3D) ──
     s = add_op(ops::LinearOp::Create(),
@@ -122,9 +134,9 @@ Status SelfAttentionGraph::Build(const std::string& name,
         },
         "v_3d");
 
-    // ── RoPE: (q_flat, k_flat, cos, sin, seqlen) -> (q_rope, k_rope) ──
-    s = add_op(ops::RopeOp::Create(),
-               {"q_flat", "k_flat", "cos", "sin", "seqlen"},
+    // ── RoPE: (q_pre_rope, k_pre_rope, cos, sin, seqlen) -> (q_rope, k_rope) ──
+    s = add_op(ops::RopeOp::Create(rotary_dim),
+               {q_pre_rope, k_pre_rope, "cos", "sin", "seqlen"},
                {"q_rope_flat", "k_rope_flat"});
     if (s != STATUS_OK) return s;
 
