@@ -36,6 +36,10 @@ public:
     DeepstackFusion(const Config& cfg, OperationHandle deepstack_graph);
     ~DeepstackFusion() override = default;
 
+    /// Build the inject_features_op_ (IndexAdd). Called once at model load.
+    /// Safe to call multiple times (idempotent).
+    Status BuildInjectOp();
+
     size_t GetNumFusionLayers() const override {
         return cfg_.deepstack_visual_indexes.size();
     }
@@ -64,6 +68,7 @@ public:
 private:
     Config cfg_;
     OperationHandle deepstack_graph_;
+    OperationHandle inject_op_;            // IndexAdd op for NPU-side injection
     std::vector<DeepstackMergerWeights> merger_weights_;
 };
 

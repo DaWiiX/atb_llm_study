@@ -143,6 +143,13 @@ Status Qwen3VLModel::Load(const std::string& model_dir, IRuntime* runtime) {
         deepstack_fusion_->SetMergerWeights(i, ds_w);
     }
 
+    // Build the NPU IndexAdd op used for cross-modal injection.
+    s = deepstack_fusion_->BuildInjectOp();
+    if (s != STATUS_OK) {
+        LOG_ERROR("Failed to build Deepstack inject op");
+        return s;
+    }
+
     // 6. Create TextRunner (graph built lazily on first Forward via EnsureBuilt)
     runners::TextRunner::Config text_cfg;
     text_cfg.num_heads = config_.text_num_heads;

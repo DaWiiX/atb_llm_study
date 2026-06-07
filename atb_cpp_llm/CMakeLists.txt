@@ -76,6 +76,7 @@ set(ENGINE_SRCS
     src/ops/concat_op.cpp
     src/ops/elewise_op.cpp
     src/ops/activation_op.cpp
+    src/ops/index_add_op.cpp
     # components/common
     src/components/common/self_attention_graph.cpp
     src/components/common/swiglu_mlp_graph.cpp
@@ -171,6 +172,7 @@ add_atb_test(test_forward_error_paths  tests/test_forward_error_paths.cpp)
 add_atb_test(test_vision_stages       tests/test_vision_stages.cpp)
 add_atb_test(test_pos_embed_npu_graph tests/test_pos_embed_npu_graph.cpp)
 add_atb_test(test_vis_rope_npu_graph  tests/test_vis_rope_npu_graph.cpp)
+add_atb_test(test_index_add_npu       tests/test_index_add_npu.cpp)
 
 # Level 1 CPU pure-function tests (no NPU dependency for the logic,
 # but link against engine library for the implementation).
