@@ -1,5 +1,6 @@
 #pragma once
 #include "atb_llm/types.h"
+#include "atb_llm/layer_desc.h"
 #include "core/raii.h"
 #include <string>
 
@@ -51,6 +52,17 @@ public:
                         OperationHandle& out,
                         bool use_qk_norm = true,
                         int32_t rotary_dim = 2);
+
+    /// Build a SelfAttention graph from AttnConfig.
+    /// Dispatches to the appropriate implementation based on AttnConfig.type.
+    /// Currently only GQA is supported; MHA/MLA return ERROR_UNSUPPORTED.
+    /// @param name    Graph name
+    /// @param config  Attention configuration
+    /// @param out     Output: RAII operation handle
+    /// @return STATUS_OK on success, ERROR_UNSUPPORTED for unimplemented types
+    static Status Build(const std::string& name,
+                        const AttnConfig& config,
+                        OperationHandle& out);
 };
 
 } // namespace components

@@ -1,5 +1,6 @@
 #pragma once
 #include "atb_llm/types.h"
+#include "atb_llm/layer_desc.h"
 #include "core/raii.h"
 #include <cstdint>
 #include <string>
@@ -30,6 +31,11 @@ public:
         bool use_qk_norm = true;
         int32_t rotary_dim = 2;
         bool use_mask = true;
+
+        /// Layer descriptor for config-driven graph building.
+        /// When set, EnsureBuilt() uses layer_desc fields instead of
+        /// the flat Config fields above. The default values match Qwen3VL-2B.
+        LayerDescriptor layer_desc;
     };
 
     /// Constructor.

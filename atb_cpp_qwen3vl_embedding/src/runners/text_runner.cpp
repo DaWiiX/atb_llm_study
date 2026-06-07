@@ -14,19 +14,39 @@ Status TextRunner::EnsureBuilt(int32_t seq_len) {
         return STATUS_OK;
     }
 
-    // Build the shared decoder layer graph (built once, looped N times)
+    // Sync flat Config fields into layer_desc so that legacy usage
+    // (setting cfg.num_heads, etc.) still works.  The layer_desc
+    // fields take precedence, but users who only set flat fields
+    // expect them to be reflected here.
+    auto& ld = cfg_.layer_desc;
+    ld.attn.num_heads    = cfg_.num_heads;
+    ld.attn.num_kv_heads = cfg_.num_kv_heads;
+    ld.attn.head_dim     = cfg_.head_dim;
+    ld.attn.epsilon      = cfg_.epsilon;
+    ld.attn.use_qk_norm  = cfg_.use_qk_norm;
+    ld.attn.rotary_dim   = cfg_.rotary_dim;
+    ld.attn.use_mask     = cfg_.use_mask;
+    ld.attn.seq_len      = seq_len;
+    ld.mlp.intermediate_size = cfg_.intermediate_size;
+    ld.input_norm.epsilon   = cfg_.epsilon;
+    ld.post_norm.epsilon    = cfg_.epsilon;
+
+    const auto& attn = ld.attn;
+
+    // Build the shared decoder layer graph using LayerDescriptor
     Status s = components::text::TextDecoderLayerGraph::Build(
         "TextDecoderLayer",
-        cfg_.num_heads, cfg_.num_kv_heads, cfg_.head_dim,
-        seq_len, cfg_.epsilon, cfg_.use_mask,
-        layer_graph_, cfg_.use_qk_norm, cfg_.rotary_dim);
+        attn.num_heads, attn.num_kv_heads, attn.head_dim,
+        seq_len, attn.epsilon, attn.use_mask,
+        layer_graph_, attn.use_qk_norm, attn.rotary_dim);
     if (s != STATUS_OK) {
         LOG_ERROR("Failed to build TextDecoderLayer graph");
         return s;
     }
 
-    // Build the final RMSNorm graph
-    s = components::RmsNormGraph::Build("TextFinalNorm", cfg_.epsilon, norm_graph_);
+    // Build the final normalization graph using LayerDescriptor
+    s = components::RmsNormGraph::Build("TextFinalNorm",
+        ld.post_norm, norm_graph_);
     if (s != STATUS_OK) {
         LOG_ERROR("Failed to build TextFinalNorm graph");
         return s;
@@ -34,8 +54,8 @@ Status TextRunner::EnsureBuilt(int32_t seq_len) {
 
     cached_seq_len_ = seq_len;
     LOG_INFO("TextRunner built: %d layers, nh=%d, kv_nh=%d, hd=%d, S=%d",
-             cfg_.num_layers, cfg_.num_heads, cfg_.num_kv_heads,
-             cfg_.head_dim, seq_len);
+             cfg_.num_layers, attn.num_heads, attn.num_kv_heads,
+             attn.head_dim, seq_len);
     return STATUS_OK;
 }
 

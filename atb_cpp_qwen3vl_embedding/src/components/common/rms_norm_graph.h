@@ -1,5 +1,6 @@
 #pragma once
 #include "atb_llm/types.h"
+#include "atb_llm/layer_desc.h"
 #include "core/raii.h"
 #include <string>
 
@@ -19,6 +20,16 @@ public:
     /// @return STATUS_OK on success
     static Status Build(const std::string& name,
                         float epsilon,
+                        OperationHandle& out);
+
+    /// Build a normalization graph from NormConfig.
+    /// Dispatches to RMSNorm or LayerNorm based on NormConfig.type.
+    /// @param name    Graph name
+    /// @param config  Normalization configuration
+    /// @param out     Output: RAII operation handle
+    /// @return STATUS_OK on success, ERROR_UNSUPPORTED for unimplemented types
+    static Status Build(const std::string& name,
+                        const NormConfig& config,
                         OperationHandle& out);
 };
 

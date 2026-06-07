@@ -8,6 +8,30 @@
 namespace atb_llm {
 namespace components {
 
+// ── MlpConfig-based Build: dispatch by type ──────────────────
+Status SwiGluMlpGraph::Build(const std::string& name,
+                              const MlpConfig& config,
+                              OperationHandle& out) {
+    switch (config.type) {
+    case MlpType::SwiGLU:
+        return Build(name, out);
+    case MlpType::GeGLU:
+        LOG_ERROR("SwiGluMlpGraph: GeGLU MLP not yet supported");
+        return ERROR_UNSUPPORTED;
+    case MlpType::GELU:
+        LOG_ERROR("SwiGluMlpGraph: GELU MLP not yet supported");
+        return ERROR_UNSUPPORTED;
+    case MlpType::MoE:
+        LOG_ERROR("SwiGluMlpGraph: MoE MLP not yet supported");
+        return ERROR_UNSUPPORTED;
+    default:
+        LOG_ERROR("SwiGluMlpGraph: unknown MlpType %d",
+                  static_cast<int>(config.type));
+        return ERROR_INVALID_PARAM;
+    }
+}
+
+// ── Legacy Build: SwiGLU implementation ───────────────────────
 Status SwiGluMlpGraph::Build(const std::string& name, OperationHandle& out) {
     std::unique_ptr<GraphBuilder> builder;
     Status s = GraphBuilder::Create(name, builder);

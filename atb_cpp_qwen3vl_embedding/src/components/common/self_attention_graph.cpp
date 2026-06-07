@@ -9,6 +9,31 @@
 namespace atb_llm {
 namespace components {
 
+// ── AttnConfig-based Build: dispatch by type ─────────────────
+Status SelfAttentionGraph::Build(const std::string& name,
+                                  const AttnConfig& config,
+                                  OperationHandle& out) {
+    switch (config.type) {
+    case AttnType::GQA:
+        return Build(name, config.num_heads, config.num_kv_heads,
+                     config.head_dim, config.seq_len, config.epsilon,
+                     config.use_mask, out, config.use_qk_norm,
+                     config.rotary_dim);
+    case AttnType::MHA:
+        LOG_ERROR("SelfAttentionGraph: MHA attention not yet supported");
+        return ERROR_UNSUPPORTED;
+    case AttnType::MLA:
+        LOG_ERROR("SelfAttentionGraph: MLA attention not yet supported");
+        return ERROR_UNSUPPORTED;
+    default:
+        LOG_ERROR("SelfAttentionGraph: unknown AttnType %d",
+                  static_cast<int>(config.type));
+        return ERROR_INVALID_PARAM;
+    }
+}
+
+// ── Legacy Build: GQA implementation ─────────────────────────
+
 Status SelfAttentionGraph::Build(const std::string& name,
                                   int32_t num_heads,
                                   int32_t num_kv_heads,
