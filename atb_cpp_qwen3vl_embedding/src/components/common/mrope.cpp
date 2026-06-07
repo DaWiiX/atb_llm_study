@@ -121,6 +121,22 @@ std::vector<float> VisionRotaryEmbedding::ComputeFreqTable(int32_t max_hw) const
     return table;
 }
 
+int64_t VisionRotaryEmbedding::ComputeRoPE(const int64_t* grid_thw, int64_t num_images,
+                                            int32_t merge_size,
+                                            float* cos_out, float* sin_out) const {
+    // Find max_hw across all images
+    int32_t max_hw = 0;
+    for (int64_t i = 0; i < num_images; i++) {
+        max_hw = std::max(max_hw, static_cast<int32_t>(grid_thw[i * 3 + 1]));
+        max_hw = std::max(max_hw, static_cast<int32_t>(grid_thw[i * 3 + 2]));
+    }
+
+    // Compute freq table and delegate to ComputeVisionRotPosEmb
+    auto freq_table = ComputeFreqTable(max_hw);
+    return ComputeVisionRotPosEmb(grid_thw, num_images, *this, merge_size,
+                                  freq_table, cos_out, sin_out);
+}
+
 int64_t ComputeVisionRotPosEmb(const int64_t* grid_thw, int64_t num_images,
                                 const VisionRotaryEmbedding& rotary_emb,
                                 int32_t merge_size,

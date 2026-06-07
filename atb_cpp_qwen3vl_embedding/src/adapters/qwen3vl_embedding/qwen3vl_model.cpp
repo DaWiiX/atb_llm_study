@@ -4,6 +4,7 @@
 #include "safetensors.hh"
 #include "core/tensor_allocator.h"
 #include "core/npu_tensor.h"
+#include "io/weight_helpers.h"
 #include "log/logger.h"
 #include <cstring>
 #include <cmath>
@@ -38,6 +39,21 @@ Status Qwen3VLModel::Load(const std::string& model_dir, IRuntime* runtime) {
     if (s != STATUS_OK) {
         LOG_ERROR("Failed to load Qwen3VL weights");
         return s;
+    }
+
+    // 2b. Cache pos_embed on host (needed for CPU-side bilinear interpolation)
+    {
+        int64_t num_pos = config_.vis_num_position_embeddings;
+        int64_t hs = config_.vis_hidden_size;
+        vis_pos_embed_host_.resize(num_pos * hs);
+        s = io::CopyWeightToFp16Host(*runtime->GetWeightLoader(),
+                                     "model.visual.pos_embed.weight",
+                                     vis_pos_embed_host_.data(),
+                                     vis_pos_embed_host_.size() * sizeof(uint16_t));
+        if (s != STATUS_OK) {
+            LOG_ERROR("Failed to cache vision pos_embed to host");
+            return s;
+        }
     }
 
     // 3. Initialize position encoding helpers
@@ -320,16 +336,21 @@ Status Qwen3VLModel::RunVision(const uint16_t* pixel_values, int64_t num_patches
     int32_t vis_hd = config_.vis_head_dim();
     int64_t merge_size = config_.vis_spatial_merge_size;
 
-    // 1. Compute position embeddings (CPU)
+    // 1. Compute position embeddings (CPU) via extracted component
     size_t pos_bytes = static_cast<size_t>(num_patches) * vis_hs * sizeof(uint16_t);
     std::vector<uint16_t> pos_embed_host(num_patches * vis_hs);
-    ComputePosEmbedInterp(grid_thw, num_images, pos_embed_host.data());
+    components::ComputePosEmbedInterp(vis_pos_embed_host_.data(),
+                                      config_.vis_hidden_size, config_.num_grid(),
+                                      config_.vis_spatial_merge_size,
+                                      grid_thw, num_images,
+                                      pos_embed_host.data());
 
-    // 2. Compute vision RoPE (CPU)
+    // 2. Compute vision RoPE (CPU) via VisionRotaryEmbedding component
     std::vector<float> cos_f32(num_patches * vis_hd * 2);
     std::vector<float> sin_f32(num_patches * vis_hd * 2);
-    int64_t total_tokens;
-    ComputeVisionRoPE(grid_thw, num_images, cos_f32.data(), sin_f32.data(), total_tokens);
+    int64_t total_tokens = vis_rope_->ComputeRoPE(
+        grid_thw, num_images, config_.vis_spatial_merge_size,
+        cos_f32.data(), sin_f32.data());
 
     // Convert to fp16
     int64_t rope_dim = vis_hd * 2;
@@ -465,137 +486,6 @@ Status Qwen3VLModel::RunVision(const uint16_t* pixel_values, int64_t num_patches
              static_cast<long>(total_tokens),
              static_cast<long>(total_tokens / (merge_size * merge_size)));
     return STATUS_OK;
-}
-
-// ═════════════════════════════════════════════════════════════════════
-// Qwen3VL-specific helpers
-// ═════════════════════════════════════════════════════════════════════
-
-void Qwen3VLModel::ComputePosEmbedInterp(const int64_t* grid_thw, int64_t num_images,
-                                         uint16_t* pos_out) {
-    // Fast position embedding interpolation
-    // Equivalent to Python fast_pos_embed_interpolate
-    auto* alloc = runtime_->GetAllocator();
-
-    int64_t vis_hs = config_.vis_hidden_size;
-    int32_t num_grid = config_.num_grid();
-    int32_t merge_size = config_.vis_spatial_merge_size;
-
-    // Copy pos_embed weight from NPU to CPU
-    WeightInfo pe_info;
-    runtime_->GetWeightLoader()->GetTensor("model.visual.pos_embed.weight", pe_info);
-    size_t pe_elements = 1;
-    for (auto d : pe_info.shape)
-        pe_elements *= d;
-    std::vector<uint16_t> pe_host(pe_elements);
-    // pos_embed is already on NPU as fp16, we need to get it to CPU
-    // Use the raw data from safetensors
-    const uint8_t* pe_data = runtime_->GetWeightLoader()->GetTensorData(
-        "model.visual.pos_embed.weight");
-    auto st_dtype = static_cast<safetensors::dtype>(pe_info.dtype);
-    if (st_dtype == safetensors::kBFLOAT16) {
-        atb_llm::Bf16ToFp16Buffer(reinterpret_cast<const uint16_t*>(pe_data),
-                                  pe_host.data(), pe_elements);
-    } else if (st_dtype == safetensors::kFLOAT16) {
-        std::memcpy(pe_host.data(), pe_data, pe_elements * sizeof(uint16_t));
-    }
-
-    // Interpolate for each image
-    int64_t out_offset = 0;
-    for (int64_t img = 0; img < num_images; img++) {
-        int64_t t = grid_thw[img * 3 + 0];
-        int64_t h = grid_thw[img * 3 + 1];
-        int64_t w = grid_thw[img * 3 + 2];
-
-        // Bilinear interpolation from (num_grid, num_grid) to (h, w)
-        std::vector<float> interpolated(h * w * vis_hs, 0.0f);
-
-        for (int64_t hi = 0; hi < h; hi++) {
-            for (int64_t wi = 0; wi < w; wi++) {
-                float fy = static_cast<float>(hi) * (num_grid - 1) / (h - 1);
-                float fx = static_cast<float>(wi) * (num_grid - 1) / (w - 1);
-
-                int32_t y0 = static_cast<int32_t>(fy);
-                int32_t x0 = static_cast<int32_t>(fx);
-                int32_t y1 = std::min(y0 + 1, num_grid - 1);
-                int32_t x1 = std::min(x0 + 1, num_grid - 1);
-
-                float dy = fy - y0;
-                float dx = fx - x0;
-
-                int64_t idx00 = y0 * num_grid + x0;
-                int64_t idx01 = y0 * num_grid + x1;
-                int64_t idx10 = y1 * num_grid + x0;
-                int64_t idx11 = y1 * num_grid + x1;
-
-                float* out_row = interpolated.data() + (hi * w + wi) * vis_hs;
-                for (int64_t d = 0; d < vis_hs; d++) {
-                    // Read fp16 values and convert to fp32
-                    float v00 = atb_llm::Fp16ToF32(pe_host[idx00 * vis_hs + d]);
-                    float v01 = atb_llm::Fp16ToF32(pe_host[idx01 * vis_hs + d]);
-                    float v10 = atb_llm::Fp16ToF32(pe_host[idx10 * vis_hs + d]);
-                    float v11 = atb_llm::Fp16ToF32(pe_host[idx11 * vis_hs + d]);
-
-                    out_row[d] = v00 * (1 - dy) * (1 - dx) + v01 * (1 - dy) * dx +
-                                 v10 * dy * (1 - dx) + v11 * dy * dx;
-                }
-            }
-        }
-
-        // Apply spatial merge shuffling and convert to fp16
-        // Python: pos_embed.view(t, h//ms, ms, w//ms, ms, -1).permute(0,1,3,2,4,5).flatten(0,4)
-        int64_t merged_h = h / merge_size;
-        int64_t merged_w = w / merge_size;
-
-        int64_t patch_idx = 0;
-        for (int64_t br = 0; br < merged_h; br++) {
-            for (int64_t bc = 0; bc < merged_w; bc++) {
-                for (int64_t ir = 0; ir < merge_size; ir++) {
-                    for (int64_t ic = 0; ic < merge_size; ic++) {
-                        int64_t row = br * merge_size + ir;
-                        int64_t col = bc * merge_size + ic;
-                        const float* src = interpolated.data() + (row * w + col) * vis_hs;
-                        uint16_t* dst = pos_out + (out_offset + patch_idx) * vis_hs;
-                        for (int64_t d = 0; d < vis_hs; d++) {
-                            dst[d] = atb_llm::Bf16ToFp16(
-                                static_cast<uint16_t>(
-                                    atb_llm::FloatToUint32(src[d]) >> 16));
-                        }
-                        patch_idx++;
-                    }
-                }
-            }
-        }
-        // Repeat for temporal dimension
-        for (int64_t ti = 1; ti < t; ti++) {
-            std::memcpy(pos_out + (out_offset + ti * merged_h * merged_w * merge_size * merge_size) * vis_hs,
-                        pos_out + out_offset * vis_hs,
-                        merged_h * merged_w * merge_size * merge_size * vis_hs * sizeof(uint16_t));
-        }
-        out_offset += t * h * w;
-    }
-}
-
-void Qwen3VLModel::ComputeVisionRoPE(const int64_t* grid_thw, int64_t num_images,
-                                     float* cos_out, float* sin_out,
-                                     int64_t& total_tokens) {
-    int32_t dim = config_.vis_head_dim();
-    int32_t merge_size = config_.vis_spatial_merge_size;
-
-    // Find max_hw
-    int32_t max_hw = 0;
-    for (int64_t i = 0; i < num_images; i++) {
-        max_hw = std::max(max_hw, static_cast<int32_t>(grid_thw[i * 3 + 1]));
-        max_hw = std::max(max_hw, static_cast<int32_t>(grid_thw[i * 3 + 2]));
-    }
-
-    // Compute freq table
-    auto freq_table = vis_rope_->ComputeFreqTable(max_hw);
-
-    // Compute vision rot pos emb
-    total_tokens = components::ComputeVisionRotPosEmb(
-        grid_thw, num_images, *vis_rope_, merge_size,
-        freq_table, cos_out, sin_out);
 }
 
 }  // namespace adapters

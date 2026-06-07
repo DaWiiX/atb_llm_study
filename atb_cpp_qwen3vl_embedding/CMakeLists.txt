@@ -91,6 +91,7 @@ set(ENGINE_SRCS
     src/components/vision/vision_attention_graph.cpp
     src/components/vision/patch_embed_graph.cpp
     src/components/vision/deepstack_graph.cpp
+    src/components/vision/pos_embed_interp.cpp
     # runners
     src/runners/vision_runner.cpp
     src/runners/text_runner.cpp

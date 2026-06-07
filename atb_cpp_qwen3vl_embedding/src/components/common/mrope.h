@@ -63,6 +63,18 @@ public:
     /// @return Flattened frequency table, shape (max_hw, dim), row-major
     std::vector<float> ComputeFreqTable(int32_t max_hw) const;
 
+    /// Convenience: compute vision RoPE cos/sin for given grid.
+    /// Equivalent to calling ComputeFreqTable + ComputeVisionRotPosEmb.
+    /// @param grid_thw     Grid dimensions [t, h, w] per image, flattened (N*3)
+    /// @param num_images    Number of images N
+    /// @param merge_size    Spatial merge size
+    /// @param cos_out       Output: cos values, shape (total_tokens, dim*2), pre-allocated
+    /// @param sin_out       Output: sin values, shape (total_tokens, dim*2), pre-allocated
+    /// @return total number of tokens
+    int64_t ComputeRoPE(const int64_t* grid_thw, int64_t num_images,
+                        int32_t merge_size,
+                        float* cos_out, float* sin_out) const;
+
     int32_t Dim() const { return dim_; }
 
 private:

@@ -8,6 +8,7 @@
 #include "core/npu_tensor.h"
 #include "components/common/mrope.h"
 #include "components/common/deepstack_fusion.h"
+#include "components/vision/pos_embed_interp.h"
 #include "runners/text_runner.h"
 #include "runners/vision_runner.h"
 #include <cstdint>
@@ -63,6 +64,9 @@ private:
     std::unique_ptr<components::MRoPE> mrope_;
     std::unique_ptr<components::VisionRotaryEmbedding> vis_rope_;
 
+    // ── Host-side pos_embed cache (for CPU interpolation) ──
+    std::vector<uint16_t> vis_pos_embed_host_;
+
     // ── Vision pipeline ───────────────────────────────────
     Status RunVision(const uint16_t* pixel_values, int64_t num_patches,
                      const int64_t* grid_thw, int64_t num_images,
@@ -86,15 +90,6 @@ private:
                           const float* mask,
                           const std::vector<std::vector<uint16_t>>& ds_features,
                           const std::vector<int64_t>& image_token_positions);
-
-    // ── Qwen3VL-specific helpers ──────────────────────────
-    /// Compute fast_pos_embed_interpolate on CPU.
-    void ComputePosEmbedInterp(const int64_t* grid_thw, int64_t num_images,
-                               uint16_t* pos_out);
-
-    /// Compute vision RoPE cos/sin on CPU.
-    void ComputeVisionRoPE(const int64_t* grid_thw, int64_t num_images,
-                           float* cos_out, float* sin_out, int64_t& total_tokens);
 };
 
 }  // namespace adapters
