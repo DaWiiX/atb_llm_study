@@ -127,23 +127,36 @@ Status DeepstackFusion::ExtractFeatures(
 void DeepstackFusion::InjectFeatures(NpuTensor& hidden_npu,
                                      const std::vector<uint16_t>& ds_feat,
                                      const std::vector<int64_t>& positions,
-                                     int64_t seq_len, int64_t hidden_size,
+                                     int64_t /*seq_len*/, int64_t hidden_size,
                                      int64_t feat_dim,
                                      IRuntime* runtime) {
     auto* alloc = runtime->GetAllocator();
-    size_t h_bytes = static_cast<size_t>(seq_len) * hidden_size * sizeof(uint16_t);
-    std::vector<uint16_t> h_host(seq_len * hidden_size);
-    alloc->CopyToHost(h_host.data(), *hidden_npu.Get(), h_bytes);
     int64_t ds_tokens = static_cast<int64_t>(ds_feat.size()) / feat_dim;
+
+    // Partial-copy optimization: only transfer the rows at image token positions
+    // instead of the entire (seq_len, hidden_size) tensor.
+    // For typical usage: ds_tokens=16 vs seq_len=16000 → ~1000x reduction in transfer.
+    size_t row_bytes = static_cast<size_t>(hidden_size) * sizeof(uint16_t);
+    std::vector<uint16_t> row_host(hidden_size);
+
     for (int64_t t = 0; t < ds_tokens && t < static_cast<int64_t>(positions.size()); t++) {
         int64_t pos = positions[t];
+        size_t offset = static_cast<size_t>(pos) * hidden_size * sizeof(uint16_t);
+
+        // Copy single row from NPU to host
+        alloc->CopyToHost(row_host.data(), *hidden_npu.Get(), row_bytes, offset);
+
+        // Add deepstack features on CPU
+        const uint16_t* ds_row = ds_feat.data() + static_cast<size_t>(t) * feat_dim;
         for (int64_t d = 0; d < feat_dim; d++) {
-            float h = atb_llm::Fp16ToF32(h_host[pos * hidden_size + d]);
-            float ds = atb_llm::Fp16ToF32(ds_feat[static_cast<size_t>(t) * feat_dim + d]);
-            h_host[pos * hidden_size + d] = atb_llm::Fp32ToFp16(h + ds);
+            float h = atb_llm::Fp16ToF32(row_host[d]);
+            float ds = atb_llm::Fp16ToF32(ds_row[d]);
+            row_host[d] = atb_llm::Fp32ToFp16(h + ds);
         }
+
+        // Copy modified row back to NPU
+        alloc->CopyToDevice(*hidden_npu.Get(), row_host.data(), row_bytes, offset);
     }
-    alloc->CopyToDevice(*hidden_npu.Get(), h_host.data(), h_bytes);
 }
 
 // ═════════════════════════════════════════════════════════════════════

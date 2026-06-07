@@ -115,6 +115,54 @@ Status TensorAllocator::CopyToHost(void* host_data, const atb::Tensor& tensor, s
     return STATUS_OK;
 }
 
+Status TensorAllocator::CopyToDevice(atb::Tensor& tensor, const void* host_data,
+                                      size_t size, size_t dst_offset_bytes) {
+    if (!tensor.deviceData || !host_data) {
+        LOG_ERROR("CopyToDevice(offset): null pointer");
+        return ERROR_INVALID_PARAM;
+    }
+    if (dst_offset_bytes + size > tensor.dataSize) {
+        LOG_ERROR("CopyToDevice(offset): offset %zu + size %zu exceeds tensor dataSize %zu",
+                  dst_offset_bytes, size, tensor.dataSize);
+        return ERROR_INVALID_PARAM;
+    }
+
+    void* dst_ptr = static_cast<uint8_t*>(tensor.deviceData) + dst_offset_bytes;
+    aclError ret = aclrtMemcpy(dst_ptr, size,
+                                host_data, size,
+                                ACL_MEMCPY_HOST_TO_DEVICE);
+    if (ret != ACL_SUCCESS) {
+        LOG_ERROR("aclrtMemcpy H2D (offset) failed: %d", static_cast<int>(ret));
+        return ERROR_NPU_MEMORY;
+    }
+
+    return STATUS_OK;
+}
+
+Status TensorAllocator::CopyToHost(void* host_data, const atb::Tensor& tensor,
+                                    size_t size, size_t src_offset_bytes) {
+    if (!host_data || !tensor.deviceData) {
+        LOG_ERROR("CopyToHost(offset): null pointer");
+        return ERROR_INVALID_PARAM;
+    }
+    if (src_offset_bytes + size > tensor.dataSize) {
+        LOG_ERROR("CopyToHost(offset): offset %zu + size %zu exceeds tensor dataSize %zu",
+                  src_offset_bytes, size, tensor.dataSize);
+        return ERROR_INVALID_PARAM;
+    }
+
+    void* src_ptr = static_cast<uint8_t*>(tensor.deviceData) + src_offset_bytes;
+    aclError ret = aclrtMemcpy(host_data, size,
+                                src_ptr, size,
+                                ACL_MEMCPY_DEVICE_TO_HOST);
+    if (ret != ACL_SUCCESS) {
+        LOG_ERROR("aclrtMemcpy D2H (offset) failed: %d", static_cast<int>(ret));
+        return ERROR_NPU_MEMORY;
+    }
+
+    return STATUS_OK;
+}
+
 void TensorAllocator::Free(atb::Tensor& tensor) {
     if (tensor.deviceData) {
         aclrtFree(tensor.deviceData);

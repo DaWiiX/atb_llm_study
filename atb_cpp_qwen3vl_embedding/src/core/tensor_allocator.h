@@ -37,6 +37,16 @@ public:
     /// Device -> Host copy (sync)
     Status CopyToHost(void* host_data, const atb::Tensor& tensor, size_t size);
 
+    /// Host -> Device copy with byte offset into the NPU tensor
+    /// @param dst_offset_bytes  Byte offset into the device tensor where writing starts
+    Status CopyToDevice(atb::Tensor& tensor, const void* host_data,
+                        size_t size, size_t dst_offset_bytes);
+
+    /// Device -> Host copy with byte offset into the NPU tensor
+    /// @param src_offset_bytes  Byte offset into the device tensor where reading starts
+    Status CopyToHost(void* host_data, const atb::Tensor& tensor,
+                      size_t size, size_t src_offset_bytes);
+
     /// Release NPU memory for a single tensor
     void Free(atb::Tensor& tensor);
 
