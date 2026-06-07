@@ -75,19 +75,20 @@ set(ENGINE_SRCS
     src/ops/concat_op.cpp
     src/ops/elewise_op.cpp
     src/ops/activation_op.cpp
-    # components
-    src/components/attention/self_attention_graph.cpp
+    # components/common
+    src/components/common/self_attention_graph.cpp
+    src/components/common/swiglu_mlp_graph.cpp
+    src/components/common/rms_norm_graph.cpp
+    src/components/common/mrope.cpp
+    # components/text
+    src/components/text/decoder_layer_graph.cpp
+    # components/vision
     src/components/vision/vision_mlp_graph.cpp
     src/components/vision/vision_merger_graph.cpp
     src/components/vision/vision_block_graph.cpp
     src/components/vision/vision_attention_graph.cpp
     src/components/vision/patch_embed_graph.cpp
     src/components/vision/deepstack_graph.cpp
-    src/components/mlp/swiglu_mlp_graph.cpp
-    src/components/norm/rms_norm_graph.cpp
-    src/components/position/mrope.cpp
-    # layers
-    src/layers/text_decoder_layer.cpp
     # models
     src/models/vision_model.cpp
     src/models/text_model.cpp

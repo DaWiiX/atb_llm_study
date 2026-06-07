@@ -1,13 +1,14 @@
-#include "layers/text_decoder_layer.h"
+#include "components/text/decoder_layer_graph.h"
 #include "core/graph_builder.h"
-#include "components/attention/self_attention_graph.h"
-#include "components/mlp/swiglu_mlp_graph.h"
-#include "components/norm/rms_norm_graph.h"
+#include "components/common/self_attention_graph.h"
+#include "components/common/swiglu_mlp_graph.h"
+#include "components/common/rms_norm_graph.h"
 #include "ops/elewise_op.h"
 #include "log/logger.h"
 
 namespace atb_llm {
-namespace layers {
+namespace components {
+namespace text {
 
 Status TextDecoderLayerGraph::Build(const std::string& name,
                                     int32_t num_heads,
@@ -152,5 +153,6 @@ Status TextDecoderLayerGraph::Build(const std::string& name,
     return STATUS_OK;
 }
 
-}  // namespace layers
+}  // namespace text
+}  // namespace components
 }  // namespace atb_llm

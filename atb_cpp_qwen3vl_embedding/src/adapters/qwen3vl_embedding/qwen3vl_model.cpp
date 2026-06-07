@@ -6,8 +6,8 @@
 #include "components/vision/vision_merger_graph.h"
 #include "components/vision/deepstack_graph.h"
 #include "components/vision/patch_embed_graph.h"
-#include "components/norm/rms_norm_graph.h"
-#include "layers/text_decoder_layer.h"
+#include "components/common/rms_norm_graph.h"
+#include "components/text/decoder_layer_graph.h"
 #include "models/text_model.h"
 #include "models/vision_model.h"
 #include "core/graph_builder.h"
@@ -134,7 +134,7 @@ Status Qwen3VLModel::EnsureTextGraph(int32_t seq_len) {
         return STATUS_OK;
     }
 
-    Status s = layers::TextDecoderLayerGraph::Build(
+    Status s = components::text::TextDecoderLayerGraph::Build(
         "TextDecoderLayer",
         config_.text_num_heads, config_.text_num_kv_heads,
         config_.text_head_dim, seq_len,

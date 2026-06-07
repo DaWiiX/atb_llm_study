@@ -4,9 +4,10 @@
 #include <string>
 
 namespace atb_llm {
-namespace layers {
+namespace components {
+namespace text {
 
-/// Qwen3VL Text Decoder Layer graph.
+/// Text Decoder Layer graph.
 ///
 /// Composes SelfAttentionGraph + SwiGLU MLP.
 /// Pipeline:
@@ -60,5 +61,6 @@ public:
                         int32_t rotary_dim = 2);
 };
 
-}  // namespace layers
+}  // namespace text
+}  // namespace components
 }  // namespace atb_llm

@@ -48,7 +48,7 @@
 #include "models/vision_model.h"
 
 // Position
-#include "components/position/mrope.h"
+#include "components/common/mrope.h"
 
 // Runtime
 #include "engine/runtime_impl.h"

@@ -1,6 +1,6 @@
 #include "models/text_model.h"
-#include "components/norm/rms_norm_graph.h"
-#include "layers/text_decoder_layer.h"
+#include "components/common/rms_norm_graph.h"
+#include "components/text/decoder_layer_graph.h"
 #include "log/logger.h"
 #include <cstring>
 #include <limits>
@@ -12,7 +12,7 @@ TextModel::TextModel(const Config& cfg) : cfg_(cfg) {}
 
 Status TextModel::Build(int32_t seq_len) {
     // Build the shared decoder layer graph (built once, looped 28 times)
-    Status s = layers::TextDecoderLayerGraph::Build(
+    Status s = components::text::TextDecoderLayerGraph::Build(
         "TextDecoderLayer",
         cfg_.num_heads, cfg_.num_kv_heads, cfg_.head_dim,
         seq_len, cfg_.epsilon, /*use_mask=*/true,

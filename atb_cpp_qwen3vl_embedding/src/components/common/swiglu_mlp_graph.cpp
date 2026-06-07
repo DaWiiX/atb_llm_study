@@ -1,4 +1,4 @@
-#include "components/mlp/swiglu_mlp_graph.h"
+#include "components/common/swiglu_mlp_graph.h"
 #include "core/graph_builder.h"
 #include "ops/linear_op.h"
 #include "ops/activation_op.h"

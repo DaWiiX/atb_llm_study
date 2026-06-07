@@ -30,10 +30,10 @@
 #include "ops/self_attention_op.h"
 #include "ops/transpose_op.h"
 #include "ops/softmax_op.h"
-#include "components/norm/rms_norm_graph.h"
-#include "components/mlp/swiglu_mlp_graph.h"
-#include "components/attention/self_attention_graph.h"
-#include "layers/text_decoder_layer.h"
+#include "components/common/rms_norm_graph.h"
+#include "components/common/swiglu_mlp_graph.h"
+#include "components/common/self_attention_graph.h"
+#include "components/text/decoder_layer_graph.h"
 #include "engine/runtime_impl.h"
 #include "log/logger.h"
 
@@ -261,7 +261,7 @@ TEST_CASE("TextDecoderLayerGraph") {
     // Without mask
     {
         atb_llm::OperationHandle op;
-        atb_llm::Status s = atb_llm::layers::TextDecoderLayerGraph::Build(
+        atb_llm::Status s = atb_llm::components::text::TextDecoderLayerGraph::Build(
             "TestDecoderLayer", 12, 12, 64, 16, 1e-6f, false, op);
         CHECK(IS_OK(s));
         REQUIRE(op.get() != nullptr);
@@ -273,7 +273,7 @@ TEST_CASE("TextDecoderLayerGraph") {
     // With mask
     {
         atb_llm::OperationHandle op;
-        atb_llm::Status s = atb_llm::layers::TextDecoderLayerGraph::Build(
+        atb_llm::Status s = atb_llm::components::text::TextDecoderLayerGraph::Build(
             "TestDecoderLayer_Mask", 12, 12, 64, 16, 1e-6f, true, op);
         CHECK(IS_OK(s));
         REQUIRE(op.get() != nullptr);
@@ -283,7 +283,7 @@ TEST_CASE("TextDecoderLayerGraph") {
     // GQA
     {
         atb_llm::OperationHandle op;
-        atb_llm::Status s = atb_llm::layers::TextDecoderLayerGraph::Build(
+        atb_llm::Status s = atb_llm::components::text::TextDecoderLayerGraph::Build(
             "TestDecoderLayer_GQA", 12, 2, 64, 16, 1e-6f, false, op);
         CHECK(IS_OK(s));
         CHECK(op.get() != nullptr);
@@ -459,7 +459,7 @@ TEST_CASE("Operation Execute on NPU") {
     // Test TextDecoderLayerGraph build + Setup
     {
         atb_llm::OperationHandle op;
-        atb_llm::Status s = atb_llm::layers::TextDecoderLayerGraph::Build(
+        atb_llm::Status s = atb_llm::components::text::TextDecoderLayerGraph::Build(
             "ExecDecoderLayer", 12, 12, 64, 4, 1e-6f, false, op);
         CHECK(IS_OK(s));
         CHECK(op.get() != nullptr);

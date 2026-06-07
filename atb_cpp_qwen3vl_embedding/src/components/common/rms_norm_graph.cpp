@@ -1,4 +1,4 @@
-#include "components/norm/rms_norm_graph.h"
+#include "components/common/rms_norm_graph.h"
 #include "core/graph_builder.h"
 #include "ops/rms_norm_op.h"
 #include "log/logger.h"

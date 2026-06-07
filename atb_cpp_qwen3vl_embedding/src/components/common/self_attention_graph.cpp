@@ -1,4 +1,4 @@
-#include "components/attention/self_attention_graph.h"
+#include "components/common/self_attention_graph.h"
 #include "core/graph_builder.h"
 #include "ops/linear_op.h"
 #include "ops/rms_norm_op.h"

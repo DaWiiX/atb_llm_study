@@ -5,7 +5,7 @@
 #include "adapters/qwen3vl_embedding/qwen3vl_weights.h"
 #include "core/raii.h"
 #include "core/npu_tensor.h"
-#include "components/position/mrope.h"
+#include "components/common/mrope.h"
 #include <cstdint>
 #include <memory>
 #include <vector>
