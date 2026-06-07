@@ -1,4 +1,5 @@
 #include "adapters/qwen3vl_embedding/qwen3vl_weights.h"
+#include "io/weight_helpers.h"
 #include "utils/float_utils.h"
 #include "io/safetensors_reader.h"
 #include "log/logger.h"
@@ -10,125 +11,6 @@ namespace atb_llm {
 namespace adapters {
 
 // ═════════════════════════════════════════════════════════════════════
-// Helper: copy weight tensor to NPU as float16
-// ═════════════════════════════════════════════════════════════════════
-
-/// Copy a safetensors weight to NPU as float16.
-/// Handles bf16->fp16 and fp32->fp16 conversion.
-static Status CopyWeightToFp16NPU(WeightLoader& loader,
-                                  const std::string& key,
-                                  TensorAllocator& alloc,
-                                  atb::Tensor& dst) {
-    WeightInfo info;
-    Status s = loader.GetTensor(key, info);
-    if (s != STATUS_OK) {
-        LOG_ERROR("Weight not found: %s", key.c_str());
-        return s;
-    }
-
-    const uint8_t* data = loader.GetTensorData(key);
-    if (!data) {
-        LOG_ERROR("No data for weight: %s", key.c_str());
-        return ERROR_WEIGHT_LOAD;
-    }
-
-    std::vector<int64_t> shape(info.shape.begin(), info.shape.end());
-    size_t num_elements = 1;
-    for (auto d : shape)
-        num_elements *= static_cast<size_t>(d);
-
-    auto st_dtype = static_cast<safetensors::dtype>(info.dtype);
-
-    if (st_dtype == safetensors::kFLOAT16) {
-        // Already fp16, copy directly
-        s = alloc.AllocFloat16(dst, shape);
-        if (s != STATUS_OK) return s;
-        return alloc.CopyToDevice(dst, data, info.nbytes);
-
-    } else if (st_dtype == safetensors::kBFLOAT16) {
-        // Convert bf16 -> fp16
-        std::vector<uint16_t> fp16_buf(num_elements);
-        atb_llm::Bf16ToFp16Buffer(reinterpret_cast<const uint16_t*>(data),
-                                  fp16_buf.data(), num_elements);
-        s = alloc.AllocFloat16(dst, shape);
-        if (s != STATUS_OK) return s;
-        return alloc.CopyToDevice(dst, fp16_buf.data(), num_elements * sizeof(uint16_t));
-
-    } else if (st_dtype == safetensors::kFLOAT32) {
-        // Convert fp32 -> fp16
-        const float* f32_ptr = reinterpret_cast<const float*>(data);
-        std::vector<uint16_t> fp16_buf(num_elements);
-        for (size_t i = 0; i < num_elements; i++) {
-            // Simple fp32 -> fp16 via bf16 intermediate
-            uint32_t f32_bits;
-            std::memcpy(&f32_bits, &f32_ptr[i], sizeof(uint32_t));
-            uint16_t bf16 = static_cast<uint16_t>(f32_bits >> 16);
-            fp16_buf[i] = atb_llm::Bf16ToFp16(bf16);
-        }
-        s = alloc.AllocFloat16(dst, shape);
-        if (s != STATUS_OK) return s;
-        return alloc.CopyToDevice(dst, fp16_buf.data(), num_elements * sizeof(uint16_t));
-
-    } else if (st_dtype == safetensors::kINT64) {
-        // int64: copy as-is (for position embeddings etc.)
-        s = alloc.AllocInt64(dst, shape);
-        if (s != STATUS_OK) return s;
-        return alloc.CopyToDevice(dst, data, info.nbytes);
-
-    } else {
-        LOG_ERROR("Unsupported dtype for %s: %d", key.c_str(), info.dtype);
-        return ERROR_UNSUPPORTED;
-    }
-}
-
-/// Copy a safetensors weight to host memory, converting bf16 -> fp16.
-static Status CopyWeightToFp16Host(WeightLoader& loader,
-                                   const std::string& key,
-                                   void* host_dst,
-                                   size_t dst_capacity_bytes) {
-    WeightInfo info;
-    Status s = loader.GetTensor(key, info);
-    if (s != STATUS_OK) return s;
-
-    const uint8_t* data = loader.GetTensorData(key);
-    if (!data) return ERROR_WEIGHT_LOAD;
-
-    size_t num_elements = 1;
-    for (auto d : info.shape)
-        num_elements *= d;
-
-    auto st_dtype = static_cast<safetensors::dtype>(info.dtype);
-    size_t required_bytes = num_elements * sizeof(uint16_t);
-
-    if (dst_capacity_bytes < required_bytes) {
-        LOG_ERROR("Host buffer too small for %s: need %zu, have %zu",
-                  key.c_str(), required_bytes, dst_capacity_bytes);
-        return ERROR_INVALID_PARAM;
-    }
-
-    if (st_dtype == safetensors::kFLOAT16) {
-        std::memcpy(host_dst, data, info.nbytes);
-    } else if (st_dtype == safetensors::kBFLOAT16) {
-        atb_llm::Bf16ToFp16Buffer(reinterpret_cast<const uint16_t*>(data),
-                                  reinterpret_cast<uint16_t*>(host_dst), num_elements);
-    } else if (st_dtype == safetensors::kFLOAT32) {
-        const float* f32_ptr = reinterpret_cast<const float*>(data);
-        uint16_t* dst16 = reinterpret_cast<uint16_t*>(host_dst);
-        for (size_t i = 0; i < num_elements; i++) {
-            uint32_t f32_bits;
-            std::memcpy(&f32_bits, &f32_ptr[i], sizeof(uint32_t));
-            uint16_t bf16 = static_cast<uint16_t>(f32_bits >> 16);
-            dst16[i] = atb_llm::Bf16ToFp16(bf16);
-        }
-    } else {
-        LOG_ERROR("Unsupported dtype for host copy %s: %d", key.c_str(), info.dtype);
-        return ERROR_UNSUPPORTED;
-    }
-
-    return STATUS_OK;
-}
-
-// ═════════════════════════════════════════════════════════════════════
 // Weight loading
 // ═════════════════════════════════════════════════════════════════════
 
@@ -138,36 +20,20 @@ static Status LoadTextLayerWeights(WeightLoader& loader,
                                    int32_t layer_idx,
                                    TextLayerWeights& w) {
     std::string pfx = "model.language_model.layers." + std::to_string(layer_idx) + ".";
-
-    auto load = [&](const std::string& suffix, atb::Tensor& dst) -> Status {
-        return CopyWeightToFp16NPU(loader, pfx + suffix, alloc, dst);
+    io::WeightLoadEntry entries[] = {
+        {"self_attn.q_proj.weight", &w.q_weight},
+        {"self_attn.k_proj.weight", &w.k_weight},
+        {"self_attn.v_proj.weight", &w.v_weight},
+        {"self_attn.o_proj.weight", &w.o_weight},
+        {"self_attn.q_norm.weight", &w.q_norm_weight},
+        {"self_attn.k_norm.weight", &w.k_norm_weight},
+        {"mlp.gate_proj.weight", &w.gate_weight},
+        {"mlp.up_proj.weight", &w.up_weight},
+        {"mlp.down_proj.weight", &w.down_weight},
+        {"input_layernorm.weight", &w.input_ln_weight},
+        {"post_attention_layernorm.weight", &w.post_ln_weight},
     };
-
-    Status s;
-    s = load("self_attn.q_proj.weight", w.q_weight);
-    if (s != STATUS_OK) return s;
-    s = load("self_attn.k_proj.weight", w.k_weight);
-    if (s != STATUS_OK) return s;
-    s = load("self_attn.v_proj.weight", w.v_weight);
-    if (s != STATUS_OK) return s;
-    s = load("self_attn.o_proj.weight", w.o_weight);
-    if (s != STATUS_OK) return s;
-    s = load("self_attn.q_norm.weight", w.q_norm_weight);
-    if (s != STATUS_OK) return s;
-    s = load("self_attn.k_norm.weight", w.k_norm_weight);
-    if (s != STATUS_OK) return s;
-    s = load("mlp.gate_proj.weight", w.gate_weight);
-    if (s != STATUS_OK) return s;
-    s = load("mlp.up_proj.weight", w.up_weight);
-    if (s != STATUS_OK) return s;
-    s = load("mlp.down_proj.weight", w.down_weight);
-    if (s != STATUS_OK) return s;
-    s = load("input_layernorm.weight", w.input_ln_weight);
-    if (s != STATUS_OK) return s;
-    s = load("post_attention_layernorm.weight", w.post_ln_weight);
-    if (s != STATUS_OK) return s;
-
-    return STATUS_OK;
+    return io::LoadLinearWeights(loader, alloc, pfx, entries, sizeof(entries) / sizeof(entries[0]));
 }
 
 static Status LoadVisionBlockWeights(WeightLoader& loader,
@@ -176,63 +42,36 @@ static Status LoadVisionBlockWeights(WeightLoader& loader,
                                      int32_t block_idx,
                                      VisionBlockWeights& w) {
     std::string pfx = "model.visual.blocks." + std::to_string(block_idx) + ".";
-
-    auto load = [&](const std::string& suffix, atb::Tensor& dst) -> Status {
-        return CopyWeightToFp16NPU(loader, pfx + suffix, alloc, dst);
+    io::WeightLoadEntry entries[] = {
+        {"attn.qkv.weight", &w.qkv_weight},
+        {"attn.qkv.bias", &w.qkv_bias},
+        {"attn.proj.weight", &w.proj_weight},
+        {"attn.proj.bias", &w.proj_bias},
+        {"mlp.linear_fc1.weight", &w.fc1_weight},
+        {"mlp.linear_fc1.bias", &w.fc1_bias},
+        {"mlp.linear_fc2.weight", &w.fc2_weight},
+        {"mlp.linear_fc2.bias", &w.fc2_bias},
+        {"norm1.weight", &w.n1_weight},
+        {"norm1.bias", &w.n1_bias},
+        {"norm2.weight", &w.n2_weight},
+        {"norm2.bias", &w.n2_bias},
     };
-
-    Status s;
-    s = load("attn.qkv.weight", w.qkv_weight);
-    if (s != STATUS_OK) return s;
-    s = load("attn.qkv.bias", w.qkv_bias);
-    if (s != STATUS_OK) return s;
-    s = load("attn.proj.weight", w.proj_weight);
-    if (s != STATUS_OK) return s;
-    s = load("attn.proj.bias", w.proj_bias);
-    if (s != STATUS_OK) return s;
-    s = load("mlp.linear_fc1.weight", w.fc1_weight);
-    if (s != STATUS_OK) return s;
-    s = load("mlp.linear_fc1.bias", w.fc1_bias);
-    if (s != STATUS_OK) return s;
-    s = load("mlp.linear_fc2.weight", w.fc2_weight);
-    if (s != STATUS_OK) return s;
-    s = load("mlp.linear_fc2.bias", w.fc2_bias);
-    if (s != STATUS_OK) return s;
-    s = load("norm1.weight", w.n1_weight);
-    if (s != STATUS_OK) return s;
-    s = load("norm1.bias", w.n1_bias);
-    if (s != STATUS_OK) return s;
-    s = load("norm2.weight", w.n2_weight);
-    if (s != STATUS_OK) return s;
-    s = load("norm2.bias", w.n2_bias);
-    if (s != STATUS_OK) return s;
-
-    return STATUS_OK;
+    return io::LoadLinearWeights(loader, alloc, pfx, entries, sizeof(entries) / sizeof(entries[0]));
 }
 
 static Status LoadMergerWeights(WeightLoader& loader,
                                 TensorAllocator& alloc,
                                 const std::string& prefix,
                                 MergerWeights& w) {
-    auto load = [&](const std::string& suffix, atb::Tensor& dst) -> Status {
-        return CopyWeightToFp16NPU(loader, prefix + suffix, alloc, dst);
+    io::WeightLoadEntry entries[] = {
+        {"norm.weight", &w.norm_weight},
+        {"norm.bias", &w.norm_bias},
+        {"linear_fc1.weight", &w.fc1_weight},
+        {"linear_fc1.bias", &w.fc1_bias},
+        {"linear_fc2.weight", &w.fc2_weight},
+        {"linear_fc2.bias", &w.fc2_bias},
     };
-
-    Status s;
-    s = load("norm.weight", w.norm_weight);
-    if (s != STATUS_OK) return s;
-    s = load("norm.bias", w.norm_bias);
-    if (s != STATUS_OK) return s;
-    s = load("linear_fc1.weight", w.fc1_weight);
-    if (s != STATUS_OK) return s;
-    s = load("linear_fc1.bias", w.fc1_bias);
-    if (s != STATUS_OK) return s;
-    s = load("linear_fc2.weight", w.fc2_weight);
-    if (s != STATUS_OK) return s;
-    s = load("linear_fc2.bias", w.fc2_bias);
-    if (s != STATUS_OK) return s;
-
-    return STATUS_OK;
+    return io::LoadLinearWeights(loader, alloc, prefix, entries, sizeof(entries) / sizeof(entries[0]));
 }
 
 Status LoadQwen3VLWeights(const std::string& model_dir,
@@ -262,7 +101,7 @@ Status LoadQwen3VLWeights(const std::string& model_dir,
     LOG_INFO("Loaded %d text layer weights", config.text_num_layers);
 
     // ── Text final norm ───────────────────────────────────
-    s = CopyWeightToFp16NPU(loader, "model.language_model.norm.weight",
+    s = io::CopyWeightToFp16NPU(loader, "model.language_model.norm.weight",
                             alloc, weights.text_norm_weight);
     if (s != STATUS_OK) {
         LOG_ERROR("Failed to load text norm weight");
@@ -372,13 +211,13 @@ Status LoadQwen3VLWeights(const std::string& model_dir,
         if (s != STATUS_OK) return s;
 
         // Bias: (hs,)
-        s = CopyWeightToFp16NPU(loader, "model.visual.patch_embed.proj.bias",
+        s = io::CopyWeightToFp16NPU(loader, "model.visual.patch_embed.proj.bias",
                                 alloc, weights.vis_patch_embed.bias);
         if (s != STATUS_OK) return s;
     }
 
     // ── Vision position embedding ─────────────────────────
-    s = CopyWeightToFp16NPU(loader, "model.visual.pos_embed.weight",
+    s = io::CopyWeightToFp16NPU(loader, "model.visual.pos_embed.weight",
                             alloc, weights.vis_pos_embed);
     if (s != STATUS_OK) {
         LOG_ERROR("Failed to load vision pos_embed weight");

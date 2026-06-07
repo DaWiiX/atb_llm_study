@@ -53,6 +53,7 @@ set(ENGINE_SRCS
     # io
     src/io/safetensors_reader.cpp
     src/io/weight_loader.cpp
+    src/io/weight_helpers.cpp
     src/io/json_config.cpp
     # log
     src/log/logger.cpp
