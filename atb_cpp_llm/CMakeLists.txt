@@ -94,6 +94,7 @@ set(ENGINE_SRCS
     src/components/vision/patch_embed_graph.cpp
     src/components/vision/deepstack_graph.cpp
     src/components/vision/pos_embed_interp.cpp
+    src/components/vision/pos_embed_npu_graph.cpp
     # runners
     src/runners/vision_runner.cpp
     src/runners/text_runner.cpp
@@ -164,7 +165,46 @@ add_atb_test(test_text_model           tests/test_text_model.cpp)
 add_atb_test(test_e2e                  tests/test_e2e.cpp)
 add_atb_test(test_consistency          tests/test_consistency.cpp)
 add_atb_test(test_accuracy             tests/test_accuracy.cpp)
+add_atb_test(test_stage_precision      tests/test_stage_precision.cpp)
 add_atb_test(test_forward_error_paths  tests/test_forward_error_paths.cpp)
+add_atb_test(test_vision_stages       tests/test_vision_stages.cpp)
+add_atb_test(test_pos_embed_npu_graph tests/test_pos_embed_npu_graph.cpp)
+
+# Level 1 CPU pure-function tests (no NPU dependency for the logic,
+# but link against engine library for the implementation).
+add_atb_test(test_mrope_cpu         tests/test_mrope_cpu.cpp)
+add_atb_test(test_vision_rope_cpu   tests/test_vision_rope_cpu.cpp)
+add_atb_test(test_preprocess_cpu    tests/test_preprocess_cpu.cpp)
+add_atb_test(test_pos_embed_cpu     tests/test_pos_embed_cpu.cpp)
+add_atb_test(test_float_utils       tests/test_float_utils.cpp)
+add_atb_test(test_base_model_utils  tests/test_base_model_utils.cpp)
+
+# Level 2 per-op precision tests (Wave 2)
+add_atb_test(test_rms_norm_precision            tests/test_rms_norm_precision.cpp)
+add_atb_test(test_layer_norm_precision          tests/test_layer_norm_precision.cpp)
+add_atb_test(test_linear_precision              tests/test_linear_precision.cpp)
+add_atb_test(test_activation_precision          tests/test_activation_precision.cpp)
+add_atb_test(test_elewise_precision             tests/test_elewise_precision.cpp)
+add_atb_test(test_split_concat_precision        tests/test_split_concat_precision.cpp)
+add_atb_test(test_softmax_precision             tests/test_softmax_precision.cpp)
+add_atb_test(test_gather_reduce_precision       tests/test_gather_reduce_precision.cpp)
+add_atb_test(test_transpose_set_value_precision tests/test_transpose_set_value_precision.cpp)
+
+# Level 2 advanced precision tests (Wave 3)
+add_atb_test(test_rope_precision                tests/test_rope_precision.cpp)
+add_atb_test(test_self_attention_precision      tests/test_self_attention_precision.cpp)
+add_atb_test(test_swiglu_mlp_precision          tests/test_swiglu_mlp_precision.cpp)
+add_atb_test(test_text_decoder_layer_precision  tests/test_text_decoder_layer_precision.cpp)
+add_atb_test(test_vision_attention_precision    tests/test_vision_attention_precision.cpp)
+add_atb_test(test_vision_mlp_precision          tests/test_vision_mlp_precision.cpp)
+add_atb_test(test_vision_block_precision        tests/test_vision_block_precision.cpp)
+add_atb_test(test_patch_embed_precision         tests/test_patch_embed_precision.cpp)
+add_atb_test(test_vision_merger_precision       tests/test_vision_merger_precision.cpp)
+
+# Level 3 integration tests (Wave 4)
+add_atb_test(test_deepstack              tests/test_deepstack.cpp)
+add_atb_test(test_vision_runner_full     tests/test_vision_runner_full.cpp)
+add_atb_test(test_text_runner_full       tests/test_text_runner_full.cpp)
 
 # doctest-based IO/Adapter tests (needs tests/ for doctest.h)
 add_executable(test_io_adapters tests/test_io_adapters.cpp)

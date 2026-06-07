@@ -27,6 +27,10 @@ Status TensorAllocator::AllocInt64(atb::Tensor& tensor, std::vector<int64_t> sha
     return AllocTensor(tensor, std::move(shape), ACL_INT64, 8);
 }
 
+Status TensorAllocator::AllocInt32(atb::Tensor& tensor, std::vector<int64_t> shape) {
+    return AllocTensor(tensor, std::move(shape), ACL_INT32, 4);
+}
+
 Status TensorAllocator::AllocTensor(atb::Tensor& tensor, std::vector<int64_t> shape,
                                      aclDataType dtype, size_t element_size) {
     if (shape.empty() || shape.size() > atb::MAX_DIM) {

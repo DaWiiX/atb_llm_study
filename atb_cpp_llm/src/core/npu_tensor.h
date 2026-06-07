@@ -49,5 +49,6 @@ private:
 NpuTensor AllocNpuFloat16(std::vector<int64_t> shape);
 NpuTensor AllocNpuFloat32(std::vector<int64_t> shape);
 NpuTensor AllocNpuInt64(std::vector<int64_t> shape);
+NpuTensor AllocNpuInt32(std::vector<int64_t> shape);
 
 } // namespace atb_llm

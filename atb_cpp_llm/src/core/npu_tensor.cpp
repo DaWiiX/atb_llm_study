@@ -107,4 +107,8 @@ NpuTensor AllocNpuInt64(std::vector<int64_t> shape) {
     return NpuTensor(std::move(shape), ACL_INT64, 8);
 }
 
+NpuTensor AllocNpuInt32(std::vector<int64_t> shape) {
+    return NpuTensor(std::move(shape), ACL_INT32, 4);
+}
+
 } // namespace atb_llm

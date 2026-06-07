@@ -9,6 +9,7 @@
 #include "components/common/mrope.h"
 #include "components/common/deepstack_fusion.h"
 #include "components/vision/pos_embed_interp.h"
+#include "components/vision/pos_embed_npu_graph.h"
 #include "runners/text_runner.h"
 #include "runners/vision_runner.h"
 #include <cstdint>
@@ -70,11 +71,27 @@ private:
     // ── Host-side pos_embed cache (for CPU interpolation) ──
     std::vector<uint16_t> vis_pos_embed_host_;
 
+    // ── NPU-side pos_embed: weight table + interpolation graph ──
+    // The CPU bilinear interp + spatial merge + temporal repeat is
+    // refactored as `BuildPosEmbedIndicesAndWeights` (host, O(N))
+    // followed by a tiny ATB graph (4× Gather + 4× Mul + 3× Add).
+    atb::Tensor vis_pos_embed_npu_;          // (G*G, vis_hs) fp16
+    OperationHandle pos_embed_interp_graph_; // shape-agnostic graph
+
     // ── Vision pipeline ───────────────────────────────────
     Status RunVision(const uint16_t* pixel_values, int64_t num_patches,
                      const int64_t* grid_thw, int64_t num_images,
                      uint16_t* vis_embeds_out, int64_t vis_embed_dim,
                      std::vector<std::vector<uint16_t>>& ds_features);
+
+    // Compute Vision PosEmbed on NPU.
+    //   - Builds (idx, wt) on host (cheap, O(N))
+    //   - Uploads + runs the 4-Gather/4-Mul/3-Add graph (NPU)
+    //   - Leaves the result in @p out_npu, shape (N, vis_hs) fp16
+    // Caller must have allocated @p out_npu with the right shape.
+    Status ComputePosEmbedNpu(const int64_t* grid_thw, int64_t num_images,
+                              int64_t expected_n,
+                              atb::Tensor& out_npu);
 
     // ── Input preparation ────────────────────────────────
     Status PrepareInputs(const InferRequest& request,

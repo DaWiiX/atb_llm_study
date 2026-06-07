@@ -31,6 +31,9 @@ public:
     /// Allocate NPU memory and set TensorDesc for int64
     Status AllocInt64(atb::Tensor& tensor, std::vector<int64_t> shape);
 
+    /// Allocate NPU memory and set TensorDesc for int32 (used by index tensors)
+    Status AllocInt32(atb::Tensor& tensor, std::vector<int64_t> shape);
+
     /// Host -> Device copy (async via stream)
     Status CopyToDevice(atb::Tensor& tensor, const void* host_data, size_t size);
 

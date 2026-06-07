@@ -115,7 +115,7 @@ Status DeepstackFusion::ExtractFeatures(
     ds_features[fusion_idx].resize(merged_tokens * cfg_.vis_out_hidden_size);
     alloc->CopyToHost(ds_features[fusion_idx].data(), *ds_out.Get(), ds_bytes);
 
-    LOG_INFO("DeepstackMerger %zu: extracted %ld merged tokens",
+    LOG_DEBUG("DeepstackMerger %zu: extracted %ld merged tokens",
              fusion_idx, static_cast<long>(merged_tokens));
     return STATUS_OK;
 }

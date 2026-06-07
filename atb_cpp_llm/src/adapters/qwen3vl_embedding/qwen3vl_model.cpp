@@ -58,6 +58,32 @@ Status Qwen3VLModel::Load(const std::string& model_dir, IRuntime* runtime) {
         }
     }
 
+    // 2c. Upload pos_embed to NPU + build the interp graph (one-time cost).
+    // The graph is shape-agnostic; runtime tensors carry the actual N.
+    {
+        int64_t num_pos = config_.vis_num_position_embeddings;
+        int64_t hs = config_.vis_hidden_size;
+        s = runtime->GetAllocator()->AllocFloat16(vis_pos_embed_npu_, {num_pos, hs});
+        if (s != STATUS_OK) {
+            LOG_ERROR("Failed to alloc pos_embed NPU tensor");
+            return s;
+        }
+        s = runtime->GetAllocator()->CopyToDevice(
+            vis_pos_embed_npu_, vis_pos_embed_host_.data(),
+            vis_pos_embed_host_.size() * sizeof(uint16_t));
+        if (s != STATUS_OK) {
+            LOG_ERROR("Failed to copy pos_embed to NPU");
+            return s;
+        }
+
+        s = components::PosEmbedInterpGraph::Build(
+            "PosEmbedInterp", pos_embed_interp_graph_);
+        if (s != STATUS_OK) {
+            LOG_ERROR("Failed to build PosEmbedInterpGraph");
+            return s;
+        }
+    }
+
     // 3. Initialize position encoding helpers
     mrope_ = std::make_unique<components::MRoPE>(
         config_.text_head_dim, config_.text_rope_theta, config_.text_mrope_section);
@@ -223,12 +249,12 @@ Status Qwen3VLModel::ForwardWithTiming(const InferRequest& request,
                             config_.vis_patch_size * config_.vis_patch_size;
         int64_t flat_elements = np * patch_dim;
 
-        // ── Stage: Vision Pos Embed + RoPE (CPU) ─────────────
-        std::vector<uint16_t> pos_embed_host(np * vis_hs);
-        components::ComputePosEmbedInterp(vis_pos_embed_host_.data(),
-                                          config_.vis_hidden_size, config_.num_grid(),
-                                          merge_size, grid_thw_host.data(), num_images,
-                                          pos_embed_host.data());
+        // ── Stage: Vision Pos Embed + RoPE ─────────────────────
+        // PosEmbed: computed directly on NPU via the interp graph.
+        NpuTensor pos_npu = AllocNpuFloat16({np, vis_hs});
+        Status pe_s = ComputePosEmbedNpu(grid_thw_host.data(), num_images,
+                                          np, *pos_npu.Get());
+        if (pe_s != STATUS_OK) return pe_s;
 
         // VisionRoPE outputs (total_tokens, vis_hd) — dim*2 = half*4 = vis_hd
         std::vector<float> vis_cos_f32(np * vis_hd);
@@ -281,13 +307,11 @@ Status Qwen3VLModel::ForwardWithTiming(const InferRequest& request,
         t_prev = t_vis_pos;
 
         // ── Stage: Vision Model (NPU) ────────────────────────
+        // pos_npu was already populated by ComputePosEmbedNpu above.
         size_t pixel_bytes = static_cast<size_t>(flat_elements) * sizeof(uint16_t);
-        size_t pos_bytes = static_cast<size_t>(np) * vis_hs * sizeof(uint16_t);
 
         NpuTensor pixels_npu = AllocNpuFloat16({flat_elements});
         alloc->CopyToDevice(*pixels_npu.Get(), pv, pixel_bytes);
-        NpuTensor pos_npu = AllocNpuFloat16({np, vis_hs});
-        alloc->CopyToDevice(*pos_npu.Get(), pos_embed_host.data(), pos_bytes);
         NpuTensor cos_npu = AllocNpuFloat16({total_tokens, static_cast<int64_t>(vis_hd)});
         alloc->CopyToDevice(*cos_npu.Get(), cos_fp16.data(),
                             cos_fp16.size() * sizeof(uint16_t));
@@ -732,14 +756,11 @@ Status Qwen3VLModel::RunVision(const uint16_t* pixel_values, int64_t num_patches
     int32_t vis_hd = config_.vis_head_dim();
     int64_t merge_size = config_.vis_spatial_merge_size;
 
-    // 1. Compute position embeddings (CPU) via extracted component
-    size_t pos_bytes = static_cast<size_t>(num_patches) * vis_hs * sizeof(uint16_t);
-    std::vector<uint16_t> pos_embed_host(num_patches * vis_hs);
-    components::ComputePosEmbedInterp(vis_pos_embed_host_.data(),
-                                      config_.vis_hidden_size, config_.num_grid(),
-                                      config_.vis_spatial_merge_size,
-                                      grid_thw, num_images,
-                                      pos_embed_host.data());
+    // 1. Compute position embeddings on NPU via the interp graph.
+    NpuTensor pos_npu = AllocNpuFloat16({num_patches, vis_hs});
+    Status pe_s = ComputePosEmbedNpu(grid_thw, num_images,
+                                      num_patches, *pos_npu.Get());
+    if (pe_s != STATUS_OK) return pe_s;
 
     // 2. Compute vision RoPE (CPU) via VisionRotaryEmbedding component
     // VisionRoPE outputs (total_tokens, vis_hd) — dim*2 = half*4 = vis_hd
@@ -803,8 +824,7 @@ Status Qwen3VLModel::RunVision(const uint16_t* pixel_values, int64_t num_patches
     NpuTensor pixels_npu = AllocNpuFloat16({flat_elements});
     alloc->CopyToDevice(*pixels_npu.Get(), pixel_values, pixel_bytes);
 
-    NpuTensor pos_npu = AllocNpuFloat16({num_patches, vis_hs});
-    alloc->CopyToDevice(*pos_npu.Get(), pos_embed_host.data(), pos_bytes);
+    // pos_npu already populated by ComputePosEmbedNpu above.
 
     NpuTensor cos_npu = AllocNpuFloat16({total_tokens, static_cast<int64_t>(vis_hd)});
     alloc->CopyToDevice(*cos_npu.Get(), cos_fp16.data(), cos_fp16.size() * sizeof(uint16_t));
@@ -1007,6 +1027,81 @@ Status Qwen3VLModel::RunVision(const uint16_t* pixel_values, int64_t num_patches
     LOG_INFO("Vision inference completed: %ld patches, %ld merged tokens",
              static_cast<long>(total_tokens),
              static_cast<long>(total_tokens / (merge_size * merge_size)));
+    return STATUS_OK;
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// ComputePosEmbedNpu — host Stage A + NPU Stage B replacement for the
+// old CPU `ComputePosEmbedInterp`.
+//
+// Caller owns @p out_npu (must be pre-allocated to {expected_n, vis_hs} fp16).
+// We allocate the 8 transient (idx, wt) tensors locally; they free on scope
+// exit via the central TensorAllocator tracker.
+// ═════════════════════════════════════════════════════════════════════
+
+Status Qwen3VLModel::ComputePosEmbedNpu(const int64_t* grid_thw, int64_t num_images,
+                                         int64_t expected_n,
+                                         atb::Tensor& out_npu) {
+    if (!pos_embed_interp_graph_) {
+        LOG_ERROR("ComputePosEmbedNpu: graph not built");
+        return ERROR_GRAPH_BUILD;
+    }
+    if (!grid_thw || num_images <= 0) {
+        LOG_ERROR("ComputePosEmbedNpu: invalid grid_thw/num_images");
+        return ERROR_INVALID_PARAM;
+    }
+
+    int32_t num_grid = config_.num_grid();
+    int32_t merge_size = static_cast<int32_t>(config_.vis_spatial_merge_size);
+
+    // ── Stage A: host-side index/weight construction ──
+    std::vector<int32_t> idx_host[4];
+    std::vector<uint16_t> wt_host[4];
+    components::BuildPosEmbedIndicesAndWeights(
+        grid_thw, num_images, num_grid, merge_size, idx_host, wt_host);
+
+    int64_t n = static_cast<int64_t>(idx_host[0].size());
+    if (n != expected_n) {
+        LOG_ERROR("ComputePosEmbedNpu: built N=%ld != expected=%ld",
+                  static_cast<long>(n), static_cast<long>(expected_n));
+        return ERROR_INVALID_PARAM;
+    }
+
+    // ── Stage B: NPU graph ──
+    auto* alloc = runtime_->GetAllocator();
+
+    NpuTensor idx_npu[4], wt_npu[4];
+    for (int k = 0; k < 4; k++) {
+        idx_npu[k] = AllocNpuInt32({n});
+        if (!idx_npu[k]) {
+            LOG_ERROR("ComputePosEmbedNpu: alloc idx%d failed", k);
+            return ERROR_NPU_MEMORY;
+        }
+        // wt shape (N, 1) so ElewiseMul broadcasts over vis_hs
+        wt_npu[k] = AllocNpuFloat16({n, 1});
+        if (!wt_npu[k]) {
+            LOG_ERROR("ComputePosEmbedNpu: alloc wt%d failed", k);
+            return ERROR_NPU_MEMORY;
+        }
+
+        alloc->CopyToDevice(*idx_npu[k].Get(), idx_host[k].data(),
+                            n * sizeof(int32_t));
+        alloc->CopyToDevice(*wt_npu[k].Get(), wt_host[k].data(),
+                            n * sizeof(uint16_t));
+    }
+
+    atb::VariantPack vp;
+    vp.inTensors = {
+        vis_pos_embed_npu_,
+        *idx_npu[0].Get(), *idx_npu[1].Get(), *idx_npu[2].Get(), *idx_npu[3].Get(),
+        *wt_npu[0].Get(),  *wt_npu[1].Get(),  *wt_npu[2].Get(),  *wt_npu[3].Get()};
+    vp.outTensors = {out_npu};
+
+    Status s = ExecuteGraph(pos_embed_interp_graph_, vp);
+    if (s != STATUS_OK) {
+        LOG_ERROR("ComputePosEmbedNpu: graph execute failed");
+        return s;
+    }
     return STATUS_OK;
 }
 
