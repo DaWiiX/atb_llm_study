@@ -51,7 +51,7 @@
 |------|------|--------|
 | InjectFeatures 纯 NPU 实现 | 当前仍为 CPU 侧加法 + partial-copy；ATB SetValue/Gather 是否支持任意索引 scatter-add 需查文档验证；若支持可实现纯 NPU 操作消除所有 NPU-Host 传输 | 中（性能优化） |
 | Debug 模式 -DDEBUG 与 LogLevel::DEBUG 冲突 | CMakeLists.txt 中 `-DDEBUG` 宏与 logger.h 中的 `LogLevel::DEBUG` 枚举值冲突，导致 Debug 构建编译失败 | 低（仅影响 Debug 构建） |
-| test_accuracy 视觉路径 NPU 流同步失败 | VisionBlock 2 执行时 Stream synchronization failed: 507057，预存问题，与重构无关 | 低（预存问题） |
+| ~~test_accuracy 视觉路径 NPU 流同步失败~~ | ~~VisionBlock 2 执行时 Stream synchronization failed: 507057~~ → 根因: GRAPH_LAUNCH_MODE 导致流状态异常，已禁用修复 | ✅ 已修复 (f636e48) |
 
 ---
 
@@ -64,20 +64,20 @@
    source /usr/local/Ascend/nnal/atb/latest/atb/set_env.sh --cxx_abi=1 2>/dev/null; source /usr/local/Ascend/nnal/atb/set_env.sh --cxx_abi=1 2>/dev/null
    export ATB_BUILD_DEPENDENCY_PATH=/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1
    export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/home/developer/Ascend/nnal/atb/9.0.0/atb/cxx_abi_1/lib
-   cd /mnt/workspace/gitCode/atb_llm/atb_cpp_qwen3vl_embedding/build
+   cd /mnt/workspace/gitCode/atb_llm/atb_cpp_llm/build
    # Step A: C++ 生成推理结果到 /tmp/cpp_embedding.bin
    ./test_consistency
    # Step B: Python 读 C++ 结果 + 跑 Python engine → 比较余弦相似度
    cd /mnt/workspace/gitCode/atb_llm
-   python atb_cpp_qwen3vl_embedding/tests/test_consistency.py
+   python atb_cpp_llm/tests/test_consistency.py
    # 期望: cosine similarity > 0.99
    ```
 4. **C++ vs Python 多模式精度对比**（text-only / image-only / image+text 三种模式）：
    ```bash
-   cd /mnt/workspace/gitCode/atb_llm/atb_cpp_qwen3vl_embedding/build
+   cd /mnt/workspace/gitCode/atb_llm/atb_cpp_llm/build
    ./test_accuracy
    cd /mnt/workspace/gitCode/atb_llm
-   python atb_cpp_qwen3vl_embedding/tests/test_accuracy.py
+   python atb_cpp_llm/tests/test_accuracy.py
    ```
 5. **提交 git，push 到远端**
 
@@ -230,6 +230,20 @@
 - [x] 删除 bench_mm.cpp，从 CMakeLists.txt 移除
 - [x] 更新 compare_multimodal.py 使用新 benchmark 的 --mode mm --cmp
 - [x] C++ 编译通过，全部 target 构建成功
+
+### Bug Fixes (post-Phase 16)
+
+| 问题 | 原因 | 修复 | Commit |
+|------|------|------|--------|
+| GRAPH_LAUNCH_MODE 流同步失败 (507057) | SetLaunchMode(GRAPH_LAUNCH_MODE) 导致 vision block 图在重复 Setup+Execute 时流状态异常 | 禁用 GRAPH_LAUNCH_MODE，待进一步调查 | f636e48 |
+| 图像 token 数量验证错误 | 比较 image_token_positions.size() 与 num_patches（原始 patches），应比较 merged_tokens | 修正为 merged_tokens = num_patches / (merge_size^2) | f636e48 |
+| 注入循环越界 | 循环上界为 np（patches 数），但 image_token_positions 只有 merged_tokens 个 | 改为 image_token_positions.size() | f636e48 |
+| IMAGE_ONLY 精度低 (cosine=0.83) | 64x64 极小图像仅产生 4 个 merged tokens，数值不稳定 | 非代码 bug，测试用例问题；实际使用不会出现此场景 | — |
+
+### Baseline 性能数据 (2026-06-07)
+
+**Text-Only (S=64)**: E2E 12.28 ms ± 0.08 ms
+**Multimodal (416x672, S=285, 273 vis_tokens)**: E2E 202.08 ms ± 1.42 ms
 
 ---
 

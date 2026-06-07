@@ -31,7 +31,7 @@ parser.add_argument('--all-seqs', action='store_true',
 args = parser.parse_args()
 
 MODEL_DIR = "/mnt/workspace/gitCode/models/Qwen3-VL-Embedding-2B"
-CPP_BUILD_DIR = "/mnt/workspace/gitCode/atb_llm/atb_cpp_qwen3vl_embedding/build"
+CPP_BUILD_DIR = "/mnt/workspace/gitCode/atb_llm/atb_cpp_llm/build"
 CPP_BENCHMARK = os.path.join(CPP_BUILD_DIR, "benchmark")
 
 def stats_ms(arr):

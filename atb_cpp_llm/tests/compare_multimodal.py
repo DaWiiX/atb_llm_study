@@ -19,7 +19,7 @@ def sync(): torch.npu.synchronize()
 def now(): return time.perf_counter()
 
 MODEL_DIR = '/mnt/workspace/gitCode/models/Qwen3-VL-Embedding-2B'
-CPP_BUILD = '/mnt/workspace/gitCode/atb_llm/atb_cpp_qwen3vl_embedding/build'
+CPP_BUILD = '/mnt/workspace/gitCode/atb_llm/atb_cpp_llm/build'
 INPUT_DIR = '/tmp/mm_inputs'
 OUTPUT_DIR = '/tmp/mm_outputs'
 

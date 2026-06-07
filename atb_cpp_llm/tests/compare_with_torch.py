@@ -33,7 +33,7 @@ parser.add_argument('--warmup', type=int, default=3)
 args = parser.parse_args()
 
 MODEL_DIR = '/mnt/workspace/gitCode/models/Qwen3-VL-Embedding-2B'
-CPP_BIN = '/mnt/workspace/gitCode/atb_llm/atb_cpp_qwen3vl_embedding/build/benchmark'
+CPP_BIN = '/mnt/workspace/gitCode/atb_llm/atb_cpp_llm/build/benchmark'
 CPP_SAVE = '/tmp/cpp_embedding.bin'
 TORCH_SAVE = '/tmp/torch_embedding.bin'
 

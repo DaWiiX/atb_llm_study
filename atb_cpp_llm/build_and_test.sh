@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────
-# atb_cpp_qwen3vl_embedding — one-shot build & test driver
+# atb_cpp_llm — one-shot build & test driver
 #
 # What it does:
 #   1. Loads `.env` from the repo root (or this project dir).
@@ -15,10 +15,10 @@
 #   - Skips test execution and prints how to run it on an NPU host.
 #
 # Usage:
-#   bash atb_cpp_qwen3vl_embedding/build_and_test.sh
-#   bash atb_cpp_qwen3vl_embedding/build_and_test.sh --debug
-#   bash atb_cpp_qwen3vl_embedding/build_and_test.sh --clean
-#   bash atb_cpp_qwen3vl_embedding/build_and_test.sh --no-test  # build only
+#   bash atb_cpp_llm/build_and_test.sh
+#   bash atb_cpp_llm/build_and_test.sh --debug
+#   bash atb_cpp_llm/build_and_test.sh --clean
+#   bash atb_cpp_llm/build_and_test.sh --no-test  # build only
 # ─────────────────────────────────────────────────────────────────────
 set -o pipefail
 
