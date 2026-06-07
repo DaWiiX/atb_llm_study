@@ -10,6 +10,7 @@
 #include "components/common/deepstack_fusion.h"
 #include "components/vision/pos_embed_interp.h"
 #include "components/vision/pos_embed_npu_graph.h"
+#include "components/vision/vis_rope_npu_graph.h"
 #include "runners/text_runner.h"
 #include "runners/vision_runner.h"
 #include <cstdint>
@@ -78,6 +79,11 @@ private:
     atb::Tensor vis_pos_embed_npu_;          // (G*G, vis_hs) fp16
     OperationHandle pos_embed_interp_graph_; // shape-agnostic graph
 
+    // ── NPU-side Vision RoPE: cos/sin generation as a graph ──
+    // Replaces ComputeVisionRotPosEmb CPU loop. Inputs are (freq_table,
+    // row_idx, col_idx), all built on host in O(N).
+    OperationHandle vis_rope_graph_;
+
     // ── Vision pipeline ───────────────────────────────────
     Status RunVision(const uint16_t* pixel_values, int64_t num_patches,
                      const int64_t* grid_thw, int64_t num_images,
@@ -92,6 +98,15 @@ private:
     Status ComputePosEmbedNpu(const int64_t* grid_thw, int64_t num_images,
                               int64_t expected_n,
                               atb::Tensor& out_npu);
+
+    // Compute Vision RoPE cos/sin on NPU.
+    //   - Builds (row_idx, col_idx) on host (O(N))
+    //   - Builds freq_table on host (O(max_hw * half))
+    //   - Uploads + runs the 2-Gather/2-Concat/Cos/Sin graph (NPU)
+    //   - Leaves results in @p cos_npu / @p sin_npu, shape (N, vis_hd) fp16
+    // @return  total_tokens on success, -1 on error
+    int64_t ComputeVisionRopeNpu(const int64_t* grid_thw, int64_t num_images,
+                                  atb::Tensor& cos_npu, atb::Tensor& sin_npu);
 
     // ── Input preparation ────────────────────────────────
     Status PrepareInputs(const InferRequest& request,

@@ -56,5 +56,13 @@ OperationHandle ElewiseOp::MakeSub() {
     return CreateElewise(atb::infer::ElewiseParam::ELEWISE_SUB);
 }
 
+OperationHandle ElewiseOp::MakeCos() {
+    return CreateElewise(atb::infer::ElewiseParam::ELEWISE_COS);
+}
+
+OperationHandle ElewiseOp::MakeSin() {
+    return CreateElewise(atb::infer::ElewiseParam::ELEWISE_SIN);
+}
+
 } // namespace ops
 } // namespace atb_llm

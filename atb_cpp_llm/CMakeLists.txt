@@ -95,6 +95,7 @@ set(ENGINE_SRCS
     src/components/vision/deepstack_graph.cpp
     src/components/vision/pos_embed_interp.cpp
     src/components/vision/pos_embed_npu_graph.cpp
+    src/components/vision/vis_rope_npu_graph.cpp
     # runners
     src/runners/vision_runner.cpp
     src/runners/text_runner.cpp
@@ -169,6 +170,7 @@ add_atb_test(test_stage_precision      tests/test_stage_precision.cpp)
 add_atb_test(test_forward_error_paths  tests/test_forward_error_paths.cpp)
 add_atb_test(test_vision_stages       tests/test_vision_stages.cpp)
 add_atb_test(test_pos_embed_npu_graph tests/test_pos_embed_npu_graph.cpp)
+add_atb_test(test_vis_rope_npu_graph  tests/test_vis_rope_npu_graph.cpp)
 
 # Level 1 CPU pure-function tests (no NPU dependency for the logic,
 # but link against engine library for the implementation).

@@ -26,6 +26,12 @@ public:
 
     /// Element-wise subtraction: a - b
     static OperationHandle MakeSub();
+
+    /// Element-wise cosine
+    static OperationHandle MakeCos();
+
+    /// Element-wise sine
+    static OperationHandle MakeSin();
 };
 
 } // namespace ops

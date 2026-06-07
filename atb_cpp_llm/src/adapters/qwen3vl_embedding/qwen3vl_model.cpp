@@ -84,6 +84,15 @@ Status Qwen3VLModel::Load(const std::string& model_dir, IRuntime* runtime) {
         }
     }
 
+    // 2d. Build Vision RoPE graph (cos/sin generation).
+    {
+        s = components::VisRopeGraph::Build("VisRope", vis_rope_graph_);
+        if (s != STATUS_OK) {
+            LOG_ERROR("Failed to build VisRopeGraph");
+            return s;
+        }
+    }
+
     // 3. Initialize position encoding helpers
     mrope_ = std::make_unique<components::MRoPE>(
         config_.text_head_dim, config_.text_rope_theta, config_.text_mrope_section);
@@ -256,48 +265,38 @@ Status Qwen3VLModel::ForwardWithTiming(const InferRequest& request,
                                           np, *pos_npu.Get());
         if (pe_s != STATUS_OK) return pe_s;
 
-        // VisionRoPE outputs (total_tokens, vis_hd) — dim*2 = half*4 = vis_hd
-        std::vector<float> vis_cos_f32(np * vis_hd);
-        std::vector<float> vis_sin_f32(np * vis_hd);
-        int64_t total_tokens = vis_rope_->ComputeRoPE(
-            grid_thw_host.data(), num_images, merge_size,
-            vis_cos_f32.data(), vis_sin_f32.data());
-
-        std::vector<uint16_t> cos_fp16(total_tokens * vis_hd);
-        std::vector<uint16_t> sin_fp16(total_tokens * vis_hd);
-        for (int64_t i = 0; i < total_tokens * vis_hd; i++) {
-            cos_fp16[i] = atb_llm::Fp32ToFp16(vis_cos_f32[i]);
-            sin_fp16[i] = atb_llm::Fp32ToFp16(vis_sin_f32[i]);
+        // VisionRoPE cos/sin: computed on NPU.
+        // total_tokens = np (= sum over images of T*H*W)
+        NpuTensor cos_npu = AllocNpuFloat16({np, static_cast<int64_t>(vis_hd)});
+        NpuTensor sin_npu = AllocNpuFloat16({np, static_cast<int64_t>(vis_hd)});
+        int64_t total_tokens = ComputeVisionRopeNpu(
+            grid_thw_host.data(), num_images, *cos_npu.Get(), *sin_npu.Get());
+        if (total_tokens < 0 || total_tokens != np) {
+            LOG_ERROR("Vision RoPE total_tokens=%ld != np=%ld",
+                      static_cast<long>(total_tokens), static_cast<long>(np));
+            return ERROR_INFERENCE;
         }
 
         // DEBUG: Save RoPE cos/sin for comparison with Python
         if (getenv("ATB_DEBUG_VISION")) {
             int64_t rope_total = total_tokens * vis_hd;
+            std::vector<uint16_t> cos_dbg(rope_total), sin_dbg(rope_total);
+            alloc->CopyToHost(cos_dbg.data(), *cos_npu.Get(),
+                              rope_total * sizeof(uint16_t));
+            alloc->CopyToHost(sin_dbg.data(), *sin_npu.Get(),
+                              rope_total * sizeof(uint16_t));
+            runtime_->Synchronize();
             FILE* fc = fopen("/tmp/cpp_rope_cos.bin", "wb");
             if (fc) {
                 fwrite(&rope_total, sizeof(int64_t), 1, fc);
-                fwrite(cos_fp16.data(), sizeof(uint16_t), rope_total, fc);
+                fwrite(cos_dbg.data(), sizeof(uint16_t), rope_total, fc);
                 fclose(fc);
-                LOG_INFO("Saved /tmp/cpp_rope_cos.bin (%ld fp16 values)", static_cast<long>(rope_total));
             }
             FILE* fs = fopen("/tmp/cpp_rope_sin.bin", "wb");
             if (fs) {
                 fwrite(&rope_total, sizeof(int64_t), 1, fs);
-                fwrite(sin_fp16.data(), sizeof(uint16_t), rope_total, fs);
+                fwrite(sin_dbg.data(), sizeof(uint16_t), rope_total, fs);
                 fclose(fs);
-                LOG_INFO("Saved /tmp/cpp_rope_sin.bin (%ld fp16 values)", static_cast<long>(rope_total));
-            }
-            FILE* fc32 = fopen("/tmp/cpp_rope_cos_f32.bin", "wb");
-            if (fc32) {
-                fwrite(&rope_total, sizeof(int64_t), 1, fc32);
-                fwrite(vis_cos_f32.data(), sizeof(float), rope_total, fc32);
-                fclose(fc32);
-            }
-            FILE* fs32 = fopen("/tmp/cpp_rope_sin_f32.bin", "wb");
-            if (fs32) {
-                fwrite(&rope_total, sizeof(int64_t), 1, fs32);
-                fwrite(vis_sin_f32.data(), sizeof(float), rope_total, fs32);
-                fclose(fs32);
             }
         }
 
@@ -307,17 +306,11 @@ Status Qwen3VLModel::ForwardWithTiming(const InferRequest& request,
         t_prev = t_vis_pos;
 
         // ── Stage: Vision Model (NPU) ────────────────────────
-        // pos_npu was already populated by ComputePosEmbedNpu above.
+        // pos_npu, cos_npu, sin_npu were already populated above.
         size_t pixel_bytes = static_cast<size_t>(flat_elements) * sizeof(uint16_t);
 
         NpuTensor pixels_npu = AllocNpuFloat16({flat_elements});
         alloc->CopyToDevice(*pixels_npu.Get(), pv, pixel_bytes);
-        NpuTensor cos_npu = AllocNpuFloat16({total_tokens, static_cast<int64_t>(vis_hd)});
-        alloc->CopyToDevice(*cos_npu.Get(), cos_fp16.data(),
-                            cos_fp16.size() * sizeof(uint16_t));
-        NpuTensor sin_npu = AllocNpuFloat16({total_tokens, static_cast<int64_t>(vis_hd)});
-        alloc->CopyToDevice(*sin_npu.Get(), sin_fp16.data(),
-                            sin_fp16.size() * sizeof(uint16_t));
 
         atb::Tensor vis_seqlen;
         int32_t vis_seqlen_val = static_cast<int32_t>(total_tokens);
@@ -762,57 +755,44 @@ Status Qwen3VLModel::RunVision(const uint16_t* pixel_values, int64_t num_patches
                                       num_patches, *pos_npu.Get());
     if (pe_s != STATUS_OK) return pe_s;
 
-    // 2. Compute vision RoPE (CPU) via VisionRotaryEmbedding component
+    // 2. Compute vision RoPE cos/sin on NPU.
     // VisionRoPE outputs (total_tokens, vis_hd) — dim*2 = half*4 = vis_hd
-    std::vector<float> cos_f32(num_patches * vis_hd);
-    std::vector<float> sin_f32(num_patches * vis_hd);
-    int64_t total_tokens = vis_rope_->ComputeRoPE(
-        grid_thw, num_images, config_.vis_spatial_merge_size,
-        cos_f32.data(), sin_f32.data());
-
-    // Convert to fp16
-    std::vector<uint16_t> cos_fp16(total_tokens * vis_hd);
-    std::vector<uint16_t> sin_fp16(total_tokens * vis_hd);
-    for (int64_t i = 0; i < total_tokens * vis_hd; i++) {
-        cos_fp16[i] = atb_llm::Fp32ToFp16(cos_f32[i]);
-        sin_fp16[i] = atb_llm::Fp32ToFp16(sin_f32[i]);
+    NpuTensor cos_npu = AllocNpuFloat16({num_patches, static_cast<int64_t>(vis_hd)});
+    NpuTensor sin_npu = AllocNpuFloat16({num_patches, static_cast<int64_t>(vis_hd)});
+    int64_t total_tokens = ComputeVisionRopeNpu(
+        grid_thw, num_images, *cos_npu.Get(), *sin_npu.Get());
+    if (total_tokens < 0 || total_tokens != num_patches) {
+        LOG_ERROR("Vision RoPE total_tokens=%ld != num_patches=%ld",
+                  static_cast<long>(total_tokens), static_cast<long>(num_patches));
+        return ERROR_INFERENCE;
     }
 
     // DEBUG: Save RoPE cos/sin for comparison with Python
     if (getenv("ATB_DEBUG_VISION")) {
         int64_t rope_total = total_tokens * vis_hd;
+        std::vector<uint16_t> cos_dbg(rope_total), sin_dbg(rope_total);
+        alloc->CopyToHost(cos_dbg.data(), *cos_npu.Get(),
+                          rope_total * sizeof(uint16_t));
+        alloc->CopyToHost(sin_dbg.data(), *sin_npu.Get(),
+                          rope_total * sizeof(uint16_t));
+        runtime_->Synchronize();
         FILE* fc = fopen("/tmp/cpp_rope_cos.bin", "wb");
         if (fc) {
             fwrite(&rope_total, sizeof(int64_t), 1, fc);
-            fwrite(cos_fp16.data(), sizeof(uint16_t), rope_total, fc);
+            fwrite(cos_dbg.data(), sizeof(uint16_t), rope_total, fc);
             fclose(fc);
             LOG_INFO("Saved /tmp/cpp_rope_cos.bin (%ld fp16 values)", static_cast<long>(rope_total));
         }
         FILE* fs = fopen("/tmp/cpp_rope_sin.bin", "wb");
         if (fs) {
             fwrite(&rope_total, sizeof(int64_t), 1, fs);
-            fwrite(sin_fp16.data(), sizeof(uint16_t), rope_total, fs);
+            fwrite(sin_dbg.data(), sizeof(uint16_t), rope_total, fs);
             fclose(fs);
             LOG_INFO("Saved /tmp/cpp_rope_sin.bin (%ld fp16 values)", static_cast<long>(rope_total));
         }
-        // Also save f32 RoPE for direct comparison
-        FILE* fc32 = fopen("/tmp/cpp_rope_cos_f32.bin", "wb");
-        if (fc32) {
-            fwrite(&rope_total, sizeof(int64_t), 1, fc32);
-            fwrite(cos_f32.data(), sizeof(float), rope_total, fc32);
-            fclose(fc32);
-            LOG_INFO("Saved /tmp/cpp_rope_cos_f32.bin (%ld f32 values)", static_cast<long>(rope_total));
-        }
-        FILE* fs32 = fopen("/tmp/cpp_rope_sin_f32.bin", "wb");
-        if (fs32) {
-            fwrite(&rope_total, sizeof(int64_t), 1, fs32);
-            fwrite(sin_f32.data(), sizeof(float), rope_total, fs32);
-            fclose(fs32);
-            LOG_INFO("Saved /tmp/cpp_rope_sin_f32.bin (%ld f32 values)", static_cast<long>(rope_total));
-        }
     }
 
-    // 3. Copy vision inputs to NPU
+    // 3. Copy vision inputs to NPU (pos_npu/cos_npu/sin_npu already done)
     int64_t patch_dim = static_cast<int64_t>(config_.vis_in_channels) *
                         config_.vis_temporal_patch_size *
                         config_.vis_patch_size * config_.vis_patch_size;
@@ -823,14 +803,6 @@ Status Qwen3VLModel::RunVision(const uint16_t* pixel_values, int64_t num_patches
     // Its Reshape divides by kernel_size to recover N
     NpuTensor pixels_npu = AllocNpuFloat16({flat_elements});
     alloc->CopyToDevice(*pixels_npu.Get(), pixel_values, pixel_bytes);
-
-    // pos_npu already populated by ComputePosEmbedNpu above.
-
-    NpuTensor cos_npu = AllocNpuFloat16({total_tokens, static_cast<int64_t>(vis_hd)});
-    alloc->CopyToDevice(*cos_npu.Get(), cos_fp16.data(), cos_fp16.size() * sizeof(uint16_t));
-
-    NpuTensor sin_npu = AllocNpuFloat16({total_tokens, static_cast<int64_t>(vis_hd)});
-    alloc->CopyToDevice(*sin_npu.Get(), sin_fp16.data(), sin_fp16.size() * sizeof(uint16_t));
 
     // Seqlen for vision (host-side int32, not NPU-allocated)
     atb::Tensor vis_seqlen;
@@ -1103,6 +1075,74 @@ Status Qwen3VLModel::ComputePosEmbedNpu(const int64_t* grid_thw, int64_t num_ima
         return s;
     }
     return STATUS_OK;
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// ComputeVisionRopeNpu — host Stage A + NPU Stage B replacement for the
+// CPU `VisionRotaryEmbedding::ComputeRoPE`.
+//
+// Caller owns @p cos_npu / @p sin_npu; both must be pre-allocated to
+// {total_tokens, vis_head_dim} fp16.
+//
+// Returns the total number of tokens written (= sum over images of T*H*W),
+// or -1 on error.
+// ═════════════════════════════════════════════════════════════════════
+
+int64_t Qwen3VLModel::ComputeVisionRopeNpu(const int64_t* grid_thw,
+                                            int64_t num_images,
+                                            atb::Tensor& cos_npu,
+                                            atb::Tensor& sin_npu) {
+    if (!vis_rope_graph_ || !grid_thw || num_images <= 0) {
+        LOG_ERROR("ComputeVisionRopeNpu: invalid args or graph not built");
+        return -1;
+    }
+
+    int32_t merge_size = static_cast<int32_t>(config_.vis_spatial_merge_size);
+    int32_t vis_hd = config_.vis_head_dim();         // 64
+    int32_t half = vis_hd / 4;                       // 16  (mirrors C++ mrope.cpp:140)
+    int32_t max_hw = components::MaxGridHW(grid_thw, num_images);
+
+    // ── Stage A: host ──
+    std::vector<int32_t> row_idx_host, col_idx_host;
+    components::BuildVisRopeIndices(grid_thw, num_images, merge_size,
+                                     row_idx_host, col_idx_host);
+    int64_t n = static_cast<int64_t>(row_idx_host.size());
+
+    std::vector<float> freq_table_f32;
+    components::BuildVisRopeFreqTable(max_hw, half, freq_table_f32);
+
+    // Convert freq_table to fp16 (ATB Concat doesn't support fp32)
+    std::vector<uint16_t> freq_table_fp16(freq_table_f32.size());
+    for (size_t i = 0; i < freq_table_f32.size(); i++) {
+        freq_table_fp16[i] = Fp32ToFp16(freq_table_f32[i]);
+    }
+
+    // ── Stage B: NPU ──
+    auto* alloc = runtime_->GetAllocator();
+    NpuTensor ft_npu  = AllocNpuFloat16({max_hw, half});
+    NpuTensor row_npu = AllocNpuInt32({n});
+    NpuTensor col_npu = AllocNpuInt32({n});
+    if (!ft_npu || !row_npu || !col_npu) {
+        LOG_ERROR("ComputeVisionRopeNpu: tensor alloc failed");
+        return -1;
+    }
+    alloc->CopyToDevice(*ft_npu.Get(), freq_table_fp16.data(),
+                        freq_table_fp16.size() * sizeof(uint16_t));
+    alloc->CopyToDevice(*row_npu.Get(), row_idx_host.data(),
+                        n * sizeof(int32_t));
+    alloc->CopyToDevice(*col_npu.Get(), col_idx_host.data(),
+                        n * sizeof(int32_t));
+
+    atb::VariantPack vp;
+    vp.inTensors  = {*ft_npu.Get(), *row_npu.Get(), *col_npu.Get()};
+    vp.outTensors = {cos_npu, sin_npu};
+
+    Status s = ExecuteGraph(vis_rope_graph_, vp);
+    if (s != STATUS_OK) {
+        LOG_ERROR("ComputeVisionRopeNpu: graph execute failed");
+        return -1;
+    }
+    return n;
 }
 
 }  // namespace adapters
