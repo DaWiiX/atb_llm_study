@@ -2,75 +2,25 @@
 
 #include <cstdint>
 #include <cstring>
+#include <acl/acl.h>
 
 namespace atb_llm {
 
 /// Type-pun a float to its uint32_t bit representation via std::memcpy.
-/// This avoids undefined behavior from reinterpret_cast<uint32_t&>(float_val).
 inline uint32_t FloatToUint32(float value) {
     uint32_t bits;
     std::memcpy(&bits, &value, sizeof(bits));
     return bits;
 }
 
-/// Correct fp16 -> fp32 conversion via IEEE 754 bit manipulation.
+/// fp16 -> fp32 using official CANN API
 inline float Fp16ToF32(uint16_t fp16_bits) {
-    uint32_t sign = (fp16_bits >> 15) & 1;
-    uint32_t exp = (fp16_bits >> 10) & 0x1F;
-    uint32_t mantissa = fp16_bits & 0x3FF;
-    uint32_t f32_bits;
-    if (exp == 0) {
-        if (mantissa == 0) {
-            f32_bits = sign << 31;
-        } else {
-            // Denormalized fp16 -> normalize for fp32
-            exp = 1;
-            while (!(mantissa & 0x400)) {
-                mantissa <<= 1;
-                exp--;
-            }
-            mantissa &= 0x3FF;
-            f32_bits = (sign << 31) | ((exp + 127 - 15) << 23) | (mantissa << 13);
-        }
-    } else if (exp == 31) {
-        // Inf or NaN
-        f32_bits = (sign << 31) | 0x7F800000 | (mantissa << 13);
-    } else {
-        // Normalized
-        f32_bits = (sign << 31) | ((exp + 127 - 15) << 23) | (mantissa << 13);
-    }
-    float val;
-    std::memcpy(&val, &f32_bits, sizeof(float));
-    return val;
+    return aclFloat16ToFloat(static_cast<aclFloat16>(fp16_bits));
 }
 
-/// Correct fp32 -> fp16 conversion via IEEE 754 bit manipulation.
+/// fp32 -> fp16 using official CANN API
 inline uint16_t Fp32ToFp16(float val) {
-    uint32_t f32_bits;
-    std::memcpy(&f32_bits, &val, sizeof(float));
-    uint32_t sign = (f32_bits >> 16) & 0x8000;
-    int32_t exp = static_cast<int32_t>((f32_bits >> 23) & 0xFF) - 127;
-    uint32_t mantissa = f32_bits & 0x7FFFFF;
-
-    if (exp == 128) {
-        // Inf or NaN
-        return static_cast<uint16_t>(sign | 0x7C00 | (mantissa >> 13));
-    }
-    if (exp > 15) {
-        // Overflow -> fp16 inf
-        return static_cast<uint16_t>(sign | 0x7C00);
-    }
-    if (exp < -24) {
-        // Too small -> zero
-        return static_cast<uint16_t>(sign);
-    }
-    if (exp < -14) {
-        // Denormalized fp16
-        mantissa = (mantissa | 0x800000) >> (-14 - exp);
-        return static_cast<uint16_t>(sign | (mantissa >> 13));
-    }
-    // Normal fp16
-    return static_cast<uint16_t>(sign | ((exp + 15) << 10) | (mantissa >> 13));
+    return static_cast<uint16_t>(aclFloatToFloat16(val));
 }
 
 /// Convert bf16 (uint16 raw bits) to float16 (uint16 raw bits) via bit manipulation.
