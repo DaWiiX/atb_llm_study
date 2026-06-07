@@ -1,0 +1,179 @@
+#include "families/base_model.h"
+#include "utils/float_utils.h"
+#include "core/tensor_allocator.h"
+#include "log/logger.h"
+#include <cstring>
+#include <cmath>
+#include <algorithm>
+
+namespace atb_llm {
+namespace families {
+
+// ═════════════════════════════════════════════════════════════════════
+// ExecuteGraph
+// ═════════════════════════════════════════════════════════════════════
+
+Status BaseModel::ExecuteGraph(OperationHandle& graph,
+                               atb::VariantPack& vp) {
+    if (!graph) return ERROR_GRAPH_BUILD;
+
+    auto* ctx = runtime_->GetContext();
+
+    uint64_t ws_size = 0;
+    atb::Status atb_s = graph.get()->Setup(vp, ws_size, ctx);
+    if (atb_s != atb::NO_ERROR) {
+        LOG_ERROR("Graph Setup failed: %d", static_cast<int>(atb_s));
+        return ERROR_GRAPH_BUILD;
+    }
+
+    uint8_t* ws_ptr = nullptr;
+    if (ws_size > 0) {
+        auto [ws, ws_s] = runtime_->GetWorkspace(ws_size);
+        ws_ptr = ws;
+        if (ws_s != STATUS_OK) {
+            LOG_ERROR("Failed to get workspace: %zu bytes", static_cast<size_t>(ws_size));
+            return ws_s;
+        }
+        if (ws_ptr == nullptr) {
+            LOG_ERROR("Workspace pointer is null despite size=%zu", static_cast<size_t>(ws_size));
+            return ERROR_NPU_MEMORY;
+        }
+    } else {
+        // GRAPH_LAUNCH_MODE requires non-null workspace device pointer
+        auto [ws, ws_s] = runtime_->GetWorkspace(1);
+        if (ws_s == STATUS_OK && ws != nullptr) {
+            ws_ptr = ws;
+            ws_size = 1;
+        }
+    }
+
+    atb_s = graph.get()->Execute(vp, ws_ptr, ws_size, ctx);
+    if (atb_s != atb::NO_ERROR) {
+        LOG_ERROR("Graph Execute failed: %d", static_cast<int>(atb_s));
+        return ERROR_INFERENCE;
+    }
+
+    Status sync_s = runtime_->Synchronize();
+    if (sync_s != STATUS_OK) {
+        LOG_ERROR("Stream sync failed after Execute: %d", static_cast<int>(sync_s));
+        return sync_s;
+    }
+
+    return STATUS_OK;
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// EmbeddingLookup
+// ═════════════════════════════════════════════════════════════════════
+
+void BaseModel::EmbeddingLookup(const int64_t* input_ids, int64_t seq_len,
+                                const uint16_t* embed_table,
+                                int64_t hidden_size, int64_t vocab_size,
+                                uint16_t* output) {
+    for (int64_t s = 0; s < seq_len; s++) {
+        int64_t token_id = input_ids[s];
+        if (token_id < 0 || token_id >= vocab_size) {
+            LOG_ERROR("EmbeddingLookup: token_id %ld out of range [0, %ld)",
+                      static_cast<long>(token_id), static_cast<long>(vocab_size));
+            // Fill with zeros for invalid token
+            std::memset(output + s * hidden_size, 0, hidden_size * sizeof(uint16_t));
+            continue;
+        }
+        std::memcpy(output + s * hidden_size,
+                    embed_table + token_id * hidden_size,
+                    hidden_size * sizeof(uint16_t));
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// FindImageTokenPositions
+// ═════════════════════════════════════════════════════════════════════
+
+std::vector<int64_t> BaseModel::FindImageTokenPositions(
+        const int64_t* input_ids, int64_t seq_len,
+        int64_t image_token_id) {
+    std::vector<int64_t> positions;
+    for (int64_t s = 0; s < seq_len; s++) {
+        if (input_ids[s] == image_token_id) {
+            positions.push_back(s);
+        }
+    }
+    return positions;
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// RunPooling
+// ═════════════════════════════════════════════════════════════════════
+
+Status BaseModel::RunPooling(const uint16_t* hidden_states, int64_t seq_len,
+                             int64_t hidden_size, bool normalize,
+                             PoolingStrategy strategy,
+                             InferResult& result) {
+    const uint16_t* pool_token = nullptr;
+
+    switch (strategy) {
+    case PoolingStrategy::LAST_TOKEN: {
+        int64_t last_pos = seq_len - 1;
+        pool_token = hidden_states + last_pos * hidden_size;
+        break;
+    }
+    case PoolingStrategy::MEAN:
+        LOG_ERROR("RunPooling: MEAN strategy not yet implemented");
+        return ERROR_UNSUPPORTED;
+    case PoolingStrategy::CLS:
+        LOG_ERROR("RunPooling: CLS strategy not yet implemented");
+        return ERROR_UNSUPPORTED;
+    default:
+        LOG_ERROR("RunPooling: unknown strategy %d", static_cast<int>(strategy));
+        return ERROR_UNSUPPORTED;
+    }
+
+    result.shape = {hidden_size};
+    result.dtype = ACL_FLOAT16;
+    result.data.resize(hidden_size * sizeof(uint16_t));
+
+    if (normalize) {
+        float norm = 0.0f;
+        for (int64_t i = 0; i < hidden_size; i++) {
+            float v = atb_llm::Fp16ToF32(pool_token[i]);
+            norm += v * v;
+        }
+        norm = std::sqrt(norm + 1e-12f);
+        uint16_t* out = reinterpret_cast<uint16_t*>(result.data.data());
+        for (int64_t i = 0; i < hidden_size; i++)
+            out[i] = atb_llm::Fp32ToFp16(atb_llm::Fp16ToF32(pool_token[i]) / norm);
+    } else {
+        std::memcpy(result.data.data(), pool_token, hidden_size * sizeof(uint16_t));
+    }
+
+    return STATUS_OK;
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// InjectDeepstack
+// ═════════════════════════════════════════════════════════════════════
+
+void BaseModel::InjectDeepstack(NpuTensor& hidden_npu,
+                                const std::vector<uint16_t>& ds_feat,
+                                const std::vector<int64_t>& positions,
+                                int64_t seq_len, int64_t hidden_size,
+                                int64_t feat_dim,
+                                IRuntime* runtime) {
+    auto* alloc = runtime->GetAllocator();
+    size_t h_bytes = static_cast<size_t>(seq_len) * hidden_size * sizeof(uint16_t);
+    std::vector<uint16_t> h_host(seq_len * hidden_size);
+    alloc->CopyToHost(h_host.data(), *hidden_npu.Get(), h_bytes);
+    int64_t ds_tokens = ds_feat.size() / feat_dim;
+    for (int64_t t = 0; t < ds_tokens && t < static_cast<int64_t>(positions.size()); t++) {
+        int64_t pos = positions[t];
+        for (int64_t d = 0; d < feat_dim; d++) {
+            float h = atb_llm::Fp16ToF32(h_host[pos * hidden_size + d]);
+            float ds = atb_llm::Fp16ToF32(ds_feat[t * feat_dim + d]);
+            h_host[pos * hidden_size + d] = atb_llm::Fp32ToFp16(h + ds);
+        }
+    }
+    alloc->CopyToDevice(*hidden_npu.Get(), h_host.data(), h_bytes);
+}
+
+}  // namespace families
+}  // namespace atb_llm

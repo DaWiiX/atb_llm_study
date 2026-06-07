@@ -1,6 +1,7 @@
 #pragma once
 #include "atb_llm/model.h"
 #include "atb_llm/runtime.h"
+#include "families/base_model.h"
 #include "adapters/qwen3vl_embedding/qwen3vl_config.h"
 #include "adapters/qwen3vl_embedding/qwen3vl_weights.h"
 #include "core/raii.h"
@@ -27,7 +28,7 @@ namespace adapters {
 /// Split-graph strategy:
 ///   - Vision: FirstLayer graph + Block graph (looped) + Merger graph + Deepstack graph
 ///   - Text: DecoderLayer graph (looped 28x) + FinalNorm graph
-class Qwen3VLModel : public IModel {
+class Qwen3VLModel : public families::BaseModel {
 public:
     Qwen3VLModel();
     ~Qwen3VLModel() override;
@@ -46,7 +47,6 @@ private:
     // ── Config & weights ──────────────────────────────────
     Qwen3VLConfig config_;
     Qwen3VLWeights weights_;
-    IRuntime* runtime_ = nullptr;
 
     // ── ATB graphs ────────────────────────────────────────
     OperationHandle vis_first_layer_graph_;
@@ -90,20 +90,7 @@ private:
                           const std::vector<std::vector<uint16_t>>& ds_features,
                           const std::vector<int64_t>& image_token_positions);
 
-    // ── Pooling ────────────────────────────────────────────
-    Status RunPooling(const uint16_t* hidden_states, int64_t seq_len,
-                      int64_t hidden_size, InferResult& result);
-
-    // ── Helpers ───────────────────────────────────────────
-    Status ExecuteGraph(OperationHandle& graph,
-                        atb::VariantPack& vp);
-
-    void InjectDeepstack(NpuTensor& hidden_npu,
-                         const std::vector<uint16_t>& ds_feat,
-                         const std::vector<int64_t>& positions,
-                         int64_t seq_len, int64_t hidden_size,
-                         int64_t vis_embed_dim);
-
+    // ── Qwen3VL-specific helpers ──────────────────────────
     /// Compute fast_pos_embed_interpolate on CPU.
     void ComputePosEmbedInterp(const int64_t* grid_thw, int64_t num_images,
                                uint16_t* pos_out);
@@ -111,14 +98,6 @@ private:
     /// Compute vision RoPE cos/sin on CPU.
     void ComputeVisionRoPE(const int64_t* grid_thw, int64_t num_images,
                            float* cos_out, float* sin_out, int64_t& total_tokens);
-
-    /// Embedding lookup on CPU (fp16 table -> fp16 output).
-    void EmbeddingLookup(const int64_t* input_ids, int64_t seq_len,
-                         uint16_t* output);
-
-    /// Find image token positions in input_ids.
-    std::vector<int64_t> FindImageTokenPositions(const int64_t* input_ids,
-                                                 int64_t seq_len);
 };
 
 }  // namespace adapters

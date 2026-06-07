@@ -173,7 +173,10 @@ Status Qwen3VLModel::Forward(const InferRequest& request, InferResult& result) {
                        ds_features, image_token_positions);
     if (s != STATUS_OK) return s;
 
-    s = RunPooling(inputs_embeds.data(), seq_len, hidden_size, result);
+    s = BaseModel::RunPooling(inputs_embeds.data(), seq_len, hidden_size,
+                              config_.normalize,
+                              families::BaseModel::PoolingStrategy::LAST_TOKEN,
+                              result);
     if (s != STATUS_OK) return s;
 
     runtime_->Synchronize();
@@ -211,7 +214,10 @@ Status Qwen3VLModel::PrepareInputs(const InferRequest& request,
 
     // Text embedding lookup (CPU, fp16)
     inputs_embeds.resize(seq_len * hidden_size);
-    EmbeddingLookup(input_ids, seq_len, inputs_embeds.data());
+    BaseModel::EmbeddingLookup(input_ids, seq_len,
+                               weights_.embed_weight_host.data(),
+                               config_.text_hidden_size, config_.text_vocab_size,
+                               inputs_embeds.data());
 
     // Vision inference (if image provided)
     std::vector<uint16_t> vis_embeds_host;
@@ -235,7 +241,7 @@ Status Qwen3VLModel::PrepareInputs(const InferRequest& request,
         Status s = RunVision(pv, np, gthw, num_images,
                              vis_embeds_host.data(), vis_embed_dim, ds_features);
         if (s != STATUS_OK) return s;
-        image_token_positions = FindImageTokenPositions(input_ids, seq_len);
+        image_token_positions = BaseModel::FindImageTokenPositions(input_ids, seq_len, config_.image_token_id);
         if (image_token_positions.size() != static_cast<size_t>(np)) {
             LOG_ERROR("Image token count mismatch: pos=%zu, vis=%ld",
                       image_token_positions.size(), static_cast<long>(np));
@@ -325,7 +331,7 @@ Status Qwen3VLModel::RunTextDecoder(uint16_t* hidden_states, int32_t seq_len,
         h_npu = std::move(h_out);
         if (li < static_cast<int32_t>(ds_features.size()) &&
             !ds_features[li].empty() && !image_token_positions.empty()) {
-            InjectDeepstack(h_npu, ds_features[li], image_token_positions, n, hs, ved);
+            BaseModel::InjectDeepstack(h_npu, ds_features[li], image_token_positions, n, hs, ved, runtime_);
         }
     }
     NpuTensor norm_out = AllocNpuFloat16({n, hs});
@@ -342,57 +348,6 @@ Status Qwen3VLModel::RunTextDecoder(uint16_t* hidden_states, int32_t seq_len,
     alloc->CopyToHost(hidden_states, *norm_out.Get(),
                       static_cast<size_t>(n) * hs * sizeof(uint16_t));
     return STATUS_OK;
-}
-
-// ═════════════════════════════════════════════════════════════════════
-// RunPooling
-// ═════════════════════════════════════════════════════════════════════
-
-Status Qwen3VLModel::RunPooling(const uint16_t* hidden_states, int64_t seq_len,
-                                int64_t hidden_size, InferResult& result) {
-    int64_t last_pos = seq_len - 1;
-    const uint16_t* last_token = hidden_states + last_pos * hidden_size;
-    result.shape = {hidden_size};
-    result.dtype = ACL_FLOAT16;
-    result.data.resize(hidden_size * sizeof(uint16_t));
-    if (config_.normalize) {
-        float norm = 0.0f;
-        for (int64_t i = 0; i < hidden_size; i++) {
-            float v = atb_llm::Fp16ToF32(last_token[i]);
-            norm += v * v;
-        }
-        norm = std::sqrt(norm + 1e-12f);
-        uint16_t* out = reinterpret_cast<uint16_t*>(result.data.data());
-        for (int64_t i = 0; i < hidden_size; i++)
-            out[i] = atb_llm::Fp32ToFp16(atb_llm::Fp16ToF32(last_token[i]) / norm);
-    } else {
-        std::memcpy(result.data.data(), last_token, hidden_size * sizeof(uint16_t));
-    }
-    return STATUS_OK;
-}
-
-// ═════════════════════════════════════════════════════════════════════
-// InjectDeepstack
-// ═════════════════════════════════════════════════════════════════════
-
-void Qwen3VLModel::InjectDeepstack(NpuTensor& hidden_npu,
-                                   const std::vector<uint16_t>& ds_feat,
-                                   const std::vector<int64_t>& positions,
-                                   int64_t seq_len, int64_t hidden_size, int64_t vis_embed_dim) {
-    auto* alloc = runtime_->GetAllocator();
-    size_t h_bytes = static_cast<size_t>(seq_len) * hidden_size * sizeof(uint16_t);
-    std::vector<uint16_t> h_host(seq_len * hidden_size);
-    alloc->CopyToHost(h_host.data(), *hidden_npu.Get(), h_bytes);
-    int64_t ds_tokens = ds_feat.size() / vis_embed_dim;
-    for (int64_t t = 0; t < ds_tokens && t < static_cast<int64_t>(positions.size()); t++) {
-        int64_t pos = positions[t];
-        for (int64_t d = 0; d < vis_embed_dim; d++) {
-            float h = atb_llm::Fp16ToF32(h_host[pos * hidden_size + d]);
-            float ds = atb_llm::Fp16ToF32(ds_feat[t * vis_embed_dim + d]);
-            h_host[pos * hidden_size + d] = atb_llm::Fp32ToFp16(h + ds);
-        }
-    }
-    alloc->CopyToDevice(*hidden_npu.Get(), h_host.data(), h_bytes);
 }
 
 // ═════════════════════════════════════════════════════════════════════
@@ -578,89 +533,8 @@ Status Qwen3VLModel::RunVision(const uint16_t* pixel_values, int64_t num_patches
 }
 
 // ═════════════════════════════════════════════════════════════════════
-// Helpers
+// Qwen3VL-specific helpers
 // ═════════════════════════════════════════════════════════════════════
-
-Status Qwen3VLModel::ExecuteGraph(OperationHandle& graph,
-                                  atb::VariantPack& vp) {
-    if (!graph) return ERROR_GRAPH_BUILD;
-
-    auto* ctx = runtime_->GetContext();
-
-    uint64_t ws_size = 0;
-    atb::Status atb_s = graph.get()->Setup(vp, ws_size, ctx);
-    if (atb_s != atb::NO_ERROR) {
-        LOG_ERROR("Graph Setup failed: %d", static_cast<int>(atb_s));
-        return ERROR_GRAPH_BUILD;
-    }
-
-    uint8_t* ws_ptr = nullptr;
-    if (ws_size > 0) {
-        auto [ws, ws_s] = runtime_->GetWorkspace(ws_size);
-        ws_ptr = ws;
-        if (ws_s != STATUS_OK) {
-            LOG_ERROR("Failed to get workspace: %zu bytes", static_cast<size_t>(ws_size));
-            return ws_s;
-        }
-        if (ws_ptr == nullptr) {
-            LOG_ERROR("Workspace pointer is null despite size=%zu", static_cast<size_t>(ws_size));
-            return ERROR_NPU_MEMORY;
-        }
-    } else {
-        // GRAPH_LAUNCH_MODE requires non-null workspace device pointer
-        auto [ws, ws_s] = runtime_->GetWorkspace(1);
-        if (ws_s == STATUS_OK && ws != nullptr) {
-            ws_ptr = ws;
-            ws_size = 1;
-        }
-    }
-
-    atb_s = graph.get()->Execute(vp, ws_ptr, ws_size, ctx);
-    if (atb_s != atb::NO_ERROR) {
-        LOG_ERROR("Graph Execute failed: %d", static_cast<int>(atb_s));
-        return ERROR_INFERENCE;
-    }
-
-    Status sync_s = runtime_->Synchronize();
-    if (sync_s != STATUS_OK) {
-        LOG_ERROR("Stream sync failed after Execute: %d", static_cast<int>(sync_s));
-        return sync_s;
-    }
-
-    return STATUS_OK;
-}
-
-void Qwen3VLModel::EmbeddingLookup(const int64_t* input_ids, int64_t seq_len,
-                                   uint16_t* output) {
-    const uint16_t* embed_table = weights_.embed_weight_host.data();
-    int64_t hs = config_.text_hidden_size;
-    int64_t vocab_size = config_.text_vocab_size;
-
-    for (int64_t s = 0; s < seq_len; s++) {
-        int64_t token_id = input_ids[s];
-        if (token_id < 0 || token_id >= vocab_size) {
-            LOG_ERROR("EmbeddingLookup: token_id %ld out of range [0, %ld)",
-                      static_cast<long>(token_id), static_cast<long>(vocab_size));
-            // Fill with zeros for invalid token
-            std::memset(output + s * hs, 0, hs * sizeof(uint16_t));
-            continue;
-        }
-        std::memcpy(output + s * hs,
-                    embed_table + token_id * hs,
-                    hs * sizeof(uint16_t));
-    }
-}
-
-std::vector<int64_t> Qwen3VLModel::FindImageTokenPositions(const int64_t* input_ids,
-                                                           int64_t seq_len) {
-    std::vector<int64_t> positions;
-    for (int64_t s = 0; s < seq_len; s++) {
-        if (input_ids[s] == config_.image_token_id) {
-            positions.push_back(s);
-        }
-    }
-    return positions;
-}
 
 void Qwen3VLModel::ComputePosEmbedInterp(const int64_t* grid_thw, int64_t num_images,
                                          uint16_t* pos_out) {

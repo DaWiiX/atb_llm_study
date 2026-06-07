@@ -78,15 +78,16 @@
 - [x] Python E2E 权重加载测试通过（Text:0.999961, Image:0.999720, Image+Text:0.999916）
 - Commit: 726fa16
 
-### Phase 4: 接口精简 + Registry 增强 🔲 TODO
-- [ ] InferRequest: PreprocessedImage 加 const void* metadata + int64_t metadata_size
-- [ ] 移除 PreprocessedImage 中硬编码的 grid_thw（Qwen3VL 适配器改用 metadata）
-- [ ] ModelRegistry: 从 map 改为 vector<RegistryEntry>，加 CompatibilityCheck + priority
-- [ ] 注册宏增加 REGISTER_MODEL_WITH_CHECK 变体
-- [ ] CreateModel() 匹配策略: 精确匹配 → 兼容性检查 → 前缀匹配（降级警告）
-- [ ] C++ 单元测试通过
-- [ ] Python 组件一致性测试通过
-- [ ] Python E2E 权重加载测试通过
+### Phase 4: 接口精简 + Registry 增强 ✅ DONE
+- [x] PreprocessedImage 增加 metadata/metadata_size 字段，grid_thw 标注 DEPRECATED
+- [x] Qwen3VL PrepareInputs 支持 metadata fallback 读取 grid_thw
+- [x] ModelRegistry: map→vector<RegistryEntry>，加 CompatibilityCheck + priority
+- [x] 注册宏增加 REGISTER_MODEL_WITH_CHECK 变体
+- [x] CreateModel() 匹配策略: 精确匹配 → 兼容性检查（删除硬编码前缀逻辑）
+- [x] Qwen3VL 注册改用 REGISTER_MODEL_WITH_CHECK + IsQwen3VLCompatible
+- [x] C++ 单元测试通过
+- [x] C++ vs Python 精度对比: cosine=0.999996 ✅
+- Commit: 8730f33
 
 ### Phase 5: BaseModel 基类引入 🔲 TODO
 - [ ] 新建 src/families/base_model.h/cpp

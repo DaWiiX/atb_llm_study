@@ -92,6 +92,8 @@ set(ENGINE_SRCS
     # runners
     src/runners/vision_runner.cpp
     src/runners/text_runner.cpp
+    # families
+    src/families/base_model.cpp
     # adapters
     src/adapters/qwen3vl_embedding/qwen3vl_model.cpp
     src/adapters/qwen3vl_embedding/qwen3vl_weights.cpp
