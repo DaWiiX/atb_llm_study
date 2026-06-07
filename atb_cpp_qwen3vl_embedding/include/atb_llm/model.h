@@ -7,6 +7,9 @@
 
 namespace atb_llm {
 
+// Forward declaration for JsonConfig (used in RegistryEntry::CompatibilityCheck)
+class JsonConfig;
+
 /// 模型抽象接口 -- 每个模型实现此接口
 ///
 /// 设计原则：
@@ -36,17 +39,41 @@ public:
 /// 模型工厂函数类型
 using ModelFactory = std::function<std::unique_ptr<IModel>()>;
 
-/// 注册模型工厂
+/// 注册表条目：包含工厂函数、优先级和兼容性检查
+struct RegistryEntry {
+    std::string model_type;        // 注册名称
+    ModelFactory factory;          // 工厂函数
+    int32_t priority = 0;          // 优先级（越大越优先）
+    using CompatibilityCheck = std::function<bool(const std::string& model_type, const JsonConfig& cfg)>;
+    CompatibilityCheck compat_check = nullptr;  // 兼容性检查函数
+};
+
+/// 注册模型工厂（旧接口，保持向后兼容）
 void RegisterModelFactory(const std::string& model_type, ModelFactory factory);
+
+/// 注册 RegistryEntry
+void RegisterModelEntry(RegistryEntry entry);
 
 /// 自动检测模型类型并创建实例
 std::unique_ptr<IModel> CreateModel(const std::string& model_dir);
 
-/// 注册模型工厂宏
+/// 注册模型工厂宏（旧接口，保持向后兼容）
 #define REGISTER_MODEL(type_name, factory_fn)                          \
     static bool _reg_##type_name = []() {                              \
-        RegisterModelFactory(#type_name, factory_fn);                  \
+        atb_llm::RegisterModelFactory(#type_name, factory_fn);          \
         return true;                                                   \
+    }();
+
+/// 注册模型工厂宏（带兼容性检查）
+#define REGISTER_MODEL_WITH_CHECK(type_name, factory_fn, check_fn, prio)  \
+    static bool _reg_##type_name = []() {                                 \
+        atb_llm::RegistryEntry entry;                                      \
+        entry.model_type = #type_name;                                     \
+        entry.factory = factory_fn;                                        \
+        entry.compat_check = check_fn;                                     \
+        entry.priority = prio;                                             \
+        atb_llm::RegisterModelEntry(std::move(entry));                     \
+        return true;                                                       \
     }();
 
 } // namespace atb_llm

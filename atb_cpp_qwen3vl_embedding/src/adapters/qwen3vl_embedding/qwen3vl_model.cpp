@@ -225,6 +225,9 @@ Status Qwen3VLModel::PrepareInputs(const InferRequest& request,
             request.preprocessed.pixel_values);
         int64_t np = request.preprocessed.num_patches;
         const int64_t* gthw = request.preprocessed.grid_thw;
+        if (!gthw && request.preprocessed.metadata) {
+            gthw = static_cast<const int64_t*>(request.preprocessed.metadata);
+        }
         grid_thw_host.assign(gthw, gthw + 3);
         num_images = 1;
         vis_embeds_host.resize(np * vis_embed_dim);
