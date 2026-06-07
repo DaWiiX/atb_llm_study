@@ -1,4 +1,5 @@
 #include "families/base_model.h"
+#include "atb_llm/build_result.h"
 #include "utils/float_utils.h"
 #include "core/tensor_allocator.h"
 #include "log/logger.h"
@@ -61,6 +62,50 @@ Status BaseModel::ExecuteGraph(OperationHandle& graph,
 
     return STATUS_OK;
 }
+
+// ═════════════════════════════════════════════════════════════════════
+// ValidateVariantPack (free function, declared in build_result.h)
+// ═════════════════════════════════════════════════════════════════════
+
+Status ValidateVariantPack(const atb::VariantPack& vp,
+                           size_t expected_in_count,
+                           size_t expected_out_count,
+                           const char* context) {
+#ifdef DEBUG
+    if (vp.inTensors.size() != expected_in_count) {
+        LOG_ERROR("VariantPack inTensors size mismatch in %s: got %zu, expected %zu",
+                  context ? context : "(unknown)",
+                  vp.inTensors.size(), expected_in_count);
+        return ERROR_INVALID_PARAM;
+    }
+    if (vp.outTensors.size() != expected_out_count) {
+        LOG_ERROR("VariantPack outTensors size mismatch in %s: got %zu, expected %zu",
+                  context ? context : "(unknown)",
+                  vp.outTensors.size(), expected_out_count);
+        return ERROR_INVALID_PARAM;
+    }
+#else
+    (void)vp;
+    (void)expected_in_count;
+    (void)expected_out_count;
+    (void)context;
+#endif
+    return STATUS_OK;
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// ExecuteGraphChecked (Debug only)
+// ═════════════════════════════════════════════════════════════════════
+
+#ifdef DEBUG
+Status BaseModel::ExecuteGraphChecked(OperationHandle& graph, atb::VariantPack& vp,
+                                       size_t expected_in_count, size_t expected_out_count,
+                                       const char* context) {
+    Status v = ValidateVariantPack(vp, expected_in_count, expected_out_count, context);
+    if (v != STATUS_OK) return v;
+    return ExecuteGraph(graph, vp);
+}
+#endif
 
 // ═════════════════════════════════════════════════════════════════════
 // EmbeddingLookup

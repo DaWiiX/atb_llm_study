@@ -28,6 +28,17 @@ protected:
     /// 执行 ATB 图：Setup → GetWorkspace → Execute → Synchronize
     Status ExecuteGraph(OperationHandle& graph, atb::VariantPack& vp);
 
+#ifdef DEBUG
+    /// Debug-only: execute graph with VariantPack size validation.
+    /// Checks that vp.inTensors.size() == expected_in_count and
+    /// vp.outTensors.size() == expected_out_count before execution.
+    /// Returns ERROR_INVALID_PARAM on mismatch; otherwise delegates
+    /// to ExecuteGraph().
+    Status ExecuteGraphChecked(OperationHandle& graph, atb::VariantPack& vp,
+                               size_t expected_in_count, size_t expected_out_count,
+                               const char* context = "");
+#endif
+
     // ── CPU 嵌入查找 ──────────────────────────────────────
     /// fp16 嵌入表查找：token_ids → fp16 向量
     void EmbeddingLookup(const int64_t* input_ids, int64_t seq_len,
