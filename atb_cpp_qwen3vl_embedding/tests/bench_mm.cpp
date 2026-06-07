@@ -13,6 +13,7 @@
 #include "atb_llm/types.h"
 #include "atb_llm/engine.h"
 #include "log/logger.h"
+#include "test_env.h"
 #include <cstdio>
 #include <cstring>
 #include <vector>
@@ -23,7 +24,7 @@
 #include <numeric>
 #include <cmath>
 
-static const char* MODEL_DIR = "/mnt/workspace/gitCode/models/Qwen3-VL-Embedding-2B";
+static const std::string MODEL_DIR = GetModelDir();
 static const char* INPUT_DIR = "/tmp/mm_inputs";
 
 // Read binary file into vector

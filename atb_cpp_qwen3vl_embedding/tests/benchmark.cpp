@@ -12,6 +12,7 @@
 #include "atb_llm/types.h"
 #include "atb_llm/engine.h"
 #include "log/logger.h"
+#include "test_env.h"
 
 #include <cstdio>
 #include <cstring>
@@ -21,7 +22,7 @@
 #include <numeric>
 #include <cmath>
 
-static const char* MODEL_DIR = "/mnt/workspace/gitCode/models/Qwen3-VL-Embedding-2B";
+static const std::string MODEL_DIR = GetModelDir();
 
 int main(int argc, char** argv) {
     int num_iter = 10;
@@ -43,7 +44,7 @@ int main(int argc, char** argv) {
 
     if (!cmp_mode) {
         LOG_INFO("=== Qwen3VL Embedding Benchmark ===");
-        LOG_INFO("Model: %s", MODEL_DIR);
+        LOG_INFO("Model: %s", MODEL_DIR.c_str());
         LOG_INFO("Sequence length: %d", seq_len);
         LOG_INFO("Iterations: %d (warmup: %d)", num_iter, num_warmup);
     }

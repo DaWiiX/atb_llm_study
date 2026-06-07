@@ -16,6 +16,7 @@
 #include "atb_llm/engine.h"
 #include "utils/float_utils.h"
 #include "log/logger.h"
+#include "test_env.h"
 
 #include <cstdio>
 #include <cstring>
@@ -25,7 +26,7 @@
 
 #define IS_OK(s) ((s) == atb_llm::STATUS_OK)
 
-static const char* MODEL_DIR = "/mnt/workspace/gitCode/models/Qwen3-VL-Embedding-2B";
+static const std::string MODEL_DIR = GetModelDir();
 static const char* OUTPUT_PATH = "/tmp/cpp_embedding.bin";
 
 int main(int argc, char** argv) {

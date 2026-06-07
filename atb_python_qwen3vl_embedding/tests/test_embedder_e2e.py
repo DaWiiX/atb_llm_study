@@ -41,15 +41,9 @@ import torch_npu  # noqa: F401
 from PIL import Image
 
 from atb_python_qwen3vl_embedding.engine import Qwen3VLEngine
-from atb_python_qwen3vl_embedding.env import QWEN3VL_EMB_MODEL_DIR
-
-
-# Make /workspace/gitCode/Qwen3-VL-Embedding/src importable so that we
-# can use Qwen3VLEmbedder as the deployment-grade reference.
-QWEN3VL_EMB_SRC = "/workspace/gitCode/Qwen3-VL-Embedding/src"
-if QWEN3VL_EMB_SRC not in sys.path:
-    sys.path.insert(0, QWEN3VL_EMB_SRC)
-
+from atb_python_qwen3vl_embedding.env import QWEN3VL_EMB_MODEL_DIR, QWEN3VL_EMB_SRC
+sys.path.insert(0, QWEN3VL_EMB_SRC)
+    
 
 # ═══════════════════════════════════════════════════════════════════
 # Test cases — same shape as test_e2e.py but expressed as embedder inputs
