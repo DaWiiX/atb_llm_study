@@ -1,4 +1,3 @@
-#include "components/common/swiglu_mlp_graph.h"
 #include "components/common/mlp_builder.h"
 #include "core/graph_builder.h"
 #include "ops/linear_op.h"
@@ -9,22 +8,11 @@
 namespace atb_llm {
 namespace components {
 
-// ── MlpConfig-based Build: delegate to builder factory ───────
-Status SwiGluMlpGraph::Build(const std::string& name,
-                              const MlpConfig& config,
-                              OperationHandle& out) {
-    auto builder = CreateMlpBuilder(config.type);
-    if (!builder) {
-        LOG_ERROR("SwiGluMlpGraph: unknown MlpType %d",
-                  static_cast<int>(config.type));
-        return ERROR_INVALID_PARAM;
-    }
-    LOG_INFO("Building MLP with %s builder", builder->Name());
-    return builder->Build(name, config, out);
-}
+Status SwiGluBuilder::Build(const std::string& name,
+                             const MlpConfig& config,
+                             OperationHandle& out) {
+    (void)config;  // SwiGLU has no config-dependent behavior currently
 
-// ── Legacy Build: SwiGLU implementation ───────────────────────
-Status SwiGluMlpGraph::Build(const std::string& name, OperationHandle& out) {
     std::unique_ptr<GraphBuilder> builder;
     Status s = GraphBuilder::Create(name, builder);
     if (s != STATUS_OK) return s;
@@ -76,5 +64,16 @@ Status SwiGluMlpGraph::Build(const std::string& name, OperationHandle& out) {
     return STATUS_OK;
 }
 
-} // namespace components
-} // namespace atb_llm
+// ── Factory ────────────────────────────────────────────────────
+std::unique_ptr<IMlpBuilder> CreateMlpBuilder(MlpType type) {
+    switch (type) {
+    case MlpType::SwiGLU: return std::make_unique<SwiGluBuilder>();
+    case MlpType::GeGLU:  return std::make_unique<GeGluBuilder>();
+    case MlpType::GELU:   return std::make_unique<GeluBuilder>();
+    case MlpType::MoE:    return std::make_unique<MoeBuilder>();
+    default:               return nullptr;
+    }
+}
+
+}  // namespace components
+}  // namespace atb_llm

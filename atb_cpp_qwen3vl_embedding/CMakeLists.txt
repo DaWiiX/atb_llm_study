@@ -79,6 +79,8 @@ set(ENGINE_SRCS
     # components/common
     src/components/common/self_attention_graph.cpp
     src/components/common/swiglu_mlp_graph.cpp
+    src/components/common/gqa_attention_builder.cpp
+    src/components/common/mlp_builder.cpp
     src/components/common/rms_norm_graph.cpp
     src/components/common/mrope.cpp
     src/components/common/deepstack_fusion.cpp

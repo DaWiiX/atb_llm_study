@@ -1,4 +1,3 @@
-#include "components/common/self_attention_graph.h"
 #include "components/common/attention_builder.h"
 #include "core/graph_builder.h"
 #include "ops/linear_op.h"
@@ -10,33 +9,16 @@
 namespace atb_llm {
 namespace components {
 
-// ── AttnConfig-based Build: delegate to builder factory ──────
-Status SelfAttentionGraph::Build(const std::string& name,
-                                  const AttnConfig& config,
-                                  OperationHandle& out) {
-    auto builder = CreateAttentionBuilder(config.type);
-    if (!builder) {
-        LOG_ERROR("SelfAttentionGraph: unknown AttnType %d",
-                  static_cast<int>(config.type));
-        return ERROR_INVALID_PARAM;
-    }
-    LOG_INFO("Building attention with %s builder", builder->Name());
-    return builder->Build(name, config, out);
-}
-
-// ── Legacy Build: GQA implementation ─────────────────────────
-
-Status SelfAttentionGraph::Build(const std::string& name,
-                                  int32_t num_heads,
-                                  int32_t num_kv_heads,
-                                  int32_t head_dim,
-                                  int32_t seq_len,
-                                  float epsilon,
-                                  bool use_mask,
-                                  OperationHandle& out,
-                                  bool use_qk_norm,
-                                  int32_t rotary_dim) {
-    (void)seq_len;
+Status GqaAttentionBuilder::Build(const std::string& name,
+                                   const AttnConfig& config,
+                                   OperationHandle& out) {
+    const int32_t nh     = config.num_heads;
+    const int32_t kv_nh  = config.num_kv_heads;
+    const int32_t hd     = config.head_dim;
+    const float   eps    = config.epsilon;
+    const bool    use_mask   = config.use_mask;
+    const bool    use_qk_norm = config.use_qk_norm;
+    const int32_t rotary_dim = config.rotary_dim;
 
     std::unique_ptr<GraphBuilder> builder;
     Status s = GraphBuilder::Create(name, builder);
@@ -73,10 +55,6 @@ Status SelfAttentionGraph::Build(const std::string& name,
         return builder->AddOperation(raw, ins, outs);
     };
 
-    int32_t nh = num_heads;
-    int32_t kv_nh = num_kv_heads;
-    int32_t hd = head_dim;
-
     // ── Q path: Linear -> [optional: Reshape(3D) -> RMSNorm -> Reshape(2D)] ──
     s = add_op(ops::LinearOp::Create(),
                {"hidden_states", "q_weight"}, {"q_lin_out"});
@@ -93,7 +71,7 @@ Status SelfAttentionGraph::Build(const std::string& name,
             },
             "q_3d");
 
-        s = add_op(ops::RmsNormOp::Create(epsilon),
+        s = add_op(ops::RmsNormOp::Create(eps),
                    {"q_3d", "q_norm_weight"}, {"q_normed"});
         if (s != STATUS_OK) return s;
 
@@ -123,7 +101,7 @@ Status SelfAttentionGraph::Build(const std::string& name,
             },
             "k_3d");
 
-        s = add_op(ops::RmsNormOp::Create(epsilon),
+        s = add_op(ops::RmsNormOp::Create(eps),
                    {"k_3d", "k_norm_weight"}, {"k_normed"});
         if (s != STATUS_OK) return s;
 
@@ -177,7 +155,7 @@ Status SelfAttentionGraph::Build(const std::string& name,
         "k_rope");
 
     // ── SelfAttention: (q_rope, k_rope, v_3d, [mask,] seqlen) -> attn_out ──
-    OperationHandle sa = ops::SelfAttentionOp::Create(num_heads, num_kv_heads, head_dim, use_mask);
+    OperationHandle sa = ops::SelfAttentionOp::Create(nh, kv_nh, hd, use_mask);
     if (!sa) return ERROR_GRAPH_BUILD;
 
     atb::SVector<std::string> sa_in;
@@ -212,5 +190,15 @@ Status SelfAttentionGraph::Build(const std::string& name,
     return STATUS_OK;
 }
 
-} // namespace components
-} // namespace atb_llm
+// ── Factory ────────────────────────────────────────────────────
+std::unique_ptr<IAttentionBuilder> CreateAttentionBuilder(AttnType type) {
+    switch (type) {
+    case AttnType::GQA: return std::make_unique<GqaAttentionBuilder>();
+    case AttnType::MHA: return std::make_unique<MhaAttentionBuilder>();
+    case AttnType::MLA: return std::make_unique<MlaAttentionBuilder>();
+    default:            return nullptr;
+    }
+}
+
+}  // namespace components
+}  // namespace atb_llm
