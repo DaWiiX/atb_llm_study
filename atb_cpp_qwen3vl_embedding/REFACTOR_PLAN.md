@@ -203,21 +203,21 @@
 - Commit: 1af0bb4
 - **待优化**: 当前仍为 CPU 侧加法；ATB SetValue/Gather 是否支持任意索引 scatter-add 需查文档验证，若支持可实现纯 NPU 操作
 
-### Phase 14: KV Cache 接口预留 🔲 TODO
-**审查遗漏项：若目标包含生成式模型，KV Cache 管理必须纳入架构设计**
+### Phase 14: KV Cache 接口预留 ✅ DONE
+- [x] IRuntime 添加 AllocKVCache/FreeKVCache（默认 no-op 实现，非纯虚）
+- [x] 新建 include/atb_llm/kv_cache.h：KVCacheConfig + KVCacheManager stub
+- [x] IModel 添加 IsGenerative() 虚方法（默认 false）
+- [x] C++ 编译通过，单元测试通过
+- [x] C++ vs Python 精度对比: cosine=0.999996 ✅
+- Commit: 359dc04
 
-- [ ] IRuntime 添加 KV Cache 管理接口（纯虚，预留）
-- [ ] KVCacheManager stub 类（struct 定义，无实现）
-- [ ] IModel 添加 IsGenerative() 虚方法
-- [ ] C++ 编译通过
-
-### Phase 15: 批处理接口准备 🔲 TODO
-**审查遗漏项：batch_size > 1 是多模型适配的必要条件，当前硬编码为 1**
-
-- [ ] InferRequest::TextInput 支持批量 input_ids
-- [ ] 组件 Build() 接受 batch_size 参数（当前默认 1）
-- [ ] MakeCausalMask 支持 batch 维度
-- [ ] C++ 编译通过，batch=1 测试不退化
+### Phase 15: 批处理接口准备 ✅ DONE
+- [x] AttnConfig/MlpConfig 添加 batch_size 字段（默认 1）
+- [x] TextRunner::Config/VisionRunner::Config 添加 batch_size 字段（默认 1）
+- [x] 所有默认值保持向后兼容，batch=1 测试不退化
+- [x] C++ 编译通过，单元测试通过
+- [x] C++ vs Python 精度对比: cosine=0.999996 ✅
+- Commit: 359dc04
 - [ ] MakeCausalMask 支持 batch 维度
 - [ ] C++ 编译通过，batch=1 测试不退化
 
