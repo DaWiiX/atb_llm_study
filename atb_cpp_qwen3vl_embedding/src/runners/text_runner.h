@@ -27,6 +27,7 @@ public:
         int32_t head_dim = 128;
         int32_t intermediate_size = 4096;
         int32_t num_layers = 28;
+        int32_t batch_size = 1;         // batch dimension (future use)
         float epsilon = 1e-6f;
         bool use_qk_norm = true;
         int32_t rotary_dim = 2;

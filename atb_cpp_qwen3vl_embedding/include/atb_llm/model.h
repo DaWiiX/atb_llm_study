@@ -34,6 +34,9 @@ public:
     virtual const char* GetName() const { return "unknown"; }
     virtual bool HasVision() const { return false; }
     virtual bool IsMoE() const { return false; }
+    /// 返回 true 表示模型需要 KV Cache 进行增量解码（生成式模型）。
+    /// 默认 false（embedding/多模态模型不需要 KV Cache）。
+    virtual bool IsGenerative() const { return false; }
 };
 
 /// 模型工厂函数类型

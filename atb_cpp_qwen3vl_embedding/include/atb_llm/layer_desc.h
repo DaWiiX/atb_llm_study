@@ -38,6 +38,7 @@ struct AttnConfig {
     int32_t   num_kv_heads = 16;
     int32_t   head_dim     = 128;
     int32_t   seq_len      = 1;
+    int32_t   batch_size   = 1;      // batch dimension (future use)
     float     epsilon      = 1e-6f;
     bool      use_qk_norm  = true;
     bool      use_bias     = false;
@@ -52,6 +53,7 @@ struct AttnConfig {
 struct MlpConfig {
     MlpType   type              = MlpType::SwiGLU;
     int32_t   intermediate_size = 4096;
+    int32_t   batch_size        = 1;   // batch dimension (future use)
     bool      use_bias          = false;
     // MoE specific
     int32_t   num_experts       = 0;

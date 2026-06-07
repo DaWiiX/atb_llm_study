@@ -39,6 +39,19 @@ public:
 
     // ── 权重加载 ─────────────────────────────────────────
     virtual WeightLoader* GetWeightLoader() = 0;
+
+    // ── KV Cache 管理（为生成式模型预留） ─────────────────
+    /// 分配 KV Cache 缓冲区，返回句柄；不支持时返回 nullptr。
+    virtual void* AllocKVCache(int64_t num_layers, int64_t num_heads,
+                               int64_t head_dim, int64_t max_seq_len) {
+        (void)num_layers; (void)num_heads; (void)head_dim; (void)max_seq_len;
+        return nullptr;  // 默认：不支持
+    }
+
+    /// 释放 KV Cache 缓冲区。
+    virtual void FreeKVCache(void* cache) {
+        (void)cache;  // 默认：无操作
+    }
 };
 
 } // namespace atb_llm

@@ -31,6 +31,7 @@ public:
         int32_t patch_size = 14;
         int32_t spatial_merge_size = 2;
         int32_t num_position_embeddings = 2304;
+        int32_t batch_size = 1;         // batch dimension (future use)
         std::vector<int32_t> deepstack_visual_indexes = {5, 11, 17};
         float epsilon = 1e-6f;
     };
