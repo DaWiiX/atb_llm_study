@@ -106,10 +106,12 @@ Status ContextManager::InitContext() {
     }
 
     // Enable GRAPH_LAUNCH_MODE for better performance
-    ret = ctx_.get()->SetLaunchMode(atb::GRAPH_LAUNCH_MODE);
-    if (ret != atb::NO_ERROR) {
-        LOG_WARN("SetLaunchMode(GRAPH_LAUNCH_MODE) failed: %d, using default", static_cast<int>(ret));
-    }
+    // NOTE: Disabled — causes stream sync failures (507057) on vision block graphs
+    // when Setup() is called before each Execute(). Re-enable after investigating.
+    // ret = ctx_.get()->SetLaunchMode(atb::GRAPH_LAUNCH_MODE);
+    // if (ret != atb::NO_ERROR) {
+    //     LOG_WARN("SetLaunchMode(GRAPH_LAUNCH_MODE) failed: %d, using default", static_cast<int>(ret));
+    // }
 
     return STATUS_OK;
 }

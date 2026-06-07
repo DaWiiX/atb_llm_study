@@ -341,12 +341,14 @@ Status Qwen3VLModel::ForwardWithTiming(const InferRequest& request,
         // Inject vision tokens into text embeddings
         image_token_positions =
             FindImageTokenPositions(input_ids, seq_len, config_.image_token_id);
-        if (image_token_positions.size() != static_cast<size_t>(np)) {
-            LOG_ERROR("Image token count mismatch: pos=%zu, vis=%ld",
-                      image_token_positions.size(), static_cast<long>(np));
+        // merged_tokens already computed above (from merger output)
+        if (image_token_positions.size() != static_cast<size_t>(merged_tokens)) {
+            LOG_ERROR("Image token count mismatch: pos=%zu, merged_vis=%ld (patches=%ld)",
+                      image_token_positions.size(), static_cast<long>(merged_tokens),
+                      static_cast<long>(np));
             return ERROR_INVALID_PARAM;
         }
-        for (int64_t i = 0; i < np; i++) {
+        for (size_t i = 0; i < image_token_positions.size(); i++) {
             int64_t pos = image_token_positions[i];
             std::memcpy(inputs_embeds.data() + pos * hidden_size,
                         vis_embeds_host.data() + i * vis_embed_dim,
@@ -513,12 +515,14 @@ Status Qwen3VLModel::PrepareInputs(const InferRequest& request,
                              vis_embeds_host.data(), vis_embed_dim, ds_features);
         if (s != STATUS_OK) return s;
         image_token_positions = BaseModel::FindImageTokenPositions(input_ids, seq_len, config_.image_token_id);
-        if (image_token_positions.size() != static_cast<size_t>(np)) {
-            LOG_ERROR("Image token count mismatch: pos=%zu, vis=%ld",
-                      image_token_positions.size(), static_cast<long>(np));
+        int64_t merged_vis = np / (config_.vis_spatial_merge_size * config_.vis_spatial_merge_size);
+        if (image_token_positions.size() != static_cast<size_t>(merged_vis)) {
+            LOG_ERROR("Image token count mismatch: pos=%zu, merged_vis=%ld (patches=%ld)",
+                      image_token_positions.size(), static_cast<long>(merged_vis),
+                      static_cast<long>(np));
             return ERROR_INVALID_PARAM;
         }
-        for (int64_t i = 0; i < np; i++) {
+        for (size_t i = 0; i < image_token_positions.size(); i++) {
             int64_t pos = image_token_positions[i];
             std::memcpy(inputs_embeds.data() + pos * hidden_size,
                         vis_embeds_host.data() + i * vis_embed_dim,
