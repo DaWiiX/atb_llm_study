@@ -72,19 +72,28 @@ def make_causal_mask(S, device='cpu'):
 
 # ── Runners ──────────────────────────────────────────────────────────
 
-def _text_layer_inputs(hidden, layer_weights, cos, sin, causal_mask=None):
+def _text_layer_inputs(hidden, weight_list, cos_npu, sin_npu, seqlen,
+                       causal_mask=None):
     """Build DecoderLayer inputs in graph order.
 
-    The final sequence-length tensor is intentionally kept on CPU int32 because
-    ATB Rope/SelfAttention expect a host-side length tensor.
+    All tensor arguments should already be NPU float16; the caller is
+    responsible for converting once before the loop.
+
+    Args:
+        hidden:      NPU float16 hidden states.
+        weight_list: pre-converted list of NPU float16 weight tensors.
+        cos_npu:     NPU float16 cos embeddings.
+        sin_npu:     NPU float16 sin embeddings.
+        seqlen:      pre-created CPU int32 [ntokens] tensor.
+        causal_mask: NPU float16 causal mask or None.
     """
-    ntoken = hidden.shape[0] * hidden.shape[1]
-    inputs = [to_npu_half(hidden)]
-    inputs.extend(prepare_npu_weights(layer_weights))
-    inputs.extend([to_npu_half(cos), to_npu_half(sin)])
+    inputs = [hidden]
+    inputs.extend(weight_list)
+    inputs.extend([cos_npu, sin_npu])
     if causal_mask is not None:
-        inputs.append(to_npu_half(causal_mask))
-    inputs.append(make_seqlen_tensor(ntoken))
+        inputs.append(causal_mask)
+    inputs.append(seqlen)
+
     return inputs
 
 
@@ -93,12 +102,14 @@ def run_text_layer(graph, hidden_states, layer_weights, cos, sin, seqlen,
     """Execute one DecoderLayer and return CPU float output.
 
     This CPU-facing wrapper accepts ordinary CPU tensors (including weights and
-    masks), prepares ATB inputs, and preserves the public signature. ``seqlen``
-    is retained for compatibility; the graph length is derived from
-    ``hidden_states`` and passed as a CPU int32 tensor.
+    masks), converts them, and calls the graph. ``seqlen`` should be a
+    pre-created CPU int32 tensor created once outside the loop.
     """
-    inputs = _text_layer_inputs(hidden_states, layer_weights, cos, sin,
-                                causal_mask=causal_mask)
+    inputs = _text_layer_inputs(
+        to_npu_half(hidden_states),
+        prepare_npu_weights(layer_weights),
+        to_npu_half(cos), to_npu_half(sin), seqlen,
+        causal_mask=to_npu_half(causal_mask) if causal_mask is not None else None)
     return to_cpu_float(graph.forward(inputs)[0])
 
 
@@ -109,16 +120,16 @@ def run_text_layer_fast(graph, hidden_states, layer_weights, cos_npu, sin_npu,
                           seqlen, causal_mask=causal_mask)
 
 
-def run_text_layer_npu(graph, hidden_npu, layer_weights, cos_npu, sin_npu,
+def run_text_layer_npu(graph, hidden_npu, weight_list, cos_npu, sin_npu,
                         seqlen, causal_mask=None):
     """Execute one DecoderLayer and keep output on NPU.
 
-    Inputs may already be NPU-resident; placement helpers are no-op-safe. The
-    ``seqlen`` argument is kept for API compatibility and the actual CPU int32
-    graph input is derived from ``hidden_npu``.
+    All tensor arguments should already be NPU float16; the caller is
+    responsible for converting once before the loop. ``seqlen`` should be
+    a pre-created CPU int32 tensor.
     """
-    inputs = _text_layer_inputs(hidden_npu, layer_weights, cos_npu, sin_npu,
-                                causal_mask=causal_mask)
+    inputs = _text_layer_inputs(hidden_npu, weight_list, cos_npu, sin_npu,
+                                seqlen, causal_mask=causal_mask)
     return graph.forward(inputs)[0]
 
 
@@ -139,19 +150,19 @@ def run_text_model(text_model, hidden_states, cos, sin, seqlen,
     """Run full Qwen3VLTextModel through ATB graphs.
 
     The public API is CPU-facing and returns CPU float output, but the layer
-    loop stays NPU-resident to avoid repeated transfers. ``seqlen`` is retained
-    for compatibility; per-layer graph lengths are derived from ``hidden``.
+    loop stays NPU-resident to avoid repeated transfers.
     """
     S = hidden_states.shape[1]
     hidden = to_npu_half(hidden_states)
     cos_npu = to_npu_half(cos)
     sin_npu = to_npu_half(sin)
+    seqlen_t = make_seqlen_tensor(S)
     causal_mask = to_npu_half(make_causal_mask(S)) if use_mask else None
 
     for layer in text_model.layers:
         w = prepare_npu_weights(collect_text_layer_weights(layer))
         hidden = run_text_layer_npu(layer_graph, hidden, w, cos_npu, sin_npu,
-                                    seqlen, causal_mask=causal_mask)
+                                    seqlen_t, causal_mask=causal_mask)
 
     normed = run_text_norm_npu(norm_graph, hidden, text_model.norm.weight.data)
     return to_cpu_float(normed)

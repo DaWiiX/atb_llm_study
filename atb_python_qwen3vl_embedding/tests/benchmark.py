@@ -43,11 +43,13 @@ from PIL import Image
 from atb_python_qwen3vl_embedding.engine import Qwen3VLEngine
 from atb_python_qwen3vl_embedding.env import QWEN3VL_EMB_MODEL_DIR
 from atb_python_qwen3vl_embedding.engine_utils import (
-    compute_rot_pos_emb, fast_pos_embed_interpolate, get_rope_index,
+    compute_posemb_indices, compute_rope_indices, get_rope_index,
 )
 from atb_python_qwen3vl_embedding.vision_model import (
     run_block_npu, run_first_layer_npu, run_merger_npu,
 )
+from atb_python_qwen3vl_embedding.vision_pos_embed import run_posemb_npu
+from atb_python_qwen3vl_embedding.utils import make_seqlen_tensor, to_npu_half
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -92,13 +94,16 @@ def make_inputs(engine, processor, w: int, h: int):
         add_generation_prompt=True)
 
     return {
-        'w': w, 'h': h, 'img_arr': img_arr,
-        'pv_raw': pv_raw, 'grid_thw': grid_thw,
+        'w': w,
+        'h': h,
+        'img_arr': img_arr,
+        'pv_raw': pv_raw,               # keep on CPU — engine handles transfer
+        'grid_thw': grid_thw,           # keep on CPU — engine handles transfer
         'input_ids': tf_in['input_ids'],
         'attention_mask': tf_in.get('attention_mask',
-                                    torch.ones_like(tf_in['input_ids'])),
-        'tf_pixel_values': tf_in.get('pixel_values'),
-        'tf_grid_thw': tf_in.get('image_grid_thw'),
+                                    torch.ones_like(tf_in['input_ids'])).npu(),
+        'tf_pixel_values': tf_in.get('pixel_values').npu(),
+        'tf_grid_thw': tf_in.get('image_grid_thw').npu(),
     }
 
 
@@ -113,32 +118,36 @@ STAGES = ['preprocess', 'vision_pos', 'vision_model',
 def _run_vision_stages(engine, pv, gth):
     """Reproduce engine._run_vision but split into (pos+rope) and (NPU graph).
 
-    Mirrors engine.py:167-186 — kept here so the benchmark can sync between the
-    two sub-stages without modifying engine.py.
+    Mirrors engine.py — uses ATB VisPosEmb graph for pos_embed + RoPE.
     """
-    # ── Stage 2: vision pos_embed + rope (CPU) ─────────────────────
-    pos = fast_pos_embed_interpolate(
-        gth, engine.v_pos_embed, engine.num_grid, engine.merge_size)
-    rope = compute_rot_pos_emb(gth, engine.vis_rotary, engine.merge_size)
-    rope = rope.reshape(pv.shape[0], -1)
-    emb = torch.cat((rope, rope), dim=-1)
-    cos_v, sin_v = emb.cos(), emb.sin()
+    # ── Stage 2: vision pos_embed + rope (CPU indices + NPU graph) ──
+    idx_wt = compute_posemb_indices(gth, engine.num_grid, engine.merge_size)
+    rope_idx = compute_rope_indices(gth, engine.vis_rotary, engine.merge_size)
+    freq_npu = to_npu_half(rope_idx['freq_table'])
+
+    pos_npu, cos_npu, sin_npu = run_posemb_npu(
+        engine.g_v_posemb, engine.v_pe_w_table,
+        idx_wt, rope_idx, freq_npu)
 
     # ── Stage 3: vision model on NPU ───────────────────────────────
-    h = run_first_layer_npu(engine.g_v_first, pv,
+    pv_npu = to_npu_half(pv.reshape(-1) if pv.ndim == 2 else pv)
+    npatches = idx_wt['idx00'].shape[0]
+    seqlen_v = make_seqlen_tensor(npatches)
+
+    h = run_first_layer_npu(engine.g_v_first, pv_npu,
                             engine.v_pe_w, engine.v_pe_b,
-                            pos, cos_v, sin_v,
-                            engine.v_block_weights[0])
+                            pos_npu, cos_npu, sin_npu,
+                            engine.v_block_weights[0], seqlen_v)
     ds_feats = []
     for li in range(1, engine.v_depth):
         h = run_block_npu(engine.g_v_block, h,
-                          engine.v_block_weights[li], cos_v, sin_v)
+                          engine.v_block_weights[li], cos_npu, sin_npu, seqlen_v)
         if li in engine.ds_indexes:
             ds_idx = engine.ds_indexes.index(li)
             ds_feats.append(
                 run_merger_npu(engine.g_v_ds, h, engine.v_ds_w[ds_idx]))
     vis = run_merger_npu(engine.g_v_merger, h, engine.v_merger_w)
-    return (pos, cos_v, sin_v), (vis, ds_feats)
+    return (idx_wt, rope_idx), (vis, ds_feats)
 
 
 def benchmark_atb_staged(engine, inputs, n_warmup, n_iter):
@@ -167,32 +176,47 @@ def benchmark_atb_staged(engine, inputs, n_warmup, n_iter):
 
         # ── Stages 2 & 3: vision pos_embed + NPU model ──────────────
         sync(); t2_start = now()
-        pos = fast_pos_embed_interpolate(
-            gth, engine.v_pos_embed, engine.num_grid, engine.merge_size)
-        rope = compute_rot_pos_emb(gth, engine.vis_rotary, engine.merge_size)
-        rope = rope.reshape(pv.shape[0], -1)
-        emb = torch.cat((rope, rope), dim=-1)
-        cos_v, sin_v = emb.cos(), emb.sin()
+        idx_wt = compute_posemb_indices(gth, engine.num_grid, engine.merge_size)
+        rope_idx = compute_rope_indices(gth, engine.vis_rotary, engine.merge_size)
+        freq_npu = to_npu_half(rope_idx['freq_table'])
+        # Sync: CPU→NPU transfers for idx_wt/rope_idx/freq must complete
+        # before ATB posemb graph reads them (ATB may use a separate stream).
+        sync()
+        pos_npu, cos_npu, sin_npu = run_posemb_npu(
+            engine.g_v_posemb, engine.v_pe_w_table,
+            idx_wt, rope_idx, freq_npu)
         sync(); t2 = now(); t['vision_pos'] = t2 - t2_start
 
-        h = run_first_layer_npu(engine.g_v_first, pv,
+        pv_npu = to_npu_half(pv.reshape(-1) if pv.ndim == 2 else pv)
+        npatches = idx_wt['idx00'].shape[0]
+        seqlen_v = make_seqlen_tensor(npatches)
+        # Sync: pv_npu H2D (or NPU dtype conversion) must complete before
+        # the ATB first-layer graph reads it.
+        sync()
+
+        h = run_first_layer_npu(engine.g_v_first, pv_npu,
                                 engine.v_pe_w, engine.v_pe_b,
-                                pos, cos_v, sin_v,
-                                engine.v_block_weights[0])
+                                pos_npu, cos_npu, sin_npu,
+                                engine.v_block_weights[0], seqlen_v)
         ds_feats = []
         for li in range(1, engine.v_depth):
+            # sync()  # sync between ATB graph calls (matches engine._run_vision)
             h = run_block_npu(engine.g_v_block, h,
-                              engine.v_block_weights[li], cos_v, sin_v)
+                              engine.v_block_weights[li], cos_npu, sin_npu, seqlen_v)
             if li in engine.ds_indexes:
                 ds_idx = engine.ds_indexes.index(li)
                 ds_feats.append(
                     run_merger_npu(engine.g_v_ds, h, engine.v_ds_w[ds_idx]))
+        # sync()
         vis = run_merger_npu(engine.g_v_merger, h, engine.v_merger_w)
         sync(); t3 = now(); t['vision_model'] = t3 - t2
 
         # ── Stage 4: text embed + vision injection (CPU + NPU copy) ─
         ie = F.embedding(input_ids, engine.embed_w).half().npu()
         vis_mask = input_ids.squeeze(0) == engine.img_tok
+        # Sync: ie (H2D), vis (ATB graph output), and vis_mask.npu() (H2D)
+        # must all be ready before the NPU scatter operation.
+        sync()
         ie[0, vis_mask.npu(), :] = vis
         sync(); t4 = now(); t['text_embed'] = t4 - t3
 
@@ -290,18 +314,6 @@ def benchmark_tf_e2e(ref, inputs, n_warmup, n_iter):
         t = tf_out.flatten()
         accuracy = F.cosine_similarity(a.unsqueeze(0), t.unsqueeze(0)).item()
     return results, accuracy
-
-    for _ in range(n_warmup):
-        _call()
-    sync()
-
-    results = []
-    for _ in range(n_iter):
-        sync(); t0 = now()
-        _call()
-        sync()
-        results.append(now() - t0)
-    return results
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -414,6 +426,8 @@ def main(argv: Optional[list] = None) -> int:
         n_vis = int(torch.prod(inputs['grid_thw'], dim=1).sum()) \
             // (engine.merge_size ** 2)
         print(f"[ATB] grid={inputs['grid_thw'].tolist()}  S={S}  vis_tok={n_vis}")
+
+        torch.npu.synchronize()
 
         stages = benchmark_atb_staged(engine, inputs, args.warmup, args.iter)
         atb_e2e = benchmark_atb_e2e(engine, inputs, args.warmup, args.iter)

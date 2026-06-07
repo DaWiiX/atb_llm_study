@@ -23,6 +23,7 @@ from .engine_utils import (
     get_vision_block_weights, get_patch_embed_weights,
     get_vision_pos_embed, get_merger_weights,
     VisionRotaryEmbedding, compute_rot_pos_emb, fast_pos_embed_interpolate,
+    compute_posemb_indices, compute_rope_indices,
     TextRotaryEmbedding, get_rope_index,
 )
 from .vision_model import (
@@ -30,9 +31,14 @@ from .vision_model import (
     run_first_layer_npu, run_block_npu, run_merger_npu,
 )
 from .vision_block import build_vision_block
+from .vision_pos_embed import build_vision_posemb_graph, run_posemb_npu
 from .text_model import (
     build_text_layer_graph, build_text_norm_graph,
     run_text_layer_npu, run_text_norm_npu, make_causal_mask,
+)
+
+from .utils import (
+    to_cpu_float, to_npu_half, make_seqlen_tensor
 )
 
 
@@ -92,27 +98,28 @@ class Qwen3VLEngine:
         self.embed_w = get_embed_weight(self.weights)
         self.norm_w = get_text_norm_weight(self.weights).half().npu()
         self.t_layer_weights = [
-            [w.half().npu() for w in get_text_layer_weights(self.weights, i)]
+            [to_npu_half(w) for w in get_text_layer_weights(self.weights, i)]
             for i in range(self.n_layer)
         ]
 
         # Vision: block weights by layer (NPU-resident)
         self.v_block_weights = [
-            [w.half().npu() for w in get_vision_block_weights(self.weights, i)]
+            [to_npu_half(w) for w in get_vision_block_weights(self.weights, i)]
             for i in range(self.v_depth)
         ]
         self.v_pe_w, self.v_pe_b = get_patch_embed_weights(
             self.weights, self.v_cfg["hidden_size"])
-        self.v_pe_w = self.v_pe_w.half().npu()
-        self.v_pe_b = self.v_pe_b.half().npu()
+        self.v_pe_w = to_npu_half(self.v_pe_w)
+        self.v_pe_b = to_npu_half(self.v_pe_b)
         self.v_pos_embed = get_vision_pos_embed(self.weights)
+        self.v_pe_w_table = to_npu_half(self.v_pos_embed)  # NPU fp16 for ATB Gather
         self.num_grid = int(self.v_cfg["num_position_embeddings"] ** 0.5)
 
         # Vision: merger weights (NPU-resident)
-        self.v_merger_w = [w.half().npu() for w in
+        self.v_merger_w = [to_npu_half(w) for w in
                            get_merger_weights(self.weights, is_deepstack=False)]
         self.v_ds_w = [
-            [w.half().npu() for w in
+            [to_npu_half(w) for w in
              get_merger_weights(self.weights, is_deepstack=True, ds_idx=i)]
             for i in range(len(self.ds_indexes))
         ]
@@ -132,7 +139,7 @@ class Qwen3VLEngine:
         self.g_t_layer = build_text_layer_graph(
             self.nh_t, self.nkv_t, self.hd_t, self.interm_t,
             B=1, S=S, use_mask=True)
-        self._cached_mask = make_causal_mask(S).half().npu()
+        self._cached_mask = to_npu_half(make_causal_mask(S))
 
     def _build_graphs(self):
         """Build all ATB graphs."""
@@ -141,6 +148,7 @@ class Qwen3VLEngine:
         _, self.g_v_block, _ = build_vision_block(self.nh_v, self.hd_v, "VisBlock")
         self.g_v_merger = build_vision_merger(self._make_vision_config())
         self.g_v_ds = build_deepstack_merger(self._make_vision_config())
+        self.g_v_posemb = build_vision_posemb_graph()
 
         # Text
         self.g_t_norm = build_text_norm_graph(self.hidden_t)
@@ -164,24 +172,50 @@ class Qwen3VLEngine:
 
         Returns (vis_npu, ds_feats_npu) — both NPU float16 tensors.
         """
-        pos = fast_pos_embed_interpolate(
-            grid_thw, self.v_pos_embed, self.num_grid, self.merge_size)
-        rope = compute_rot_pos_emb(grid_thw, self.vis_rotary, self.merge_size)
-        rope = rope.reshape(pixel_values.shape[0], -1)
-        emb = torch.cat((rope, rope), dim=-1)
-        cos, sin = emb.cos(), emb.sin()
+        # ── Position embedding + RoPE via ATB graph (NPU) ────────────
+        idx_wt = compute_posemb_indices(grid_thw, self.num_grid, self.merge_size)
+        rope_idx = compute_rope_indices(grid_thw, self.vis_rotary, self.merge_size)
+        freq_npu = to_npu_half(rope_idx['freq_table'])
 
-        h = run_first_layer_npu(self.g_v_first, pixel_values,
-                                self.v_pe_w, self.v_pe_b, pos, cos, sin,
-                                self.v_block_weights[0])
+        pos_npu, cos_npu, sin_npu = run_posemb_npu(
+            self.g_v_posemb, self.v_pe_w_table, idx_wt, rope_idx, freq_npu)
+
+        # Pre-convert pixel values to NPU float16 once.
+        pv_npu = to_npu_half(pixel_values.reshape(-1)
+                             if pixel_values.ndim == 2 else pixel_values)
+
+        # Pre-create seqlen tensor once — all blocks share the same npatches
+        npatches = idx_wt['idx00'].shape[0]
+        seqlen_v = make_seqlen_tensor(npatches)
+
+        # Sync: all CPU-derived data (idx_wt, rope_idx → via .npu() inside
+        # run_posemb_npu) and H2D transfers (pv_npu, freq_npu) must land on
+        # NPU before the vision ATB graphs read them.  ATB graph execution
+        # may happen on a separate NPU stream that does not see pending
+        # transfers on the default stream.
+        torch.npu.synchronize()
+
+        h = run_first_layer_npu(self.g_v_first, pv_npu,
+                                self.v_pe_w, self.v_pe_b,
+                                pos_npu, cos_npu, sin_npu,
+                                self.v_block_weights[0], seqlen_v)
 
         ds_feats = []
         for li in range(1, self.v_depth):
-            h = run_block_npu(self.g_v_block, h, self.v_block_weights[li], cos, sin)
+            # Sync between different ATB graphs.  The C++ engine calls
+            # aclrtSynchronizeStream after every ExecuteGraph; Python's
+            # graph.forward() is purely async.  Without this sync, a
+            # subsequent graph may read the previous graph's output before
+            # it is ready when the graphs execute on different internal
+            # streams or when NPU-side ordering is not guaranteed.
+            torch.npu.synchronize()
+            h = run_block_npu(self.g_v_block, h, self.v_block_weights[li],
+                              cos_npu, sin_npu, seqlen_v)
             if li in self.ds_indexes:
                 ds_idx = self.ds_indexes.index(li)
                 ds_feats.append(run_merger_npu(self.g_v_ds, h, self.v_ds_w[ds_idx]))
 
+        # torch.npu.synchronize()
         vis = run_merger_npu(self.g_v_merger, h, self.v_merger_w)
         return vis, ds_feats
 
@@ -194,18 +228,30 @@ class Qwen3VLEngine:
         self._ensure_text_graph(S)
 
         cos, sin = self.text_rope(position_ids)
-        cos_npu = cos.reshape(-1, self.hd_t).half().npu()
-        sin_npu = sin.reshape(-1, self.hd_t).half().npu()
+        cos_npu = to_npu_half(cos.reshape(-1, self.hd_t))
+        sin_npu = to_npu_half(sin.reshape(-1, self.hd_t))
 
-        hidden = inputs_embeds.half().npu()
+        # Pre-create seqlen tensor once — all 28 layers share the same S
+        seqlen_t = make_seqlen_tensor(S)
+
+        hidden = to_npu_half(inputs_embeds)
 
         if visual_mask is not None:
             visual_mask = visual_mask.npu()
 
+        # Sync: CPU-derived cos/sin and visual_mask are transferred to NPU
+        # via to_npu_half() / .npu() above.  ATB graph may execute on a
+        # separate NPU stream — without this sync it could read those
+        # tensors before the H2D transfers complete.
+        torch.npu.synchronize()
+
         for li in range(self.n_layer):
+            # Sync between ATB text layer graph executions (same reason as
+            # vision block loop — C++ engine syncs after every ExecuteGraph).
+            torch.npu.synchronize()
             hidden = run_text_layer_npu(self.g_t_layer, hidden,
                                         self.t_layer_weights[li],
-                                        cos_npu, sin_npu, S,
+                                        cos_npu, sin_npu, seqlen_t,
                                         causal_mask=self._cached_mask)
             if deepstack_features and li < len(deepstack_features):
                 # clone + add + writeback (matches TF _deepstack_process)
@@ -237,6 +283,10 @@ class Qwen3VLEngine:
         vis_mask = None
         if pixel_values is not None and image_grid_thw is not None:
             vis_embeds, ds_feats = self._run_vision(pixel_values, image_grid_thw)
+            # CPU: compute mask; async H2D: vis_mask.npu(); async NPU: scatter.
+            # Sync so the scatter sees a fully-transferred mask AND valid
+            # vis_embeds from the (async) ATB vision graph.
+            torch.npu.synchronize()
             vis_mask = input_ids.squeeze(0) == self.img_tok
             inputs_embeds[0, vis_mask.npu(), :] = vis_embeds
 

@@ -150,6 +150,10 @@ def compute_rot_pos_emb(grid_thw: torch.Tensor, rotary_emb: VisionRotaryEmbeddin
 
     Equivalent to Qwen3VLVisionModel.rot_pos_emb.
 
+    Vectorized: accumulates per-image coordinate chunks via list + cat
+    instead of pre-allocating a large empty tensor and filling it in-place.
+    The merge-size block grouping is preserved via reshape + permute.
+
     Args:
         grid_thw:   (N, 3) tensor [t, h, w] for each image.
         rotary_emb: VisionRotaryEmbedding instance.
@@ -161,34 +165,33 @@ def compute_rot_pos_emb(grid_thw: torch.Tensor, rotary_emb: VisionRotaryEmbeddin
     max_hw = int(grid_thw[:, 1:].max().item())
     freq_table = rotary_emb(max_hw)  # (max_hw, dim)
 
-    total_tokens = int(torch.prod(grid_thw, dim=1).sum().item())
-    pos_ids = torch.empty((total_tokens, 2), dtype=torch.long)
-
-    offset = 0
+    pos_id_chunks = []
     for num_frames, height, width in grid_thw:
-        merged_h, merged_w = height // merge_size, width // merge_size
+        t_i, h_i, w_i = int(num_frames), int(height), int(width)
+        merged_h, merged_w = h_i // merge_size, w_i // merge_size
 
-        block_rows = torch.arange(merged_h)
-        block_cols = torch.arange(merged_w)
-        intra_row = torch.arange(merge_size)
-        intra_col = torch.arange(merge_size)
+        # Build block-grouped position indices via reshape + permute.
+        # This produces the same ordering as the original 4D expand:
+        #   (merged_h, merged_w, merge_size, merge_size) → flatten
+        # with blocks of merge_size×merge_size grouped together.
+        row_idx = torch.arange(h_i).view(merged_h, merge_size, 1, 1)
+        col_idx = torch.arange(w_i).view(1, 1, merged_w, merge_size)
 
-        row_idx = (block_rows[:, None, None, None] * merge_size +
-                   intra_row[None, None, :, None])
-        col_idx = (block_cols[None, :, None, None] * merge_size +
-                   intra_col[None, None, None, :])
+        # Broadcast to (merged_h, merge_size, merged_w, merge_size)
+        row_grid = row_idx.expand(merged_h, merge_size, merged_w, merge_size)
+        col_grid = col_idx.expand(merged_h, merge_size, merged_w, merge_size)
 
-        row_idx = row_idx.expand(merged_h, merged_w, merge_size, merge_size).reshape(-1)
-        col_idx = col_idx.expand(merged_h, merged_w, merge_size, merge_size).reshape(-1)
-        coords = torch.stack((row_idx, col_idx), dim=-1)
+        # Permute to (merged_h, merged_w, merge_size, merge_size) then flatten
+        row_flat = row_grid.permute(0, 2, 1, 3).reshape(-1)
+        col_flat = col_grid.permute(0, 2, 1, 3).reshape(-1)
+        coords = torch.stack([row_flat, col_flat], dim=-1)
 
-        if num_frames > 1:
-            coords = coords.repeat(num_frames, 1)
+        if t_i > 1:
+            coords = coords.repeat(t_i, 1)
 
-        num_tokens = coords.shape[0]
-        pos_ids[offset:offset + num_tokens] = coords
-        offset += num_tokens
+        pos_id_chunks.append(coords)
 
+    pos_ids = torch.cat(pos_id_chunks, dim=0)
     return freq_table[pos_ids].flatten(1)  # (total_tokens, dim*2)
 
 
@@ -197,6 +200,9 @@ def fast_pos_embed_interpolate(grid_thw: torch.Tensor, pos_embed_weight: torch.T
     """Bilinear interpolation from learned 2D position embedding grid.
 
     Equivalent to Qwen3VLVisionModel.fast_pos_embed_interpolate.
+
+    Vectorized implementation: avoids Python list appends and .tolist()
+    round-trips by accumulating index/weight tensors directly.
 
     Args:
         grid_thw:          (N, 3) tensor.
@@ -210,54 +216,66 @@ def fast_pos_embed_interpolate(grid_thw: torch.Tensor, pos_embed_weight: torch.T
     """
     grid_ts, grid_hs, grid_ws = grid_thw[:, 0], grid_thw[:, 1], grid_thw[:, 2]
 
-    idx_list = [[] for _ in range(4)]
-    weight_list = [[] for _ in range(4)]
+    # Accumulate tensor chunks directly — no Python list → .tolist() round-trip
+    all_idx_chunks = [[] for _ in range(4)]
+    all_wt_chunks = [[] for _ in range(4)]
 
     for t, h, w in zip(grid_ts, grid_hs, grid_ws):
-        h_idxs = torch.linspace(0, num_grid_per_side - 1, h)
-        w_idxs = torch.linspace(0, num_grid_per_side - 1, w)
+        h_i, w_i = int(h), int(w)
+        h_idxs = torch.linspace(0, num_grid_per_side - 1, h_i)
+        w_idxs = torch.linspace(0, num_grid_per_side - 1, w_i)
 
         h_floor = h_idxs.int()
         w_floor = w_idxs.int()
-        h_ceil = (h_idxs.int() + 1).clip(max=num_grid_per_side - 1)
-        w_ceil = (w_idxs.int() + 1).clip(max=num_grid_per_side - 1)
+        h_ceil = (h_floor + 1).clamp(max=num_grid_per_side - 1)
+        w_ceil = (w_floor + 1).clamp(max=num_grid_per_side - 1)
 
-        dh = h_idxs - h_floor
-        dw = w_idxs - w_floor
+        dh = h_idxs - h_floor.float()
+        dw = w_idxs - w_floor.float()
 
         base_h = h_floor * num_grid_per_side
         base_h_ceil = h_ceil * num_grid_per_side
 
-        indices = [
-            (base_h[None].T + w_floor[None]).flatten(),
-            (base_h[None].T + w_ceil[None]).flatten(),
-            (base_h_ceil[None].T + w_floor[None]).flatten(),
-            (base_h_ceil[None].T + w_ceil[None]).flatten(),
-        ]
-        weights_ = [
-            ((1 - dh)[None].T * (1 - dw)[None]).flatten(),
-            ((1 - dh)[None].T * dw[None]).flatten(),
-            (dh[None].T * (1 - dw)[None]).flatten(),
-            (dh[None].T * dw[None]).flatten(),
-        ]
+        # Build 2D index grids via outer products — no Python loop
+        idx00 = (base_h.unsqueeze(1) + w_floor.unsqueeze(0)).reshape(-1)
+        idx01 = (base_h.unsqueeze(1) + w_ceil.unsqueeze(0)).reshape(-1)
+        idx10 = (base_h_ceil.unsqueeze(1) + w_floor.unsqueeze(0)).reshape(-1)
+        idx11 = (base_h_ceil.unsqueeze(1) + w_ceil.unsqueeze(0)).reshape(-1)
 
-        for i in range(4):
-            idx_list[i].extend(indices[i].tolist())
-            weight_list[i].extend(weights_[i].tolist())
+        wt00 = ((1 - dh).unsqueeze(1) * (1 - dw).unsqueeze(0)).reshape(-1)
+        wt01 = ((1 - dh).unsqueeze(1) * dw.unsqueeze(0)).reshape(-1)
+        wt10 = (dh.unsqueeze(1) * (1 - dw).unsqueeze(0)).reshape(-1)
+        wt11 = (dh.unsqueeze(1) * dw.unsqueeze(0)).reshape(-1)
 
-    idx_tensor = torch.tensor(idx_list, dtype=torch.long)
-    weight_tensor = torch.tensor(weight_list, dtype=pos_embed_weight.dtype)
-    pos_embeds = pos_embed_weight[idx_tensor] * weight_tensor[:, :, None]
-    patch_pos_embeds = pos_embeds[0] + pos_embeds[1] + pos_embeds[2] + pos_embeds[3]
-    patch_pos_embeds = patch_pos_embeds.split(
-        [(h * w).item() for h, w in zip(grid_hs, grid_ws)])
+        all_idx_chunks[0].append(idx00)
+        all_idx_chunks[1].append(idx01)
+        all_idx_chunks[2].append(idx10)
+        all_idx_chunks[3].append(idx11)
+        all_wt_chunks[0].append(wt00)
+        all_wt_chunks[1].append(wt01)
+        all_wt_chunks[2].append(wt10)
+        all_wt_chunks[3].append(wt11)
+
+    # Concatenate all image chunks into single tensors — no .tolist()
+    idx_tensors = [torch.cat(chunks) for chunks in all_idx_chunks]
+    wt_tensors = [torch.cat(chunks).to(pos_embed_weight.dtype) for chunks in all_wt_chunks]
+
+    # Gather + weighted sum
+    patch_pos_embeds = sum(
+        pos_embed_weight[idx] * wt[:, None]
+        for idx, wt in zip(idx_tensors, wt_tensors))
+
+    # Split per image and apply spatial merge shuffle
+    hw_sizes = [(int(h), int(w)) for h, w in zip(grid_hs, grid_ws)]
+    patch_pos_embeds = patch_pos_embeds.split([h * w for h, w in hw_sizes])
 
     result = []
-    for pos_embed, t, h, w in zip(patch_pos_embeds, grid_ts, grid_hs, grid_ws):
-        pos_embed = pos_embed.repeat(t.item(), 1)
+    for pos_embed, t_val, h, w in zip(patch_pos_embeds, grid_ts, grid_hs, grid_ws):
+        t_i, h_i, w_i = int(t_val), int(h), int(w)
+        pos_embed = pos_embed.repeat(t_i, 1)
         pos_embed = (pos_embed
-                     .view(t.item(), h.item() // merge_size, merge_size,
-                           w.item() // merge_size, merge_size, -1)
+                     .view(t_i, h_i // merge_size, merge_size,
+                           w_i // merge_size, merge_size, -1)
                      .permute(0, 1, 3, 2, 4, 5)
                      .flatten(0, 4))
         result.append(pos_embed)
@@ -447,3 +465,126 @@ def get_rope_index(input_ids: torch.LongTensor,
                 [input_ids.shape[0], 1], device=input_ids.device,
                 dtype=input_ids.dtype)
         return position_ids, mrope_position_deltas
+
+
+# ═════════════════════════════════════════════════════════════════════
+# ATB graph helpers — index/weight extraction for NPU-side computation
+# ═════════════════════════════════════════════════════════════════════
+
+def compute_posemb_indices(grid_thw: torch.Tensor, num_grid_per_side: int,
+                           merge_size: int = 2):
+    """Compute bilinear interpolation indices and weights for pos_embed.
+
+    Returns indices/weights in **shuffled (block-major) order** so that the
+    ATB Gather output is directly usable by the vision model without further
+    permutation.
+
+    Returns dict with keys:
+        idx00..11: (total_patches,) int64 — interpolation corner indices
+        wt00..11:  (total_patches,) float32 — interpolation weights
+    """
+    grid_ts, grid_hs, grid_ws = grid_thw[:, 0], grid_thw[:, 1], grid_thw[:, 2]
+
+    all_idx_chunks = [[] for _ in range(4)]
+    all_wt_chunks = [[] for _ in range(4)]
+
+    for t, h, w in zip(grid_ts, grid_hs, grid_ws):
+        h_i, w_i = int(h), int(w)
+        merged_h, merged_w = h_i // merge_size, w_i // merge_size
+
+        h_idxs = torch.linspace(0, num_grid_per_side - 1, h_i)
+        w_idxs = torch.linspace(0, num_grid_per_side - 1, w_i)
+
+        h_floor = h_idxs.int()
+        w_floor = w_idxs.int()
+        h_ceil = (h_floor + 1).clamp(max=num_grid_per_side - 1)
+        w_ceil = (w_floor + 1).clamp(max=num_grid_per_side - 1)
+
+        dh = h_idxs - h_floor.float()
+        dw = w_idxs - w_floor.float()
+
+        base_h = h_floor * num_grid_per_side
+        base_h_ceil = h_ceil * num_grid_per_side
+
+        # Build 2D grids in (h, w) row-major order
+        idx00_2d = base_h.unsqueeze(1) + w_floor.unsqueeze(0)
+        idx01_2d = base_h.unsqueeze(1) + w_ceil.unsqueeze(0)
+        idx10_2d = base_h_ceil.unsqueeze(1) + w_floor.unsqueeze(0)
+        idx11_2d = base_h_ceil.unsqueeze(1) + w_ceil.unsqueeze(0)
+
+        wt00_2d = (1 - dh).unsqueeze(1) * (1 - dw).unsqueeze(0)
+        wt01_2d = (1 - dh).unsqueeze(1) * dw.unsqueeze(0)
+        wt10_2d = dh.unsqueeze(1) * (1 - dw).unsqueeze(0)
+        wt11_2d = dh.unsqueeze(1) * dw.unsqueeze(0)
+
+        # Reshape to (merged_h, merge_size, merged_w, merge_size)
+        # then permute to (merged_h, merged_w, merge_size, merge_size)
+        # then flatten — this is the spatial merge shuffle order
+        def _shuffle(tensor):
+            return (tensor
+                    .view(merged_h, merge_size, merged_w, merge_size)
+                    .permute(0, 2, 1, 3)
+                    .reshape(-1))
+
+        t_i = int(t)
+        for i, (idx_2d, wt_2d) in enumerate([
+            (idx00_2d, wt00_2d), (idx01_2d, wt01_2d),
+            (idx10_2d, wt10_2d), (idx11_2d, wt11_2d)
+        ]):
+            s_idx = _shuffle(idx_2d).to(torch.int64)
+            s_wt = _shuffle(wt_2d)
+            if t_i > 1:
+                s_idx = s_idx.repeat(t_i)
+                s_wt = s_wt.repeat(t_i)
+            all_idx_chunks[i].append(s_idx)
+            all_wt_chunks[i].append(s_wt)
+
+    # Keys match the bilinear interpolation corners:
+    #   00 = (h_floor, w_floor), 01 = (h_floor, w_ceil),
+    #   10 = (h_ceil,  w_floor), 11 = (h_ceil,  w_ceil)
+    corner_names = ['00', '01', '10', '11']
+    return {
+        **{f'idx{n}': torch.cat(chunks) for n, chunks in zip(corner_names, all_idx_chunks)},
+        **{f'wt{n}': torch.cat(chunks) for n, chunks in zip(corner_names, all_wt_chunks)},
+    }
+
+
+def compute_rope_indices(grid_thw: torch.Tensor, rotary_emb: VisionRotaryEmbedding,
+                          merge_size: int = 2):
+    """Compute rotary position IDs and frequency table for NPU-side RoPE.
+
+    Returns dict with keys:
+        pid_row: (total_tokens,) int64 — row position IDs in block-major order
+        pid_col: (total_tokens,) int64 — col position IDs in block-major order
+        freq_table: (max_hw, dim) float32 — rotary frequency table
+    """
+    max_hw = int(grid_thw[:, 1:].max().item())
+    freq_table = rotary_emb(max_hw)  # (max_hw, dim)
+
+    row_chunks = []
+    col_chunks = []
+    for num_frames, height, width in grid_thw:
+        t_i, h_i, w_i = int(num_frames), int(height), int(width)
+        merged_h, merged_w = h_i // merge_size, w_i // merge_size
+
+        row_idx = torch.arange(h_i).view(merged_h, merge_size, 1, 1)
+        col_idx = torch.arange(w_i).view(1, 1, merged_w, merge_size)
+
+        row_grid = row_idx.expand(merged_h, merge_size, merged_w, merge_size)
+        col_grid = col_idx.expand(merged_h, merge_size, merged_w, merge_size)
+
+        row_flat = row_grid.permute(0, 2, 1, 3).reshape(-1).to(torch.int64)
+        col_flat = col_grid.permute(0, 2, 1, 3).reshape(-1).to(torch.int64)
+
+        if t_i > 1:
+            row_flat = row_flat.repeat(t_i)
+            col_flat = col_flat.repeat(t_i)
+
+        row_chunks.append(row_flat)
+        col_chunks.append(col_flat)
+
+    return {
+        'pid_row': torch.cat(row_chunks),
+        'pid_col': torch.cat(col_chunks),
+        'freq_table': freq_table,
+    }
