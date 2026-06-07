@@ -2,18 +2,8 @@
 #include "adapters/qwen3vl_embedding/qwen3vl_preprocess.h"
 #include "utils/float_utils.h"
 #include "safetensors.hh"
-#include "components/vision/vision_block_graph.h"
-#include "components/vision/vision_merger_graph.h"
-#include "components/vision/deepstack_graph.h"
-#include "components/vision/patch_embed_graph.h"
-#include "components/common/rms_norm_graph.h"
-#include "components/text/decoder_layer_graph.h"
-#include "runners/text_runner.h"
-#include "runners/vision_runner.h"
-#include "core/graph_builder.h"
 #include "core/tensor_allocator.h"
 #include "core/npu_tensor.h"
-#include "ops/elewise_op.h"
 #include "log/logger.h"
 #include <cstring>
 #include <cmath>
@@ -56,75 +46,35 @@ Status Qwen3VLModel::Load(const std::string& model_dir, IRuntime* runtime) {
     vis_rope_ = std::make_unique<components::VisionRotaryEmbedding>(
         config_.vis_head_dim());
 
-    // 4. Build ATB graphs
-    s = BuildGraphs();
+    // 4. Create VisionRunner and build vision graphs
+    runners::VisionRunner::Config vis_cfg;
+    vis_cfg.hidden_size = config_.vis_hidden_size;
+    vis_cfg.num_heads = config_.vis_num_heads;
+    vis_cfg.intermediate_size = config_.vis_intermediate_size;
+    vis_cfg.depth = config_.vis_depth;
+    vis_cfg.in_channels = config_.vis_in_channels;
+    vis_cfg.temporal_patch_size = config_.vis_temporal_patch_size;
+    vis_cfg.patch_size = config_.vis_patch_size;
+    vis_cfg.spatial_merge_size = config_.vis_spatial_merge_size;
+    vis_cfg.num_position_embeddings = config_.vis_num_position_embeddings;
+    vis_cfg.deepstack_visual_indexes = config_.vis_deepstack_visual_indexes;
+    vis_cfg.epsilon = config_.vis_epsilon;
+    vision_runner_ = std::make_unique<runners::VisionRunner>(vis_cfg);
+
+    s = vision_runner_->Build();
     if (s != STATUS_OK) {
-        LOG_ERROR("Failed to build ATB graphs");
+        LOG_ERROR("Failed to build VisionRunner graphs");
         return s;
     }
 
-    LOG_INFO("Qwen3VLModel loaded successfully");
-    return STATUS_OK;
-}
-
-Status Qwen3VLModel::BuildGraphs() {
-    int32_t vis_nh = config_.vis_num_heads;
-    int32_t vis_hd = config_.vis_head_dim();
-
-    // Vision graphs
-    Status s = runners::BuildVisionFirstLayer(
-        [&]() {
-            runners::VisionRunner::Config vc;
-            vc.hidden_size = config_.vis_hidden_size;
-            vc.num_heads = config_.vis_num_heads;
-            vc.intermediate_size = config_.vis_intermediate_size;
-            vc.depth = config_.vis_depth;
-            vc.in_channels = config_.vis_in_channels;
-            vc.temporal_patch_size = config_.vis_temporal_patch_size;
-            vc.patch_size = config_.vis_patch_size;
-            vc.spatial_merge_size = config_.vis_spatial_merge_size;
-            vc.num_position_embeddings = config_.vis_num_position_embeddings;
-            vc.deepstack_visual_indexes = config_.vis_deepstack_visual_indexes;
-            vc.epsilon = config_.vis_epsilon;
-            return vc;
-        }(),
-        vis_first_layer_graph_);
-    if (s != STATUS_OK) {
-        LOG_ERROR("Failed to build VisionFirstLayer graph");
-        return s;
-    }
-
-    s = components::VisionBlockGraph::Build(
-        "VisionBlock", vis_nh, vis_hd, config_.vis_epsilon, vis_block_graph_);
-    if (s != STATUS_OK) {
-        LOG_ERROR("Failed to build VisionBlock graph");
-        return s;
-    }
-
-    s = components::VisionMergerGraph::Build(
-        "VisionMerger", config_.vis_hidden_size, config_.vis_spatial_merge_size,
-        false, config_.vis_epsilon, vis_merger_graph_);
-    if (s != STATUS_OK) {
-        LOG_ERROR("Failed to build VisionMerger graph");
-        return s;
-    }
-
-    // Build deepstack merger graph and create DeepstackFusion component
-    OperationHandle deepstack_graph;
-    s = components::DeepstackGraph::Build(
-        "DeepstackMerger", config_.vis_hidden_size, config_.vis_spatial_merge_size,
-        config_.vis_epsilon, deepstack_graph);
-    if (s != STATUS_OK) {
-        LOG_ERROR("Failed to build DeepstackMerger graph");
-        return s;
-    }
-
+    // 5. Setup deepstack fusion using vision runner's deepstack graph
     components::DeepstackFusion::Config ds_cfg;
     ds_cfg.vis_hidden_size = config_.vis_hidden_size;
     ds_cfg.vis_out_hidden_size = config_.vis_out_hidden_size;
     ds_cfg.spatial_merge_size = config_.vis_spatial_merge_size;
     ds_cfg.deepstack_visual_indexes = config_.vis_deepstack_visual_indexes;
-    deepstack_fusion_ = std::make_unique<components::DeepstackFusion>(ds_cfg, std::move(deepstack_graph));
+    deepstack_fusion_ = std::make_unique<components::DeepstackFusion>(
+        ds_cfg, std::move(vision_runner_->GetDeepstackGraph()));
 
     // Set merger weights from loaded weights
     for (size_t i = 0; i < weights_.deepstack_mergers.size(); i++) {
@@ -139,36 +89,20 @@ Status Qwen3VLModel::BuildGraphs() {
         deepstack_fusion_->SetMergerWeights(i, ds_w);
     }
 
-    // Text norm graph
-    s = components::RmsNormGraph::Build(
-        "TextFinalNorm", config_.text_rms_norm_eps, text_norm_graph_);
-    if (s != STATUS_OK) {
-        LOG_ERROR("Failed to build TextFinalNorm graph");
-        return s;
-    }
+    // 6. Create TextRunner (graph built lazily on first Forward via EnsureBuilt)
+    runners::TextRunner::Config text_cfg;
+    text_cfg.num_heads = config_.text_num_heads;
+    text_cfg.num_kv_heads = config_.text_num_kv_heads;
+    text_cfg.head_dim = config_.text_head_dim;
+    text_cfg.intermediate_size = config_.text_intermediate_size;
+    text_cfg.num_layers = config_.text_num_layers;
+    text_cfg.epsilon = config_.text_rms_norm_eps;
+    text_cfg.use_qk_norm = true;
+    text_cfg.rotary_dim = 2;
+    text_cfg.use_mask = true;
+    text_runner_ = std::make_unique<runners::TextRunner>(text_cfg);
 
-    LOG_INFO("All ATB graphs built successfully");
-    return STATUS_OK;
-}
-
-Status Qwen3VLModel::EnsureTextGraph(int32_t seq_len) {
-    if (cached_text_seq_len_ == seq_len && text_decoder_graph_) {
-        return STATUS_OK;
-    }
-
-    Status s = components::text::TextDecoderLayerGraph::Build(
-        "TextDecoderLayer",
-        config_.text_num_heads, config_.text_num_kv_heads,
-        config_.text_head_dim, seq_len,
-        config_.text_rms_norm_eps, /*use_mask=*/true,
-        text_decoder_graph_);
-    if (s != STATUS_OK) {
-        LOG_ERROR("Failed to build TextDecoderLayer graph for seq_len=%d", seq_len);
-        return s;
-    }
-
-    cached_text_seq_len_ = seq_len;
-    LOG_INFO("TextDecoderLayer graph built for seq_len=%d", seq_len);
+    LOG_INFO("Qwen3VLModel loaded successfully");
     return STATUS_OK;
 }
 
@@ -332,7 +266,7 @@ Status Qwen3VLModel::RunTextDecoder(uint16_t* hidden_states, int32_t seq_len,
     seqlen.desc.shape.dims[0] = 1;
     seqlen.dataSize = sizeof(int32_t);
     seqlen.hostData = &sl;
-    Status s = EnsureTextGraph(seq_len);
+    Status s = text_runner_->EnsureBuilt(seq_len);
     if (s != STATUS_OK) return s;
     for (int32_t li = 0; li < config_.text_num_layers; li++) {
         const auto& lw = weights_.text_layers[li];
@@ -345,7 +279,7 @@ Status Qwen3VLModel::RunTextDecoder(uint16_t* hidden_states, int32_t seq_len,
                         lw.input_ln_weight, lw.post_ln_weight,
                         *cos_npu.Get(), *sin_npu.Get(), *mask_npu.Get(), seqlen};
         vp.outTensors = {*h_out.Get()};
-        s = ExecuteGraph(text_decoder_graph_, vp);
+        s = ExecuteGraph(text_runner_->GetLayerGraph(), vp);
         if (s != STATUS_OK) {
             LOG_ERROR("TextDecoderLayer %d failed", li);
             return s;
@@ -360,7 +294,7 @@ Status Qwen3VLModel::RunTextDecoder(uint16_t* hidden_states, int32_t seq_len,
     atb::VariantPack nvp;
     nvp.inTensors = {*h_npu.Get(), weights_.text_norm_weight};
     nvp.outTensors = {*norm_out.Get()};
-    s = ExecuteGraph(text_norm_graph_, nvp);
+    s = ExecuteGraph(text_runner_->GetNormGraph(), nvp);
     if (s != STATUS_OK) {
         LOG_ERROR("TextFinalNorm failed");
         return s;
@@ -452,7 +386,7 @@ Status Qwen3VLModel::RunVision(const uint16_t* pixel_values, int64_t num_patches
             bw.n1_weight, bw.n1_bias, bw.n2_weight, bw.n2_bias};
         vp.outTensors = {*h_npu.Get()};
 
-        Status s = ExecuteGraph(vis_first_layer_graph_, vp);
+        Status s = ExecuteGraph(vision_runner_->GetFirstLayerGraph(), vp);
         if (s != STATUS_OK) {
             LOG_ERROR("VisionFirstLayer execution failed");
             return s;
@@ -476,7 +410,7 @@ Status Qwen3VLModel::RunVision(const uint16_t* pixel_values, int64_t num_patches
             *cos_npu.Get(), *sin_npu.Get(), vis_seqlen};
         vp.outTensors = {*h_out.Get()};
 
-        Status s = ExecuteGraph(vis_block_graph_, vp);
+        Status s = ExecuteGraph(vision_runner_->GetBlockGraph(), vp);
         if (s != STATUS_OK) {
             LOG_ERROR("VisionBlock %d execution failed", li);
             return s;
@@ -511,7 +445,7 @@ Status Qwen3VLModel::RunVision(const uint16_t* pixel_values, int64_t num_patches
             mw.fc2_weight, mw.fc2_bias};
         vp.outTensors = {*merged_out.Get()};
 
-        Status s = ExecuteGraph(vis_merger_graph_, vp);
+        Status s = ExecuteGraph(vision_runner_->GetMergerGraph(), vp);
         if (s != STATUS_OK) {
             LOG_ERROR("VisionMerger execution failed");
             return s;

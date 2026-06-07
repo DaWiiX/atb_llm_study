@@ -8,6 +8,8 @@
 #include "core/npu_tensor.h"
 #include "components/common/mrope.h"
 #include "components/common/deepstack_fusion.h"
+#include "runners/text_runner.h"
+#include "runners/vision_runner.h"
 #include <cstdint>
 #include <memory>
 #include <vector>
@@ -26,9 +28,10 @@ namespace adapters {
 ///   6. FinalNorm (NPU)
 ///   7. Pooling (last non-padded token) + copy to host
 ///
-/// Split-graph strategy:
-///   - Vision: FirstLayer graph + Block graph (looped) + Merger graph + Deepstack graph
-///   - Text: DecoderLayer graph (looped 28x) + FinalNorm graph
+/// Split-graph strategy (delegated to Runners):
+///   - Vision: VisionRunner owns FirstLayer + Block + Merger + Deepstack graphs
+///   - Text: TextRunner owns DecoderLayer + FinalNorm graphs
+///   - This adapter only orchestrates execution and cross-modal fusion
 class Qwen3VLModel : public families::BaseModel {
 public:
     Qwen3VLModel();
@@ -49,25 +52,16 @@ private:
     Qwen3VLConfig config_;
     Qwen3VLWeights weights_;
 
-    // ── ATB graphs ────────────────────────────────────────
-    OperationHandle vis_first_layer_graph_;
-    OperationHandle vis_block_graph_;
-    OperationHandle vis_merger_graph_;
-    OperationHandle text_decoder_graph_;
-    OperationHandle text_norm_graph_;
+    // ── Runners (own ATB graphs) ──────────────────────────
+    std::unique_ptr<runners::TextRunner> text_runner_;
+    std::unique_ptr<runners::VisionRunner> vision_runner_;
 
     // ── Cross-modal fusion ────────────────────────────────
     std::unique_ptr<components::DeepstackFusion> deepstack_fusion_;
 
-    int32_t cached_text_seq_len_ = 0;
-
     // ── Position encoding helpers ─────────────────────────
     std::unique_ptr<components::MRoPE> mrope_;
     std::unique_ptr<components::VisionRotaryEmbedding> vis_rope_;
-
-    // ── Graph building ────────────────────────────────────
-    Status BuildGraphs();
-    Status EnsureTextGraph(int32_t seq_len);
 
     // ── Vision pipeline ───────────────────────────────────
     Status RunVision(const uint16_t* pixel_values, int64_t num_patches,
