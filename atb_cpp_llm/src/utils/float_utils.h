@@ -23,37 +23,18 @@ inline uint16_t Fp32ToFp16(float val) {
     return static_cast<uint16_t>(aclFloatToFloat16(val));
 }
 
-/// Convert bf16 (uint16 raw bits) to float16 (uint16 raw bits) via bit manipulation.
-/// bf16: 1 sign + 8 exp + 7 mantissa (stored in upper 16 bits of float32)
-/// fp16: 1 sign + 5 exp + 10 mantissa
+/// Convert bf16 (uint16 raw bits) to float16 (uint16 raw bits).
+/// Uses bf16 → fp32 → fp16 path via CANN APIs, which applies
+/// round-to-nearest-even matching Python's bf16→f32→f16 behavior.
+/// The old bit-manipulation path truncated mantissa bits (zeroing
+/// the low 3 fp16 mantissa bits), causing systematic rounding bias.
 inline uint16_t Bf16ToFp16(uint16_t bf16_bits) {
+    // Reconstruct fp32 from bf16 (bf16 is upper 16 bits of fp32)
     uint32_t f32_bits = static_cast<uint32_t>(bf16_bits) << 16;
-    uint32_t sign = (f32_bits >> 16) & 0x8000;
-    int32_t exp = static_cast<int32_t>((f32_bits >> 23) & 0xFF) - 127;
-
-    if (exp == 128) {
-        // Inf or NaN -> clamp to fp16 inf
-        return static_cast<uint16_t>(sign | 0x7C00);
-    }
-    if (exp < -24) {
-        // Too small for fp16 denormals -> zero
-        return static_cast<uint16_t>(sign);
-    }
-    if (exp < -14) {
-        // fp16 denormal range
-        uint32_t mantissa = (f32_bits & 0x7FFFFF) | 0x800000;
-        int32_t shift = -14 - exp;
-        mantissa >>= (shift + 13);
-        return static_cast<uint16_t>(sign | mantissa);
-    }
-    if (exp > 15) {
-        // Overflow -> fp16 max
-        return static_cast<uint16_t>(sign | 0x7C00);
-    }
-    // Normal fp16
-    uint16_t fp16_exp = static_cast<uint16_t>(exp + 15);
-    uint16_t fp16_mantissa = static_cast<uint16_t>((f32_bits >> 13) & 0x3FF);
-    return static_cast<uint16_t>(sign | (fp16_exp << 10) | fp16_mantissa);
+    float f32_value;
+    std::memcpy(&f32_value, &f32_bits, sizeof(float));
+    // Convert fp32 → fp16 using CANN round-to-nearest-even
+    return Fp32ToFp16(f32_value);
 }
 
 /// Convert bf16 buffer to fp16 buffer (element-wise).

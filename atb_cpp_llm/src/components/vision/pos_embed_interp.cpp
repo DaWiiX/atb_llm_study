@@ -70,10 +70,8 @@ void ComputePosEmbedInterp(const uint16_t* pos_embed_src,
                         const float* src = interpolated.data() + (row * w + col) * vis_hs;
                         uint16_t* dst = pos_out + (out_offset + patch_idx) * vis_hs;
                         for (int64_t d = 0; d < vis_hs; d++) {
-                            // Match original: float -> bf16 truncation -> fp16
-                            dst[d] = atb_llm::Bf16ToFp16(
-                                static_cast<uint16_t>(
-                                    atb_llm::FloatToUint32(src[d]) >> 16));
+                            // float32 -> fp16 (round-to-nearest-even, matches Python)
+                            dst[d] = atb_llm::Fp32ToFp16(src[d]);
                         }
                         patch_idx++;
                     }

@@ -142,13 +142,11 @@ Status LoadQwen3VLWeights(const std::string& model_dir,
         } else if (st_dtype == safetensors::kFLOAT16) {
             std::memcpy(weights.embed_weight_host.data(), emb_data, host_bytes);
         } else if (st_dtype == safetensors::kFLOAT32) {
-            // Convert fp32 -> fp16
+            // Convert fp32 -> fp16 (round-to-nearest-even, matches Python)
             const float* f32 = reinterpret_cast<const float*>(emb_data);
             uint16_t* dst16 = weights.embed_weight_host.data();
             for (size_t i = 0; i < num_elements; i++) {
-                uint32_t bits;
-                std::memcpy(&bits, &f32[i], sizeof(uint32_t));
-                dst16[i] = atb_llm::Bf16ToFp16(static_cast<uint16_t>(bits >> 16));
+                dst16[i] = atb_llm::Fp32ToFp16(f32[i]);
             }
         }
         LOG_INFO("Embedding weight loaded to host: vocab=%ld, hs=%ld",

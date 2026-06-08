@@ -53,15 +53,11 @@ Status CopyWeightToFp16NPU(WeightLoader& loader,
         return alloc.CopyToDevice(dst, fp16_buf.data(), num_elements * sizeof(uint16_t));
 
     } else if (st_dtype == safetensors::kFLOAT32) {
-        // Convert fp32 -> fp16
+        // Convert fp32 -> fp16 directly (round-to-nearest-even, matches Python)
         const float* f32_ptr = reinterpret_cast<const float*>(data);
         std::vector<uint16_t> fp16_buf(num_elements);
         for (size_t i = 0; i < num_elements; i++) {
-            // Simple fp32 -> fp16 via bf16 intermediate
-            uint32_t f32_bits;
-            std::memcpy(&f32_bits, &f32_ptr[i], sizeof(uint32_t));
-            uint16_t bf16 = static_cast<uint16_t>(f32_bits >> 16);
-            fp16_buf[i] = atb_llm::Bf16ToFp16(bf16);
+            fp16_buf[i] = atb_llm::Fp32ToFp16(f32_ptr[i]);
         }
         s = alloc.AllocFloat16(dst, shape);
         if (s != STATUS_OK) return s;
@@ -116,10 +112,7 @@ Status CopyWeightToFp16Host(WeightLoader& loader,
         const float* f32_ptr = reinterpret_cast<const float*>(data);
         uint16_t* dst16 = reinterpret_cast<uint16_t*>(host_dst);
         for (size_t i = 0; i < num_elements; i++) {
-            uint32_t f32_bits;
-            std::memcpy(&f32_bits, &f32_ptr[i], sizeof(uint32_t));
-            uint16_t bf16 = static_cast<uint16_t>(f32_bits >> 16);
-            dst16[i] = atb_llm::Bf16ToFp16(bf16);
+            dst16[i] = atb_llm::Fp32ToFp16(f32_ptr[i]);
         }
     } else {
         LOG_ERROR("Unsupported dtype for host copy %s: %d", key.c_str(), info.dtype);
