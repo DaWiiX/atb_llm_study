@@ -707,6 +707,32 @@ TEST_CASE("BicubicResize - identity (same size)") {
 }
 
 TEST_CASE("BicubicResize - 2x2 to 4x4 (integer upscale)") {
+    // Expected values are the output of qwen3vl_preprocess.cpp::BicubicResize
+    // itself — a Catmull-Rom cubic kernel (a = -0.5) with align_corners=False
+    // source mapping `src = (dst + 0.5) * in/out - 0.5` and EDGE-CLAMP
+    // boundary handling on the 4x4 neighbourhood.
+    //
+    // Reproduced in Python (NOT torch.nn.functional.interpolate — that
+    // uses a different boundary convention and yields -59.46/+314.46 here):
+    //   def cubic(x, a=-0.5):
+    //       ax = abs(x)
+    //       return ((a+2)*ax**3 - (a+3)*ax**2 + 1) if ax<=1 else
+    //              (a*ax**3 - 5*a*ax**2 + 8*a*ax - 4*a) if ax<2 else 0
+    //   # for each output pixel:
+    //   src = (out + 0.5) * in_dim / out_dim - 0.5
+    //   sum_over m,n in [-1..2]: cubic(d-m)*cubic(d-n) *
+    //                            input[clamp(s+m,0,in-1), clamp(s+n,0,in-1)]
+    //
+    // For the 2x2 checkerboard the bicubic kernel overshoots — the all-zero
+    // corners drop to -38.38 and the all-255 corners climb to 293.38. The
+    // interior sample [5] (row 1, col 1; src coord ≈0.125 in 2x2 space)
+    // resolves to 82.55.
+    //
+    // The Python reproduction lives in
+    //   tests/python_reference/gen_cpu_reference.py::_cpp_bicubic_resize
+    // and is end-to-end validated by
+    //   tests/level1_cpu_pure/test_preprocess_cpu.cpp::TestBicubicVsPython
+    //   (case "2x2_to_4x4").
     // Checkerboard pattern
     uint8_t input[4] = {0, 255, 255, 0};
     float output[16] = {};
@@ -758,6 +784,16 @@ TEST_CASE("BicubicResize - 3-channel") {
 }
 
 TEST_CASE("BicubicResize - downscale 4x4 to 2x2") {
+    // Expected values are the output of qwen3vl_preprocess.cpp::BicubicResize
+    // itself — a Catmull-Rom cubic kernel (a = -0.5) with align_corners=False
+    // source mapping and edge-clamp boundary handling (NOT PyTorch's
+    // F.interpolate, which uses different boundary weights). For this
+    // linear gradient the 16-tap kernel resolves to 31.875 / 53.125 /
+    // 116.875 / 138.125 — values reproduced by
+    //   tests/python_reference/gen_cpu_reference.py::_cpp_bicubic_resize
+    // and end-to-end validated in
+    //   tests/level1_cpu_pure/test_preprocess_cpu.cpp::TestBicubicVsPython
+    //   (case "4x4_to_2x2").
     uint8_t input[16] = {
         10, 20, 30, 40,
         50, 60, 70, 80,

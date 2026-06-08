@@ -15,6 +15,8 @@ Output files (in /tmp/):
     cpu_mrope_cos_sin.bin          — MRoPE::Compute: cos/sin for position_ids [3, 1, 8]
     cpu_vision_rope_cos_sin.bin    — VisionRotaryEmbedding: cos/sin for grid [1, 4, 6]
     cpu_smart_resize.bin           — SmartResize: height, width pairs (in/out)
+    bicubic_*_input/output.bin     — BicubicResize: C++-kernel-equivalent reference
+    preprocess_*_input/output/grid — PreprocessImage: Python end-to-end pipeline ref
 """
 
 import os
@@ -260,6 +262,18 @@ def gen_vision_rope():
     write_f32(f"{OUTPUT_DIR}/cpu_vision_freq_table.bin", freq_table.numpy())
     print(f"  → {OUTPUT_DIR}/cpu_vision_freq_table.bin  shape={freq_table.shape}")
 
+    # ── Multi-image reference: two images concatenated ─────────────
+    # grid_thw [[1,4,4], [1,6,6]] → tokens = 16 + 36 = 52
+    grid_multi = torch.tensor([[1, 4, 4], [1, 6, 6]], dtype=torch.long)
+    rope_multi = compute_rot_pos_emb(grid_multi, vis_rope, merge_size)
+    emb_multi = torch.cat((rope_multi, rope_multi), dim=-1)
+    cos_multi = emb_multi.cos()
+    sin_multi = emb_multi.sin()
+    write_f32(f"{OUTPUT_DIR}/cpu_vision_rope_multi_cos.bin", cos_multi.numpy())
+    write_f32(f"{OUTPUT_DIR}/cpu_vision_rope_multi_sin.bin", sin_multi.numpy())
+    print(f"  → {OUTPUT_DIR}/cpu_vision_rope_multi_cos.bin  shape={cos_multi.shape}")
+    print(f"  → {OUTPUT_DIR}/cpu_vision_rope_multi_sin.bin  shape={sin_multi.shape}")
+
 
 # ═══════════════════════════════════════════════════════════════════
 # Stage: ComputePosEmbedInterp — position embeddings
@@ -379,6 +393,173 @@ def gen_smart_resize():
 
     write_i32s(f"{OUTPUT_DIR}/cpu_smart_resize.bin", results)
     print(f"  → {OUTPUT_DIR}/cpu_smart_resize.bin  {len(cases)} cases")
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Stage: BicubicResize + PreprocessImage — end-to-end pipeline reference
+#
+# BicubicResize ref: we reproduce the C++ algorithm in Python (Catmull-Rom
+# a=-0.5 cubic kernel with **edge-clamp boundary handling**) — NOT
+# `F.interpolate(mode='bicubic')`. The PyTorch implementation uses
+# different boundary handling (effectively reflective/extended kernel
+# weights at edges) and produces noticeably different values for small
+# images (e.g. corner of a 2x2→4x4 checkerboard is -59.46 in PyTorch vs
+# -38.38 with edge-clamping). The C++ code intentionally uses edge-clamp
+# because that's the common OpenCV/standard CV implementation and is
+# numerically stable. This Python reference therefore validates the C++
+# kernel against itself (regression test), not against PyTorch. The C++
+# kernel matches PIL's CATMULL-ROM-style algorithm at interior pixels
+# but they differ at boundaries too — there is no "canonical" bicubic.
+#
+# PreprocessImage ref uses the in-repo `preprocess.preprocess_image`
+# (which calls `F.interpolate(mode='bicubic', align_corners=False)` and
+# then normalizes with mean=std=0.5). Because the bicubic boundary
+# handling differs between C++ (edge-clamp) and PyTorch (extended
+# kernel), the C++ output will not match Python bit-for-bit — but on
+# natural images the difference is concentrated in a thin border, so
+# cosine similarity ≥ 0.999 still passes. If a tighter bar is needed
+# in future, swap `preprocess_image` to use an edge-clamp bicubic
+# implementation on both sides.
+# ═══════════════════════════════════════════════════════════════════
+
+
+def _cpp_bicubic_resize(arr_chw: np.ndarray, out_h: int, out_w: int) -> np.ndarray:
+    """Pure-numpy reproduction of qwen3vl_preprocess.cpp::BicubicResize.
+
+    Catmull-Rom kernel a=-0.5 + align_corners=False source mapping
+    + edge-clamp on neighbour indices. Returns fp32 array shaped
+    (C, out_h, out_w).
+    """
+    def cubic(x, a=-0.5):
+        ax = np.abs(x)
+        w = np.where(ax <= 1,
+                     (a + 2) * ax**3 - (a + 3) * ax**2 + 1,
+                     np.where(ax < 2,
+                              a * ax**3 - 5 * a * ax**2 + 8 * a * ax - 4 * a,
+                              0.0))
+        return w
+
+    c, in_h, in_w = arr_chw.shape
+    out = np.zeros((c, out_h, out_w), dtype=np.float32)
+    for ch in range(c):
+        for oh in range(out_h):
+            src_h = (oh + 0.5) * in_h / out_h - 0.5
+            sh = int(np.floor(src_h))
+            dh = src_h - sh
+            for ow in range(out_w):
+                src_w = (ow + 0.5) * in_w / out_w - 0.5
+                sw = int(np.floor(src_w))
+                dw = src_w - sw
+                s = 0.0
+                for m in range(-1, 3):
+                    wh = cubic(dh - m)
+                    ih = max(0, min(in_h - 1, sh + m))
+                    for n in range(-1, 3):
+                        ww = cubic(dw - n)
+                        iw = max(0, min(in_w - 1, sw + n))
+                        s += arr_chw[ch, ih, iw] * wh * ww
+                out[ch, oh, ow] = s
+    return out
+
+
+def _gen_bicubic_case(name: str, input_np: np.ndarray, out_h: int, out_w: int):
+    """Run the C++-equivalent bicubic on `input_np` (C,H,W float32) and
+    dump input + output as f32 bins. The reference exactly mirrors the
+    C++ algorithm (Catmull-Rom a=-0.5 + edge clamp), so the C++ test
+    validates the implementation against a Python-side reproduction.
+    """
+    assert input_np.dtype == np.float32 and input_np.ndim == 3
+    y_np = _cpp_bicubic_resize(input_np, out_h, out_w).astype(np.float32)
+    write_f32(f"{OUTPUT_DIR}/bicubic_{name}_input.bin", input_np)
+    write_f32(f"{OUTPUT_DIR}/bicubic_{name}_output.bin", y_np)
+    print(f"  → bicubic_{name}: in{input_np.shape} -> out{y_np.shape}")
+
+
+def gen_bicubic_preprocess():
+    """Generate BicubicResize + PreprocessImage reference data.
+
+    BicubicResize cases (reference = Python reproduction of the C++
+    Catmull-Rom-with-edge-clamp kernel):
+      * "2x2_to_4x4"             — single-channel checkerboard upscale.
+      * "4x4_to_2x2"             — single-channel gradient downscale.
+      * "random_8x8_to_16x16_3ch" — 3-channel random RGB upscale.
+
+    PreprocessImage cases (end-to-end against Python `preprocess_image`,
+    which uses PyTorch's bicubic — boundary handling differs from C++
+    so the C++ output is compared via cosine similarity ≥ 0.999 rather
+    than bitwise equality):
+      * "gradient_64x64"  — per-channel gradient RGB (R horizontal,
+                            G vertical, B diagonal).
+      * "random_96x96"    — fixed-seed random RGB.
+    """
+    print("[gen] BicubicResize + PreprocessImage — pipeline reference")
+
+    # ── BicubicResize cases (matching test_io_adapters magic numbers) ──
+    # Case 1: 2x2 checkerboard -> 4x4 (matches the values in
+    # test_io_adapters.cpp::"BicubicResize - 2x2 to 4x4": -38.3807, 293.3807,
+    # 82.5513).
+    cb = np.array([[0., 255.],
+                   [255.,   0.]], dtype=np.float32).reshape(1, 2, 2)
+    _gen_bicubic_case("2x2_to_4x4", cb, 4, 4)
+
+    # Case 2: 4x4 gradient 10..160 step 10 -> 2x2 (matches values in
+    # test_io_adapters.cpp::"BicubicResize - downscale 4x4 to 2x2":
+    # 31.875 / 53.125 / 116.875 / 138.125).
+    grad = np.arange(10.0, 170.0, 10.0,
+                     dtype=np.float32).reshape(1, 4, 4)
+    _gen_bicubic_case("4x4_to_2x2", grad, 2, 2)
+
+    # Case 3: fixed-seed random 3ch 8x8 -> 16x16 (general stress case)
+    np.random.seed(42)
+    rand_rgb = (np.random.rand(3, 8, 8) * 255.0).astype(np.float32)
+    _gen_bicubic_case("random_8x8_to_16x16_3ch", rand_rgb, 16, 16)
+
+    # ── PreprocessImage cases ───────────────────────────────────
+    # Load the in-repo Python reference (matches engine.preprocess_image).
+    from preprocess import preprocess_image
+
+    def _gen_preprocess_case(name: str, image_u8: np.ndarray):
+        """image_u8: (C, H, W) uint8."""
+        assert image_u8.dtype == np.uint8 and image_u8.ndim == 3
+        c, h, w = image_u8.shape
+        pixel_values, grid_thw = preprocess_image(
+            torch.from_numpy(image_u8),
+            patch_size=16,
+            temporal_patch_size=2,
+            merge_size=2,
+            min_pixels=4096,
+            max_pixels=1310720,
+        )
+        # Python returns float32; round-trip through fp16 to match what
+        # the C++ pipeline writes (which calls Fp32ToFp16 per patch).
+        pv_np = pixel_values.numpy().astype(np.float32)
+        pv_fp16 = pv_np.astype(np.float16)
+        write_f32(f"{OUTPUT_DIR}/preprocess_{name}_input.bin",
+                  image_u8.astype(np.float32))
+        write_fp16(f"{OUTPUT_DIR}/preprocess_{name}_output.bin", pv_fp16)
+        write_i64(f"{OUTPUT_DIR}/preprocess_{name}_grid.bin",
+                  grid_thw.numpy())
+        print(f"  → preprocess_{name}: in({c},{h},{w}) "
+              f"-> pv{tuple(pv_fp16.shape)} grid={grid_thw.tolist()}")
+
+    # Case A: 64x64 gradient RGB (R: 0..255 horizontal,
+    #                             G: 0..255 vertical,
+    #                             B: diagonal)
+    H, W = 64, 64
+    r = np.tile(np.linspace(0, 255, W, dtype=np.float32), (H, 1))
+    g = np.tile(np.linspace(0, 255, H, dtype=np.float32).reshape(H, 1), (1, W))
+    b = np.zeros((H, W), dtype=np.float32)
+    for i in range(H):
+        for j in range(W):
+            d = abs(i - j) / max(H, W) * 255.0
+            b[i, j] = 255.0 - d
+    grad_rgb = np.stack([r, g, b], axis=0).clip(0, 255).astype(np.uint8)
+    _gen_preprocess_case("gradient_64x64", grad_rgb)
+
+    # Case B: 96x96 fixed-seed random RGB
+    np.random.seed(123)
+    rand_img = (np.random.rand(3, 96, 96) * 255.0).astype(np.uint8)
+    _gen_preprocess_case("random_96x96", rand_img)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -1566,6 +1747,7 @@ STAGES = {
     "vision_rope":         gen_vision_rope,
     "pos_embed":           gen_pos_embed_interp,
     "smart_resize":        gen_smart_resize,
+    "bicubic_preprocess":  gen_bicubic_preprocess,
     "float_utils":         gen_float_utils,
     "op_rms_norm":         gen_rms_norm,
     "op_layer_norm":       gen_layer_norm,

@@ -244,7 +244,7 @@ static bool TestVisionRoPEMultiImage() {
     int32_t dim = 32;
     atb_llm::components::VisionRotaryEmbedding rotary(dim);
 
-    // Two small images
+    // Two small images: [[1,4,4], [1,6,6]]
     int64_t grid_thw[] = {1, 4, 4, 1, 6, 6};
     int64_t num_images = 2;
     int32_t merge_size = 2;
@@ -266,49 +266,157 @@ static bool TestVisionRoPEMultiImage() {
 
     LOG_INFO("  Total tokens: %ld (expected %ld)", num, expected_tokens);
 
-    // Verify all cos/sin values are in [-1, 1]
-    bool valid = true;
+    bool all_ok = true;
+
+    // Check 1: token count
+    if (num != expected_tokens) {
+        LOG_ERROR("  [FAIL] token_count=%ld (expected %ld)", num, expected_tokens);
+        all_ok = false;
+    }
+
+    // Check 2: sanity — cos/sin in [-1, 1] (trivial but guards NaN/inf)
     for (int64_t i = 0; i < num * out_dim; i++) {
-        if (cos_out[i] < -1.0f || cos_out[i] > 1.0f) {
-            valid = false;
-            break;
-        }
-        if (sin_out[i] < -1.0f || sin_out[i] > 1.0f) {
-            valid = false;
+        if (std::isnan(cos_out[i]) || std::isnan(sin_out[i]) ||
+            cos_out[i] < -1.0001f || cos_out[i] > 1.0001f ||
+            sin_out[i] < -1.0001f || sin_out[i] > 1.0001f) {
+            LOG_ERROR("  [FAIL] cos/sin out of range at i=%ld: cos=%.8f sin=%.8f",
+                     i, cos_out[i], sin_out[i]);
+            all_ok = false;
             break;
         }
     }
 
-    if (num == expected_tokens && valid) {
-        LOG_INFO("  [PASS] Multi-image RoPE: correct token count, values in range");
-        return true;
-    } else {
-        LOG_ERROR("  [FAIL] token_count=%ld (expected %ld), valid=%d",
-                 num, expected_tokens, valid);
-        return false;
+    // Check 3: consistency — per-image RoPE computed independently must match
+    //           the slice of the multi-image concatenated output.
+    // Image 1: grid [1,4,4], tokens=16
+    {
+        int64_t grid1[] = {1, 4, 4};
+        int32_t max_hw1 = 4;
+        auto ft1 = rotary.ComputeFreqTable(max_hw1);
+        int64_t tokens1 = 16;
+        std::vector<float> cos1(tokens1 * out_dim), sin1(tokens1 * out_dim);
+        int64_t n1 = atb_llm::components::ComputeVisionRotPosEmb(
+            grid1, 1, rotary, merge_size, ft1, cos1.data(), sin1.data());
+
+        if (n1 != tokens1) {
+            LOG_ERROR("  [FAIL] image1 tokens=%ld (expected %ld)", n1, tokens1);
+            all_ok = false;
+        } else {
+            // Compare cos1/sin1 against first tokens1 rows of multi-image output.
+            // But freq_table differs: multi uses max_hw=6, single uses max_hw=4.
+            // The freq_table row for position p only uses freq_table[p], so as long
+            // as p < max_hw1, the values are identical regardless of max_hw.
+            float max_d_cos = MaxAbsDiff(cos1.data(), cos_out.data(), tokens1 * out_dim);
+            float max_d_sin = MaxAbsDiff(sin1.data(), sin_out.data(), tokens1 * out_dim);
+            if (max_d_cos > 1e-6f || max_d_sin > 1e-6f) {
+                LOG_ERROR("  [FAIL] image1 consistency: max_d_cos=%.8f max_d_sin=%.8f",
+                         max_d_cos, max_d_sin);
+                all_ok = false;
+            } else {
+                LOG_INFO("  [PASS] image1 consistency: max_d_cos=%.8f max_d_sin=%.8f",
+                         max_d_cos, max_d_sin);
+            }
+        }
     }
+
+    // Image 2: grid [1,6,6], tokens=36
+    {
+        int64_t grid2[] = {1, 6, 6};
+        int32_t max_hw2 = 6;
+        auto ft2 = rotary.ComputeFreqTable(max_hw2);
+        int64_t tokens2 = 36;
+        std::vector<float> cos2(tokens2 * out_dim), sin2(tokens2 * out_dim);
+        int64_t n2 = atb_llm::components::ComputeVisionRotPosEmb(
+            grid2, 1, rotary, merge_size, ft2, cos2.data(), sin2.data());
+
+        if (n2 != tokens2) {
+            LOG_ERROR("  [FAIL] image2 tokens=%ld (expected %ld)", n2, tokens2);
+            all_ok = false;
+        } else {
+            float max_d_cos = MaxAbsDiff(cos2.data(), cos_out.data() + 16 * out_dim,
+                                         tokens2 * out_dim);
+            float max_d_sin = MaxAbsDiff(sin2.data(), sin_out.data() + 16 * out_dim,
+                                         tokens2 * out_dim);
+            if (max_d_cos > 1e-6f || max_d_sin > 1e-6f) {
+                LOG_ERROR("  [FAIL] image2 consistency: max_d_cos=%.8f max_d_sin=%.8f",
+                         max_d_cos, max_d_sin);
+                all_ok = false;
+            } else {
+                LOG_INFO("  [PASS] image2 consistency: max_d_cos=%.8f max_d_sin=%.8f",
+                         max_d_cos, max_d_sin);
+            }
+        }
+    }
+
+    // Check 4: Python reference comparison (cosine similarity >= 0.9999)
+    LoadedArrayF32 ref_cos, ref_sin;
+    if (ref_cos.Load("/tmp/cpu_vision_rope_multi_cos.bin") &&
+        ref_sin.Load("/tmp/cpu_vision_rope_multi_sin.bin")) {
+        int64_t cmp_n = std::min(static_cast<int64_t>(cos_out.size()),
+                                 static_cast<int64_t>(ref_cos.data.size()));
+        float cos_cs = CosineSim(cos_out.data(), ref_cos.data.data(), cmp_n);
+        float sin_cs = CosineSim(sin_out.data(), ref_sin.data.data(), cmp_n);
+        float cos_maxd = MaxAbsDiff(cos_out.data(), ref_cos.data.data(), cmp_n);
+        float sin_maxd = MaxAbsDiff(sin_out.data(), ref_sin.data.data(), cmp_n);
+
+        LOG_INFO("  Python ref: cos_cosine=%.6f sin_cosine=%.6f", cos_cs, sin_cs);
+        LOG_INFO("  Python ref: cos_maxdiff=%.8f sin_maxdiff=%.8f", cos_maxd, sin_maxd);
+
+        if (cos_cs < 0.9999f || sin_cs < 0.9999f) {
+            LOG_ERROR("  [FAIL] Python ref cosine below 0.9999");
+            all_ok = false;
+        } else {
+            LOG_INFO("  [PASS] Python ref cosine >= 0.9999");
+        }
+    } else {
+        LOG_ERROR("  [SKIP] Python ref not found (run: python tests/gen_cpu_reference.py --stage vision_rope)");
+        all_ok = false;
+    }
+
+    if (all_ok) {
+        LOG_INFO("  [PASS] Multi-image RoPE: all checks passed");
+    }
+    return all_ok;
 }
 
 // ═══════════════════════════════════════════════════════════════
-// Test 4: VisionRotaryEmbedding — empty grid
+// Test 4: VisionRotaryEmbedding — edge cases
 // ═══════════════════════════════════════════════════════════════
 static bool TestVisionRoPEEdgeCases() {
     LOG_INFO("\n=== Test 4: VisionRotaryEmbedding — edge cases ===");
 
-    int32_t dim = 32;
-    atb_llm::components::VisionRotaryEmbedding rotary(dim);
+    bool all_ok = true;
 
-    // Case A: freq table for max_hw=1 (should have 1 * dim/2 elements)
+    // Case A: freq table for max_hw=1 — all positions are 0, so freqs are 0
     {
+        int32_t dim = 32;
+        atb_llm::components::VisionRotaryEmbedding rotary(dim);
         auto ft = rotary.ComputeFreqTable(1);
-        int32_t expected_cols = dim / 2;
-        bool ok = (static_cast<int32_t>(ft.size()) == 1 * expected_cols);
-        LOG_INFO("  [%s] max_hw=1: %zu elements (expected %d)",
-                 ok ? "PASS" : "FAIL", ft.size(), expected_cols);
+        int32_t half = dim / 2;
+        int32_t expected_size = 1 * half;
+        if (static_cast<int32_t>(ft.size()) != expected_size) {
+            LOG_ERROR("  [FAIL] Case A: max_hw=1 freq_table size=%zu (expected %d)",
+                     ft.size(), expected_size);
+            all_ok = false;
+        } else {
+            // At position 0, all freq values = 0 * inv_freq[i] = 0
+            bool all_zero = true;
+            for (int32_t i = 0; i < half; i++) {
+                if (std::fabs(ft[i]) > 1e-7f) { all_zero = false; break; }
+            }
+            if (!all_zero) {
+                LOG_ERROR("  [FAIL] Case A: max_hw=1 freq_table[0,*] not all zero");
+                all_ok = false;
+            } else {
+                LOG_INFO("  [PASS] Case A: max_hw=1 freq_table size and zeros correct");
+            }
+        }
     }
 
-    // Case B: single token (grid [1, 1, 1], merge=1)
+    // Case B: single token (grid [1, 1, 1], merge=1) — position (0,0), cos=1, sin=0
     {
+        int32_t dim = 32;
+        atb_llm::components::VisionRotaryEmbedding rotary(dim);
         int64_t grid_thw[] = {1, 1, 1};
         auto ft = rotary.ComputeFreqTable(1);
         int32_t half = dim / 2;
@@ -316,12 +424,118 @@ static bool TestVisionRoPEEdgeCases() {
         std::vector<float> cos_out(1 * out_dim), sin_out(1 * out_dim);
         int64_t num = atb_llm::components::ComputeVisionRotPosEmb(
             grid_thw, 1, rotary, 1, ft, cos_out.data(), sin_out.data());
-        bool ok = (num == 1);
-        LOG_INFO("  [%s] single token: num=%ld, cos[0]=%.6f sin[0]=%.6f",
-                 ok ? "PASS" : "FAIL", num, cos_out[0], sin_out[0]);
+        if (num != 1) {
+            LOG_ERROR("  [FAIL] Case B: single token num=%ld (expected 1)", num);
+            all_ok = false;
+        } else {
+            // At position (0,0): freq=0 for both row and col, so cos(0)=1, sin(0)=0
+            float max_cos_diff = 0, max_sin_val = 0;
+            for (int32_t i = 0; i < out_dim; i++) {
+                float cd = std::fabs(cos_out[i] - 1.0f);
+                if (cd > max_cos_diff) max_cos_diff = cd;
+                float sv = std::fabs(sin_out[i]);
+                if (sv > max_sin_val) max_sin_val = sv;
+            }
+            if (max_cos_diff > 1e-6f || max_sin_val > 1e-6f) {
+                LOG_ERROR("  [FAIL] Case B: single token cos偏离1=%.8f or sin偏离0=%.8f",
+                         max_cos_diff, max_sin_val);
+                all_ok = false;
+            } else {
+                LOG_INFO("  [PASS] Case B: single token cos=1, sin=0 (max_cos_diff=%.8f, max_sin=%.8f)",
+                         max_cos_diff, max_sin_val);
+            }
+        }
     }
 
-    return true;
+    // Case C: freq table first element = inv_freq[0] = 1/10000^0 = 1.0 at position 1
+    //         freq_table[1,0] = 1 * inv_freq[0] = 1.0
+    {
+        int32_t dim = 32;
+        atb_llm::components::VisionRotaryEmbedding rotary(dim);
+        auto ft = rotary.ComputeFreqTable(4);
+        int32_t half = dim / 2;
+        // Row 0: all zeros (position 0). Row 1: inv_freq values.
+        // inv_freq[0] = 1/10000^(0/dim) = 1.0
+        // inv_freq[1] = 1/10000^(2/dim) = 1/10000^(2/32) = 1/10000^0.0625
+        float ft_1_0 = ft[1 * half + 0];
+        float expected_inv_freq_0 = 1.0f;
+        if (std::fabs(ft_1_0 - expected_inv_freq_0) > 1e-6f) {
+            LOG_ERROR("  [FAIL] Case C: freq_table[1,0]=%.8f (expected %.8f)",
+                     ft_1_0, expected_inv_freq_0);
+            all_ok = false;
+        } else {
+            LOG_INFO("  [PASS] Case C: freq_table[1,0]=%.8f (correct)", ft_1_0);
+        }
+    }
+
+    // Case D: different dim values (16, 64, 128) — verify shape and inv_freq[0]
+    {
+        int32_t dims[] = {16, 64, 128};
+        for (int d = 0; d < 3; d++) {
+            int32_t test_dim = dims[d];
+            atb_llm::components::VisionRotaryEmbedding rotary(test_dim);
+            int32_t half = test_dim / 2;
+            int32_t max_hw = 3;
+            auto ft = rotary.ComputeFreqTable(max_hw);
+            int64_t expected_size = static_cast<int64_t>(max_hw) * half;
+
+            bool shape_ok = (static_cast<int64_t>(ft.size()) == expected_size);
+            bool first_row_zero = true;
+            for (int32_t i = 0; i < half; i++) {
+                if (std::fabs(ft[i]) > 1e-7f) { first_row_zero = false; break; }
+            }
+            // Row 1, col 0 should = inv_freq[0] = 1.0
+            bool inv_freq0_ok = (std::fabs(ft[half] - 1.0f) < 1e-6f);
+
+            if (!shape_ok || !first_row_zero || !inv_freq0_ok) {
+                LOG_ERROR("  [FAIL] Case D: dim=%d shape_ok=%d row0_zero=%d inv0_ok=%d",
+                         test_dim, shape_ok, first_row_zero, inv_freq0_ok);
+                all_ok = false;
+            } else {
+                LOG_INFO("  [PASS] Case D: dim=%d freq_table shape/zero-row/inv_freq[0] correct",
+                         test_dim);
+            }
+        }
+    }
+
+    // Case E: num_tokens = grid_h * grid_w for various grids
+    {
+        struct GridCase { int64_t t, h, w; int32_t merge; int64_t expected; };
+        GridCase cases[] = {
+            {1, 2, 2, 1, 4},
+            {1, 4, 6, 2, 24},
+            {1, 8, 12, 2, 96},
+            {1, 6, 6, 2, 36},
+        };
+        int32_t dim = 32;
+        atb_llm::components::VisionRotaryEmbedding rotary(dim);
+        int32_t half = dim / 2;
+        int32_t out_dim = half * 4;
+
+        for (int c = 0; c < 4; c++) {
+            int64_t grid_thw[] = {cases[c].t, cases[c].h, cases[c].w};
+            int32_t max_hw = static_cast<int32_t>(std::max(cases[c].h, cases[c].w));
+            auto ft = rotary.ComputeFreqTable(max_hw);
+            std::vector<float> cos_buf(cases[c].expected * out_dim);
+            std::vector<float> sin_buf(cases[c].expected * out_dim);
+            int64_t n = atb_llm::components::ComputeVisionRotPosEmb(
+                grid_thw, 1, rotary, cases[c].merge, ft,
+                cos_buf.data(), sin_buf.data());
+            if (n != cases[c].expected) {
+                LOG_ERROR("  [FAIL] Case E: grid=[%ld,%ld,%ld] merge=%d tokens=%ld (expected %ld)",
+                         cases[c].t, cases[c].h, cases[c].w, cases[c].merge, n, cases[c].expected);
+                all_ok = false;
+            } else {
+                LOG_INFO("  [PASS] Case E: grid=[%ld,%ld,%ld] merge=%d tokens=%ld",
+                         cases[c].t, cases[c].h, cases[c].w, cases[c].merge, n);
+            }
+        }
+    }
+
+    if (all_ok) {
+        LOG_INFO("  [PASS] All edge cases passed");
+    }
+    return all_ok;
 }
 
 // ═══════════════════════════════════════════════════════════════

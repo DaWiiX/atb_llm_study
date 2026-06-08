@@ -315,6 +315,7 @@ static bool TestGetRopeIndexImageOnlyNoVisionStart() {
 // ═══════════════════════════════════════════════════════════════
 static bool TestGetRopeIndexEdgeCases() {
     LOG_INFO("\n=== Test 5: GetRopeIndex — edge cases ===");
+    bool all_ok = true;
 
     // Case A: B=1, S=1 (single text token)
     {
@@ -325,6 +326,7 @@ static bool TestGetRopeIndexEdgeCases() {
                                            151655, 151652, 2, pid_out.data());
         // All 3 dims should be [0]
         bool ok = (pid_out[0] == 0 && pid_out[1] == 0 && pid_out[2] == 0);
+        all_ok &= ok;
         if (ok) {
             LOG_INFO("  [PASS] Single token: all positions = 0");
         } else {
@@ -333,33 +335,12 @@ static bool TestGetRopeIndexEdgeCases() {
         }
     }
 
-    // Case B: image tokens exactly at the boundary (last token is image)
-    {
-        int64_t input_ids[] = {151652, 151655, 151655, 151655, 151655};
-        int64_t grid_thw[] = {1, 2, 2};
-        int64_t B = 1, S = 5, N = 1;
-        std::vector<int64_t> pid_out(3 * B * S);
-        atb_llm::components::GetRopeIndex(input_ids, B, S, grid_thw, N,
-                                           151655, 151652, 2, pid_out.data());
-        // All tokens after vision_start should get 2D grid pos
-        // T: [0, 0,0, 1,1] H: [0, 0,1, 0,1] W: [0, 0,0,1,0,1]
-        // (2x2 grid, merge=2, but grid is already merged? No — merge=2 means h//2, w//2
-        //  so h=1, w=1 after merge, just 1 token)
-        // Wait: grid [1,2,2] with merge=2 → h_dim=1, w_dim=1 → 1 token, not 4.
-        // Let me trace: image tokens start at S=1, t_dim*h_dim*w_dim = 1*1*1 = 1
-        // So S=2..S=5 are all beyond the image segment → they'd be treated as text
-        // after the image.
-        //
-        // Actually this test case may have issues. Let me focus on the simpler
-        // cases that we already have Python reference for.
-        LOG_INFO("  [INFO] Edge case B: boundary image tokens (see logs for details)");
-        for (int d = 0; d < 3; d++) {
-            PrintI64(pid_out.data() + d * B * S, S,
-                     (std::string("    dim ") + std::to_string(d)).c_str());
-        }
-    }
+    // Case B: boundary image tokens scenario removed.
+    // The expected output for boundary image token cases is difficult to verify
+    // by hand (the original author noted this case "may have issues"). This
+    // scenario is now covered by the mrope precision E2E test at higher level.
 
-    return true;
+    return all_ok;
 }
 
 // ═══════════════════════════════════════════════════════════════
