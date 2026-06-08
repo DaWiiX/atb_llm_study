@@ -10,16 +10,70 @@
 namespace atb_llm {
 namespace adapters {
 
+// ── Bicubic interpolation kernel (Catmull-Rom, a=-0.5) ──────
+// Matches PyTorch F.interpolate(mode='bicubic', align_corners=False)
+static float CubicWeight(float x) {
+    x = std::fabs(x);
+    float a = -0.5f;
+    if (x <= 1.0f) {
+        return (a + 2.0f) * x * x * x - (a + 3.0f) * x * x + 1.0f;
+    } else if (x < 2.0f) {
+        return a * x * x * x - 5.0f * a * x * x + 8.0f * a * x - 4.0f * a;
+    }
+    return 0.0f;
+}
+
+void BicubicResize(const uint8_t* input, int32_t in_h, int32_t in_w,
+                   int32_t channels, int32_t out_h, int32_t out_w,
+                   float* output) {
+    for (int32_t c = 0; c < channels; c++) {
+        const uint8_t* in_c = input + static_cast<size_t>(c) * in_h * in_w;
+        float* out_c = output + static_cast<size_t>(c) * out_h * out_w;
+
+        for (int32_t oh = 0; oh < out_h; oh++) {
+            // align_corners=False mapping
+            float src_h = (oh + 0.5f) * static_cast<float>(in_h) / out_h - 0.5f;
+            int32_t sh = static_cast<int32_t>(std::floor(src_h));
+            float dh = src_h - sh;
+
+            for (int32_t ow = 0; ow < out_w; ow++) {
+                float src_w = (ow + 0.5f) * static_cast<float>(in_w) / out_w - 0.5f;
+                int32_t sw = static_cast<int32_t>(std::floor(src_w));
+                float dw = src_w - sw;
+
+                float sum = 0.0f;
+                for (int32_t m = -1; m <= 2; m++) {
+                    float w_h = CubicWeight(dh - m);
+                    int32_t ih = std::clamp(sh + m, 0, in_h - 1);
+                    for (int32_t n = -1; n <= 2; n++) {
+                        float w_w = CubicWeight(dw - n);
+                        int32_t iw = std::clamp(sw + n, 0, in_w - 1);
+                        sum += in_c[ih * in_w + iw] * w_h * w_w;
+                    }
+                }
+                out_c[oh * out_w + ow] = sum;
+            }
+        }
+    }
+}
+
+// Python-style banker's rounding: round half to even (matches Python 3 round())
+static int32_t BankersRound(float x) {
+    float floor_val = std::floor(x);
+    float frac = x - floor_val;
+    if (frac < 0.5f) return static_cast<int32_t>(floor_val);
+    if (frac > 0.5f) return static_cast<int32_t>(floor_val + 1.0f);
+    // Exactly 0.5 — round to nearest even
+    int32_t lower = static_cast<int32_t>(floor_val);
+    return (lower % 2 == 0) ? lower : lower + 1;
+}
+
 void SmartResize(int32_t height, int32_t width,
                  int32_t factor, int32_t min_pixels, int32_t max_pixels,
                  int32_t& new_height, int32_t& new_width) {
-    // Round to nearest multiple of factor
-    int32_t h_bar = static_cast<int32_t>(std::round(
-                        static_cast<float>(height) / factor)) *
-                    factor;
-    int32_t w_bar = static_cast<int32_t>(std::round(
-                        static_cast<float>(width) / factor)) *
-                    factor;
+    // Round to nearest multiple of factor (banker's rounding, matches Python)
+    int32_t h_bar = BankersRound(static_cast<float>(height) / factor) * factor;
+    int32_t w_bar = BankersRound(static_cast<float>(width) / factor) * factor;
 
     int64_t area = static_cast<int64_t>(h_bar) * w_bar;
     if (area > max_pixels) {
@@ -40,43 +94,6 @@ void SmartResize(int32_t height, int32_t width,
     new_width = w_bar;
 }
 
-void BilinearResize(const uint8_t* input, int32_t in_h, int32_t in_w,
-                    int32_t channels, int32_t out_h, int32_t out_w,
-                    float* output) {
-    // Bilinear interpolation for uint8 -> float32
-    for (int32_t oh = 0; oh < out_h; oh++) {
-        for (int32_t ow = 0; ow < out_w; ow++) {
-            // Map output coord to input coord
-            float fy = static_cast<float>(oh) * in_h / out_h;
-            float fx = static_cast<float>(ow) * in_w / out_w;
-
-            int32_t y0 = static_cast<int32_t>(fy);
-            int32_t x0 = static_cast<int32_t>(fx);
-            int32_t y1 = std::min(y0 + 1, in_h - 1);
-            int32_t x1 = std::min(x0 + 1, in_w - 1);
-
-            float dy = fy - y0;
-            float dx = fx - x0;
-
-            for (int32_t c = 0; c < channels; c++) {
-                // Input layout: (C, H, W) -> index: c*H*W + h*W + w
-                float v00 = input[c * in_h * in_w + y0 * in_w + x0];
-                float v01 = input[c * in_h * in_w + y0 * in_w + x1];
-                float v10 = input[c * in_h * in_w + y1 * in_w + x0];
-                float v11 = input[c * in_h * in_w + y1 * in_w + x1];
-
-                float val = v00 * (1 - dy) * (1 - dx) +
-                            v01 * (1 - dy) * dx +
-                            v10 * dy * (1 - dx) +
-                            v11 * dy * dx;
-
-                // Output layout: (C, out_h, out_w)
-                output[c * out_h * out_w + oh * out_w + ow] = val;
-            }
-        }
-    }
-}
-
 Status PreprocessImage(const uint8_t* image,
                        int32_t channels, int32_t height, int32_t width,
                        const Qwen3VLConfig& config,
@@ -94,10 +111,10 @@ Status PreprocessImage(const uint8_t* image,
                 config.pp_min_pixels, config.pp_max_pixels,
                 new_h, new_w);
 
-    // 2. Bilinear resize (uint8 -> float32)
+    // 2. Bicubic resize (uint8 -> float32, matches PyTorch align_corners=False)
     size_t resized_size = static_cast<size_t>(channels) * new_h * new_w;
     std::vector<float> resized(resized_size);
-    BilinearResize(image, height, width, channels, new_h, new_w, resized.data());
+    BicubicResize(image, height, width, channels, new_h, new_w, resized.data());
 
     // 3. Rescale to [0, 1] and normalize
     float mean[3] = {0.5f, 0.5f, 0.5f};
@@ -135,12 +152,9 @@ Status PreprocessImage(const uint8_t* image,
     //         .permute(0, 3, 6, 4, 7, 2, 1, 5, 8)
     //         .reshape(grid_t*grid_h*grid_w, C*tp*ps*ps)
     //
-    // We implement this directly without 9D reshape.
-    // Each output patch (n, :) contains:
-    //   For each merge-group (br, bc), for each intra (ir, ic),
-    //   for each channel c, for each frame f, for each spatial (ph, pw):
-    //     value = normalized[ c, br*ms*ps + ir*ps + ph, bc*ms*ps + ic*ps + pw ]
-    //   (duplicated for both frames since single image)
+    // After permute, the last dim order is: C, tp, ps_h, ps_w
+    // So each patch element is indexed by (c, f, ph, pw) with strides:
+    //   offset = c * tp*ps*ps + f * ps*ps + ph * ps + pw
 
     int64_t patch_dim = static_cast<int64_t>(channels) * tp * patch_size * patch_size;
     num_patches = static_cast<int64_t>(grid_t) * grid_h * grid_w;
@@ -154,35 +168,20 @@ Status PreprocessImage(const uint8_t* image,
             for (int64_t ir = 0; ir < merge_size; ir++) {
                 for (int64_t ic = 0; ic < merge_size; ic++) {
                     // This is one output patch
+                    // Dimension order: C, tp, ps_h, ps_w (matches Python permute)
                     int64_t offset = 0;
-                    // Frame 0 (same as frame 1 for single image)
                     for (int64_t c = 0; c < channels; c++) {
-                        for (int64_t ph = 0; ph < patch_size; ph++) {
-                            for (int64_t pw = 0; pw < patch_size; pw++) {
-                                int64_t row = br * merge_size * patch_size + ir * patch_size + ph;
-                                int64_t col = bc * merge_size * patch_size + ic * patch_size + pw;
-                                float val = resized[c * new_h * new_w + row * new_w + col];
-                                // Store as fp16
-                                uint16_t fp16_val = atb_llm::Bf16ToFp16(
-                                    static_cast<uint16_t>(
-                                        FloatToUint32(val) >> 16));
-                                pixel_values[patch_idx * patch_dim + offset] = fp16_val;
-                                offset++;
-                            }
-                        }
-                    }
-                    // Frame 1 (duplicate for temporal_patch_size=2)
-                    for (int64_t c = 0; c < channels; c++) {
-                        for (int64_t ph = 0; ph < patch_size; ph++) {
-                            for (int64_t pw = 0; pw < patch_size; pw++) {
-                                int64_t row = br * merge_size * patch_size + ir * patch_size + ph;
-                                int64_t col = bc * merge_size * patch_size + ic * patch_size + pw;
-                                float val = resized[c * new_h * new_w + row * new_w + col];
-                                uint16_t fp16_val = atb_llm::Bf16ToFp16(
-                                    static_cast<uint16_t>(
-                                        FloatToUint32(val) >> 16));
-                                pixel_values[patch_idx * patch_dim + offset] = fp16_val;
-                                offset++;
+                        for (int64_t f = 0; f < tp; f++) {
+                            for (int64_t ph = 0; ph < patch_size; ph++) {
+                                for (int64_t pw = 0; pw < patch_size; pw++) {
+                                    int64_t row = br * merge_size * patch_size + ir * patch_size + ph;
+                                    int64_t col = bc * merge_size * patch_size + ic * patch_size + pw;
+                                    float val = resized[c * new_h * new_w + row * new_w + col];
+                                    // Store as fp16
+                                    uint16_t fp16_val = atb_llm::Fp32ToFp16(val);
+                                    pixel_values[patch_idx * patch_dim + offset] = fp16_val;
+                                    offset++;
+                                }
                             }
                         }
                     }

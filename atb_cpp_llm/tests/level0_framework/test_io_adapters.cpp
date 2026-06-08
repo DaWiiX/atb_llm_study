@@ -5,7 +5,7 @@
  *   - SafetensorsReader (load, metadata, move semantics, error paths)
  *   - WeightLoader (delegation to reader, error paths)
  *   - Qwen3VLConfig (JSON parsing, defaults, derived fields)
- *   - Qwen3VLPreprocess (SmartResize, BilinearResize)
+ *   - Qwen3VLPreprocess (SmartResize, BicubicResize)
  *
  * Run: ./test_io_adapters
  * No NPU required — pure CPU/file tests.
@@ -694,36 +694,36 @@ TEST_CASE("SmartResize - non-square image") {
     CHECK(ratio_out == doctest::Approx(ratio_in).epsilon(0.1));
 }
 
-TEST_CASE("BilinearResize - identity (same size)") {
+TEST_CASE("BicubicResize - identity (same size)") {
     // 2x2 image, 1 channel, resize to 2x2
     uint8_t input[4] = {10, 20, 30, 40};
     float output[4] = {};
 
-    atb_llm::adapters::BilinearResize(input, 2, 2, 1, 2, 2, output);
+    atb_llm::adapters::BicubicResize(input, 2, 2, 1, 2, 2, output);
     CHECK(output[0] == doctest::Approx(10.0f));
     CHECK(output[1] == doctest::Approx(20.0f));
     CHECK(output[2] == doctest::Approx(30.0f));
     CHECK(output[3] == doctest::Approx(40.0f));
 }
 
-TEST_CASE("BilinearResize - 2x2 to 4x4 (integer upscale)") {
+TEST_CASE("BicubicResize - 2x2 to 4x4 (integer upscale)") {
     // Checkerboard pattern
     uint8_t input[4] = {0, 255, 255, 0};
     float output[16] = {};
 
-    atb_llm::adapters::BilinearResize(input, 2, 2, 1, 4, 4, output);
+    atb_llm::adapters::BicubicResize(input, 2, 2, 1, 4, 4, output);
 
-    // Corners should match input
-    CHECK(output[0] == doctest::Approx(0.0f));     // top-left
-    CHECK(output[3] == doctest::Approx(255.0f));   // top-right
-    CHECK(output[12] == doctest::Approx(255.0f));  // bottom-left
-    CHECK(output[15] == doctest::Approx(0.0f));    // bottom-right
+    // Bicubic (align_corners=False) overshoots: negative at all-0 corners, >255 at all-255 corners
+    CHECK(output[0] == doctest::Approx(-38.3807f));    // top-left (was 0)
+    CHECK(output[3] == doctest::Approx(293.3807f));    // top-right (was 255)
+    CHECK(output[12] == doctest::Approx(293.3807f));   // bottom-left (was 255)
+    CHECK(output[15] == doctest::Approx(-38.3807f));   // bottom-right (was 0)
 
-    // Center should be average: (0+255+255+0)/4 = 127.5
-    CHECK(output[5] == doctest::Approx(127.5f));
+    // Center interpolation
+    CHECK(output[5] == doctest::Approx(82.5513f));
 }
 
-TEST_CASE("BilinearResize - 3-channel") {
+TEST_CASE("BicubicResize - 3-channel") {
     // 2x2 image, 3 channels (RGB)
     uint8_t input[12] = {
         // Channel 0 (R)
@@ -744,7 +744,7 @@ TEST_CASE("BilinearResize - 3-channel") {
     };
     float output[12] = {};
 
-    atb_llm::adapters::BilinearResize(input, 2, 2, 3, 2, 2, output);
+    atb_llm::adapters::BicubicResize(input, 2, 2, 3, 2, 2, output);
 
     // Channel 0
     CHECK(output[0] == doctest::Approx(255.0f));
@@ -757,7 +757,7 @@ TEST_CASE("BilinearResize - 3-channel") {
     CHECK(output[11] == doctest::Approx(128.0f));
 }
 
-TEST_CASE("BilinearResize - downscale 4x4 to 2x2") {
+TEST_CASE("BicubicResize - downscale 4x4 to 2x2") {
     uint8_t input[16] = {
         10, 20, 30, 40,
         50, 60, 70, 80,
@@ -765,17 +765,13 @@ TEST_CASE("BilinearResize - downscale 4x4 to 2x2") {
         130, 140, 150, 160};
     float output[4] = {};
 
-    atb_llm::adapters::BilinearResize(input, 4, 4, 1, 2, 2, output);
+    atb_llm::adapters::BicubicResize(input, 4, 4, 1, 2, 2, output);
 
-    // (0,0) maps to input (0,0): fy=0*4/2=0, fx=0*4/2=0
-    // dy=0, dx=0 -> val = v00 = input[0] = 10
-    CHECK(output[0] == doctest::Approx(10.0f));
-    // (0,1) maps to input (0,2): fy=0, fx=1*4/2=2 -> val = input[2] = 30
-    CHECK(output[1] == doctest::Approx(30.0f));
-    // (1,0) maps to input (2,0): fy=1*4/2=2, fx=0 -> val = input[8] = 90
-    CHECK(output[2] == doctest::Approx(90.0f));
-    // (1,1) maps to input (2,2): fy=2, fx=2 -> val = input[10] = 110
-    CHECK(output[3] == doctest::Approx(110.0f));
+    // Bicubic 16-neighbour interpolation (align_corners=False)
+    CHECK(output[0] == doctest::Approx(31.875f));
+    CHECK(output[1] == doctest::Approx(53.125f));
+    CHECK(output[2] == doctest::Approx(116.875f));
+    CHECK(output[3] == doctest::Approx(138.125f));
 }
 
 // ═══════════════════════════════════════════════════════════════════

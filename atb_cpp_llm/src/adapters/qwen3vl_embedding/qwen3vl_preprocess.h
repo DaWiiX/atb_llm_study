@@ -21,7 +21,7 @@ void SmartResize(int32_t height, int32_t width,
                  int32_t factor, int32_t min_pixels, int32_t max_pixels,
                  int32_t& new_height, int32_t& new_width);
 
-/// Bilinear resize (CPU).
+/// Bicubic resize (CPU, align_corners=False, matches PyTorch F.interpolate).
 /// @param input    (C, H, W) uint8
 /// @param in_h     Input height
 /// @param in_w     Input width
@@ -29,9 +29,9 @@ void SmartResize(int32_t height, int32_t width,
 /// @param out_h    Output height
 /// @param out_w    Output width
 /// @param output   (C, out_h, out_w) float32, pre-allocated
-void BilinearResize(const uint8_t* input, int32_t in_h, int32_t in_w,
-                    int32_t channels, int32_t out_h, int32_t out_w,
-                    float* output);
+void BicubicResize(const uint8_t* input, int32_t in_h, int32_t in_w,
+                   int32_t channels, int32_t out_h, int32_t out_w,
+                   float* output);
 
 /// Full image preprocessing.
 ///
