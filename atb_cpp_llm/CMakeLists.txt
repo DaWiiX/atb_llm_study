@@ -183,6 +183,7 @@ add_atb_test(test_preprocess_cpu    tests/level1_cpu_pure/test_preprocess_cpu.cp
 add_atb_test(test_pos_embed_cpu     tests/level1_cpu_pure/test_pos_embed_cpu.cpp)
 add_atb_test(test_float_utils       tests/level1_cpu_pure/test_float_utils.cpp)
 add_atb_test(test_base_model_utils  tests/level1_cpu_pure/test_base_model_utils.cpp)
+add_atb_test(test_causal_mask_fp16  tests/level1_cpu_pure/test_causal_mask_fp16.cpp)
 
 # Level 2 per-op precision tests (Wave 2)
 add_atb_test(test_rms_norm_precision            tests/level2_op_precision/test_rms_norm_precision.cpp)

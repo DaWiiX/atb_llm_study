@@ -1,4 +1,5 @@
 #include "components/common/mrope.h"
+#include "utils/float_utils.h"
 #include "log/logger.h"
 #include <cmath>
 #include <algorithm>
@@ -94,6 +95,20 @@ void MRoPE::Compute(const int64_t* position_ids,
         }
     }
 }
+
+	void MRoPE::ComputeFp16(const int64_t* position_ids,
+	                         int64_t batch_size, int64_t seq_len,
+	                         uint16_t* cos_out, uint16_t* sin_out) const {
+	    // Compute in float32 for numerical accuracy, then convert to fp16.
+	    int64_t total = batch_size * seq_len * head_dim_;
+	    std::vector<float> cos_f32(total), sin_f32(total);
+	    Compute(position_ids, batch_size, seq_len, cos_f32.data(), sin_f32.data());
+	    for (int64_t i = 0; i < total; i++) {
+	        cos_out[i] = atb_llm::Fp32ToFp16(cos_f32[i]);
+	        sin_out[i] = atb_llm::Fp32ToFp16(sin_f32[i]);
+	    }
+	}
+
 
 // ═════════════════════════════════════════════════════════════════════
 // VisionRotaryEmbedding

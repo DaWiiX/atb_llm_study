@@ -33,6 +33,18 @@ public:
                  int64_t batch_size, int64_t seq_len,
                  float* cos_out, float* sin_out) const;
 
+    /// Compute MRoPE cos/sin directly in fp16 — skip fp32 intermediate allocation
+    /// and the element-by-element fp32→fp16 conversion loop.
+    ///
+    /// @param position_ids  Flattened 3D position IDs, layout [3][B][S] as contiguous int64.
+    /// @param batch_size    Batch size B
+    /// @param seq_len       Sequence length S
+    /// @param cos_out       Output: cos values, shape (B*S, head_dim), fp16, pre-allocated
+    /// @param sin_out       Output: sin values, shape (B*S, head_dim), fp16, pre-allocated
+    void ComputeFp16(const int64_t* position_ids,
+                     int64_t batch_size, int64_t seq_len,
+                     uint16_t* cos_out, uint16_t* sin_out) const;
+
     int32_t HeadDim() const { return head_dim_; }
     const std::vector<int32_t>& MropeSection() const { return mrope_section_; }
 

@@ -307,6 +307,9 @@ Status Qwen3VLModel::ForwardWithTiming(const InferRequest& request,
             }
         }
 
+        // Synchronize to capture true GPU time for pos_embed + RoPE.
+        // Without this, the NPU time leaks into vision_model_ms.
+        runtime_->Synchronize();
         auto t_vis_pos = std::chrono::high_resolution_clock::now();
         timings.vision_pos_ms = std::chrono::duration<double, std::milli>(
             t_vis_pos - t_prev).count();
@@ -328,6 +331,8 @@ Status Qwen3VLModel::ForwardWithTiming(const InferRequest& request,
         vis_seqlen.dataSize = sizeof(int32_t);
         vis_seqlen.hostData = &vis_seqlen_val;
 
+        // ── Vision sub-stage: FirstLayer (patch_embed + pos_embed + block 0) ──
+        auto t_v_first = std::chrono::high_resolution_clock::now();
         NpuTensor h_npu = AllocNpuFloat16({total_tokens, vis_hs});
         {
             const auto& bw = weights_.vis_blocks[0];
@@ -358,6 +363,11 @@ Status Qwen3VLModel::ForwardWithTiming(const InferRequest& request,
                 LOG_INFO("Saved /tmp/cpp_first_layer_out.bin (%ld fp16 values)", static_cast<long>(fl_total));
             }
         }
+
+        // ── Vision sub-stage: Blocks 1..(depth-1) + Deepstack extraction ──
+        auto t_v_blocks = std::chrono::high_resolution_clock::now();
+        double v_first_ms = std::chrono::duration<double, std::milli>(
+            t_v_blocks - t_v_first).count();
 
         ds_features.resize(config_.vis_deepstack_visual_indexes.size());
         for (int32_t li = 1; li < config_.vis_depth; li++) {
@@ -406,6 +416,11 @@ Status Qwen3VLModel::ForwardWithTiming(const InferRequest& request,
             }
         }
 
+        // ── Vision sub-stage: Merger + D2H ──
+        auto t_v_merger = std::chrono::high_resolution_clock::now();
+        double v_blocks_ms = std::chrono::duration<double, std::milli>(
+            t_v_merger - t_v_blocks).count();
+
         // Merger
         int64_t merged_tokens = total_tokens / (merge_size * merge_size);
         vis_embeds_host.resize(merged_tokens * vis_embed_dim);
@@ -429,9 +444,14 @@ Status Qwen3VLModel::ForwardWithTiming(const InferRequest& request,
 
         runtime_->Synchronize();
         auto t_vis_model = std::chrono::high_resolution_clock::now();
+        double v_merger_ms = std::chrono::duration<double, std::milli>(
+            t_vis_model - t_v_merger).count();
         timings.vision_model_ms = std::chrono::duration<double, std::milli>(
             t_vis_model - t_prev).count();
         t_prev = t_vis_model;
+
+        LOG_INFO("  [Vision detail] FirstLayer: %.2f ms | Blocks(1..%d): %.2f ms | Merger+D2H: %.2f ms",
+                 v_first_ms, config_.vis_depth - 1, v_blocks_ms, v_merger_ms);
 
         // Inject vision tokens into text embeddings
         image_token_positions =
@@ -478,12 +498,31 @@ Status Qwen3VLModel::ForwardWithTiming(const InferRequest& request,
             LOG_INFO("Saved /tmp/cpp_position_ids.bin (%ld values)", static_cast<long>(pid_total));
         }
     }
-    std::vector<float> cos_f32(seq_len * hd);
-    std::vector<float> sin_f32(seq_len * hd);
-    mrope_->Compute(position_ids.data(), 1, seq_len,
-                    cos_f32.data(), sin_f32.data());
-    std::vector<float> mask(seq_len * seq_len);
-    runners::MakeCausalMask(seq_len, mask.data());
+    // ── P0: MRoPE cos/sin + Causal mask — direct fp16 + NPU cache ──
+    // When seq_len is unchanged across calls, reuse the cached NPU tensors
+    // to avoid regeneration + H2D upload (saves ~212ms at S=4096).
+    bool cache_hit = (seq_len == cached_text_seq_len_ && cached_mask_npu_);
+    if (!cache_hit) {
+        // Generate cos/sin directly in fp16 (skip fp32 intermediate)
+        std::vector<uint16_t> cos16(seq_len * hd);
+        std::vector<uint16_t> sin16(seq_len * hd);
+        mrope_->ComputeFp16(position_ids.data(), 1, seq_len,
+                            cos16.data(), sin16.data());
+        // Generate causal mask directly in fp16 (skip fp32 intermediate)
+        std::vector<uint16_t> m16(static_cast<size_t>(seq_len) * seq_len);
+        runners::MakeCausalMaskFp16(seq_len, m16.data());
+        // Upload to NPU and cache
+        cached_cos_npu_ = AllocNpuFloat16({seq_len, hd});
+        alloc->CopyToDevice(*cached_cos_npu_.Get(), cos16.data(),
+                            static_cast<size_t>(seq_len) * hd * sizeof(uint16_t));
+        cached_sin_npu_ = AllocNpuFloat16({seq_len, hd});
+        alloc->CopyToDevice(*cached_sin_npu_.Get(), sin16.data(),
+                            static_cast<size_t>(seq_len) * hd * sizeof(uint16_t));
+        cached_mask_npu_ = AllocNpuFloat16({seq_len, seq_len});
+        alloc->CopyToDevice(*cached_mask_npu_.Get(), m16.data(),
+                            static_cast<size_t>(seq_len) * seq_len * sizeof(uint16_t));
+        cached_text_seq_len_ = seq_len;
+    }
 
     auto t_pos_ids = std::chrono::high_resolution_clock::now();
     timings.position_ids_ms = std::chrono::duration<double, std::milli>(
@@ -491,25 +530,13 @@ Status Qwen3VLModel::ForwardWithTiming(const InferRequest& request,
     t_prev = t_pos_ids;
 
     // ── Stage: Text Model (NPU) ──────────────────────────────
+    double t_h2d_ms = 0, t_layers_ms = 0, t_norm_ms = 0;
+    std::chrono::high_resolution_clock::time_point t_t_norm;
     {
         int64_t n = seq_len;
         NpuTensor h_npu = AllocNpuFloat16({n, hidden_size});
         alloc->CopyToDevice(*h_npu.Get(), inputs_embeds.data(),
                             static_cast<size_t>(n) * hidden_size * sizeof(uint16_t));
-        int64_t rope_n = n * hd;
-        std::vector<uint16_t> cos16(rope_n), sin16(rope_n), m16(n * n);
-        for (int64_t i = 0; i < rope_n; i++) {
-            cos16[i] = atb_llm::Fp32ToFp16(cos_f32[i]);
-            sin16[i] = atb_llm::Fp32ToFp16(sin_f32[i]);
-        }
-        for (int64_t i = 0; i < n * n; i++)
-            m16[i] = atb_llm::Fp32ToFp16(mask[i]);
-        NpuTensor cos_npu = AllocNpuFloat16({n, hd});
-        alloc->CopyToDevice(*cos_npu.Get(), cos16.data(), rope_n * sizeof(uint16_t));
-        NpuTensor sin_npu = AllocNpuFloat16({n, hd});
-        alloc->CopyToDevice(*sin_npu.Get(), sin16.data(), rope_n * sizeof(uint16_t));
-        NpuTensor mask_npu = AllocNpuFloat16({n, n});
-        alloc->CopyToDevice(*mask_npu.Get(), m16.data(), n * n * sizeof(uint16_t));
         atb::Tensor seqlen;
         int32_t sl = seq_len;
         seqlen.desc.dtype = ACL_INT32;
@@ -520,6 +547,12 @@ Status Qwen3VLModel::ForwardWithTiming(const InferRequest& request,
         seqlen.hostData = &sl;
         Status s = text_runner_->EnsureBuilt(seq_len);
         if (s != STATUS_OK) return s;
+
+        // ── Text sub-stage: 28 Decoder Layers ──
+        auto t_t_layers = std::chrono::high_resolution_clock::now();
+        t_h2d_ms = std::chrono::duration<double, std::milli>(
+            t_t_layers - t_prev).count();
+
         for (int32_t li = 0; li < config_.text_num_layers; li++) {
             const auto& lw = weights_.text_layers[li];
             NpuTensor h_out = AllocNpuFloat16({n, hidden_size});
@@ -529,7 +562,8 @@ Status Qwen3VLModel::ForwardWithTiming(const InferRequest& request,
                             lw.q_norm_weight, lw.k_norm_weight,
                             lw.gate_weight, lw.up_weight, lw.down_weight,
                             lw.input_ln_weight, lw.post_ln_weight,
-                            *cos_npu.Get(), *sin_npu.Get(), *mask_npu.Get(), seqlen};
+                            *cached_cos_npu_.Get(), *cached_sin_npu_.Get(),
+                            *cached_mask_npu_.Get(), seqlen};
             vp.outTensors = {*h_out.Get()};
             s = ExecuteGraph(text_runner_->GetLayerGraph(), vp);
             if (s != STATUS_OK) return s;
@@ -541,6 +575,12 @@ Status Qwen3VLModel::ForwardWithTiming(const InferRequest& request,
                     n, hidden_size, vis_embed_dim, runtime_);
             }
         }
+
+        // ── Text sub-stage: FinalNorm + D2H ──
+        t_t_norm = std::chrono::high_resolution_clock::now();
+        t_layers_ms = std::chrono::duration<double, std::milli>(
+            t_t_norm - t_t_layers).count();
+
         NpuTensor norm_out = AllocNpuFloat16({n, hidden_size});
         atb::VariantPack nvp;
         nvp.inTensors = {*h_npu.Get(), weights_.text_norm_weight};
@@ -553,9 +593,15 @@ Status Qwen3VLModel::ForwardWithTiming(const InferRequest& request,
     }
 
     auto t_text_model = std::chrono::high_resolution_clock::now();
+    t_norm_ms = std::chrono::duration<double, std::milli>(
+        t_text_model - t_t_norm).count();
     timings.text_model_ms = std::chrono::duration<double, std::milli>(
         t_text_model - t_prev).count();
     t_prev = t_text_model;
+
+    LOG_INFO("  [Text detail] H2D prep: %.2f ms | %d layers: %.2f ms (avg %.3f/layer) | Norm+D2H: %.2f ms",
+             t_h2d_ms, config_.text_num_layers, t_layers_ms,
+             t_layers_ms / config_.text_num_layers, t_norm_ms);
 
     // ── Stage: Pooling ───────────────────────────────────────
     Status s = BaseModel::RunPooling(inputs_embeds.data(), seq_len, hidden_size,

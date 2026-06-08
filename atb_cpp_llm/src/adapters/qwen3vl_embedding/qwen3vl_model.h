@@ -84,6 +84,13 @@ private:
     // row_idx, col_idx), all built on host in O(N).
     OperationHandle vis_rope_graph_;
 
+    // ── Text model input cache (P0: avoid regenerating mask/cos/sin
+    //     when seq_len hasn't changed across forward calls) ──
+    int32_t cached_text_seq_len_ = -1;
+    NpuTensor cached_mask_npu_;
+    NpuTensor cached_cos_npu_;
+    NpuTensor cached_sin_npu_;
+
     // ── Vision pipeline ───────────────────────────────────
     Status RunVision(const uint16_t* pixel_values, int64_t num_patches,
                      const int64_t* grid_thw, int64_t num_images,

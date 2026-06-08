@@ -72,5 +72,11 @@ private:
 /// @param mask_out Output: (seq_len, seq_len) float32 additive mask, pre-allocated
 void MakeCausalMask(int32_t seq_len, float* mask_out);
 
+/// Build a causal mask for text attention, directly in fp16.
+/// Eliminates the fp32 intermediate + fp32→fp16 conversion loop.
+/// @param seq_len  Sequence length
+/// @param mask_out Output: (seq_len, seq_len) fp16 additive mask, pre-allocated
+void MakeCausalMaskFp16(int32_t seq_len, uint16_t* mask_out);
+
 } // namespace runners
 } // namespace atb_llm

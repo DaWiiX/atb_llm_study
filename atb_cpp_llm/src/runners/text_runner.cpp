@@ -1,6 +1,7 @@
 #include "runners/text_runner.h"
 #include "components/common/rms_norm_graph.h"
 #include "components/text/decoder_layer_graph.h"
+#include "utils/float_utils.h"
 #include "log/logger.h"
 
 namespace atb_llm {
@@ -66,6 +67,19 @@ void MakeCausalMask(int32_t seq_len, float* mask_out) {
     for (int32_t i = 0; i < seq_len; i++) {
         for (int32_t j = 0; j < seq_len; j++) {
             mask_out[i * seq_len + j] = (j > i) ? mask_value : 0.0f;
+        }
+    }
+}
+
+void MakeCausalMaskFp16(int32_t seq_len, uint16_t* mask_out) {
+    // Direct fp16 generation — skips the fp32 intermediate allocation
+    // and the element-by-element fp32→fp16 conversion loop.
+    // -65504 = fp16 minimum representable value (used as mask sentinel).
+    const uint16_t mask_fp16 = atb_llm::Fp32ToFp16(-65504.0f);
+    const uint16_t zero_fp16  = atb_llm::Fp32ToFp16(0.0f);
+    for (int32_t i = 0; i < seq_len; i++) {
+        for (int32_t j = 0; j < seq_len; j++) {
+            mask_out[i * seq_len + j] = (j > i) ? mask_fp16 : zero_fp16;
         }
     }
 }
