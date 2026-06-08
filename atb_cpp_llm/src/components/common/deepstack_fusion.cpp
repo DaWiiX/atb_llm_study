@@ -57,7 +57,7 @@ Status DeepstackFusion::ExtractFeatures(
         int32_t layer_idx,
         size_t& fusion_idx,
         IRuntime* runtime,
-        std::vector<std::vector<uint16_t>>& ds_features) {
+        std::vector<NpuTensor>& ds_features) {
     if (!IsDeepstackLayer(layer_idx, fusion_idx)) {
         return STATUS_OK;  // Not a deepstack layer, nothing to extract
     }
@@ -68,7 +68,6 @@ Status DeepstackFusion::ExtractFeatures(
         return ERROR_INVALID_PARAM;
     }
 
-    auto* alloc = runtime->GetAllocator();
     int64_t merge_size = cfg_.spatial_merge_size;
     int64_t merged_tokens = total_tokens / (merge_size * merge_size);
 
@@ -117,19 +116,13 @@ Status DeepstackFusion::ExtractFeatures(
         return ERROR_INFERENCE;
     }
 
-    Status sync_s = runtime->Synchronize();
-    if (sync_s != STATUS_OK) {
-        LOG_ERROR("Stream sync failed after DeepstackMerger %zu", fusion_idx);
-        return sync_s;
-    }
+    // Move the NPU-resident output tensor into the caller's collection.
+    // The deepstack graph wrote ds_out on the same stream as subsequent ops
+    // (IndexAdd in InjectFeatures), so stream FIFO ordering guarantees
+    // ds_out is ready before it is read — no host sync needed.
+    ds_features[fusion_idx] = std::move(ds_out);
 
-    // Copy deepstack features to host
-    size_t ds_bytes = static_cast<size_t>(merged_tokens) *
-                      cfg_.vis_out_hidden_size * sizeof(uint16_t);
-    ds_features[fusion_idx].resize(merged_tokens * cfg_.vis_out_hidden_size);
-    alloc->CopyToHost(ds_features[fusion_idx].data(), *ds_out.Get(), ds_bytes);
-
-    LOG_DEBUG("DeepstackMerger %zu: extracted %ld merged tokens",
+    LOG_DEBUG("DeepstackMerger %zu: extracted %ld merged tokens, kept on NPU",
              fusion_idx, static_cast<long>(merged_tokens));
     return STATUS_OK;
 }
@@ -144,12 +137,12 @@ Status DeepstackFusion::ExtractFeatures(
 // one kernel launch.
 // ═════════════════════════════════════════════════════════════════════
 void DeepstackFusion::InjectFeatures(NpuTensor& hidden_npu,
-                                     const std::vector<uint16_t>& ds_feat,
+                                     const NpuTensor& ds_feat,
                                      const std::vector<int64_t>& positions,
                                      int64_t /*seq_len*/, int64_t hidden_size,
                                      int64_t feat_dim,
                                      IRuntime* runtime) {
-    if (positions.empty() || ds_feat.empty()) return;
+    if (positions.empty() || !ds_feat) return;
     if (feat_dim != hidden_size) {
         // Deepstack features are expected to already be projected to the
         // text hidden_size by the deepstack merger MLP.
@@ -167,14 +160,9 @@ void DeepstackFusion::InjectFeatures(NpuTensor& hidden_npu,
     auto* ctx   = runtime->GetContext();
 
     int64_t n = static_cast<int64_t>(positions.size());
-    int64_t ds_tokens = static_cast<int64_t>(ds_feat.size()) / feat_dim;
-    if (ds_tokens != n) {
-        LOG_ERROR("InjectFeatures: ds_tokens=%ld != positions=%ld",
-                  static_cast<long>(ds_tokens), static_cast<long>(n));
-        return;
-    }
 
     // ── Upload positions as int32 indices ──
+    // (positions upload is left as a future optimization; not in this patch.)
     std::vector<int32_t> idx_i32(n);
     for (int64_t i = 0; i < n; i++) {
         idx_i32[i] = static_cast<int32_t>(positions[i]);
@@ -186,15 +174,6 @@ void DeepstackFusion::InjectFeatures(NpuTensor& hidden_npu,
     }
     alloc->CopyToDevice(*idx_npu.Get(), idx_i32.data(),
                         n * sizeof(int32_t));
-
-    // ── Upload ds_feat as (N, hidden_size) fp16 ──
-    NpuTensor upd_npu = AllocNpuFloat16({n, hidden_size});
-    if (!upd_npu) {
-        LOG_ERROR("InjectFeatures: alloc upd_npu failed");
-        return;
-    }
-    alloc->CopyToDevice(*upd_npu.Get(), ds_feat.data(),
-                        ds_feat.size() * sizeof(uint16_t));
 
     // ── Upload alpha=1.0 (4th input to ATB IndexAdd: scalar multiplier on updates) ──
     NpuTensor alpha_npu = AllocNpuFloat16({1});
@@ -209,8 +188,11 @@ void DeepstackFusion::InjectFeatures(NpuTensor& hidden_npu,
     // hidden_npu is both input (var) and output. ATB IndexAdd writes the
     // result back into the SAME buffer as inTensor0, so we list
     // hidden_npu in both inTensors[0] and outTensors[0].
+    // ds_feat is already an NPU-resident tensor (produced by the deepstack
+    // merger graph in ExtractFeatures), so it is consumed directly without
+    // any host→device copy.
     atb::VariantPack vp;
-    vp.inTensors  = {*hidden_npu.Get(), *idx_npu.Get(), *upd_npu.Get(), *alpha_npu.Get()};
+    vp.inTensors  = {*hidden_npu.Get(), *idx_npu.Get(), *ds_feat.Get(), *alpha_npu.Get()};
     vp.outTensors = {*hidden_npu.Get()};
 
     uint64_t ws_size = 0;

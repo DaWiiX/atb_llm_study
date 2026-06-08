@@ -88,7 +88,7 @@ private:
     Status RunVision(const uint16_t* pixel_values, int64_t num_patches,
                      const int64_t* grid_thw, int64_t num_images,
                      uint16_t* vis_embeds_out, int64_t vis_embed_dim,
-                     std::vector<std::vector<uint16_t>>& ds_features);
+                     std::vector<NpuTensor>& ds_features);
 
     // Compute Vision PosEmbed on NPU.
     //   - Builds (idx, wt) on host (cheap, O(N))
@@ -116,14 +116,14 @@ private:
                          std::vector<float>& cos_f32,
                          std::vector<float>& sin_f32,
                          std::vector<float>& mask,
-                         std::vector<std::vector<uint16_t>>& ds_features,
+                         std::vector<NpuTensor>& ds_features,
                          std::vector<int64_t>& image_token_positions);
 
     // ── Text pipeline ─────────────────────────────────────
     Status RunTextDecoder(uint16_t* hidden_states, int32_t seq_len,
                           const float* cos, const float* sin,
                           const float* mask,
-                          const std::vector<std::vector<uint16_t>>& ds_features,
+                          const std::vector<NpuTensor>& ds_features,
                           const std::vector<int64_t>& image_token_positions);
 };
 

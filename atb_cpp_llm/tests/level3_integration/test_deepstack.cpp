@@ -183,7 +183,11 @@ TEST_CASE("DeepstackFusion::InjectFeatures position scatter (NPU)") {
     const std::vector<int64_t> positions = {2, 5, 8};
     const int64_t ds_tokens = static_cast<int64_t>(positions.size());
     const uint16_t fp16_half = atb_llm::Fp32ToFp16(0.5f);
-    std::vector<uint16_t> ds_feat(ds_tokens * feat_dim, fp16_half);
+    std::vector<uint16_t> ds_feat_host(ds_tokens * feat_dim, fp16_half);
+    atb_llm::NpuTensor ds_feat = atb_llm::AllocNpuFloat16({ds_tokens, feat_dim});
+    REQUIRE(static_cast<bool>(ds_feat));
+    REQUIRE(IS_OK(alloc->CopyToDevice(*ds_feat.Get(), ds_feat_host.data(),
+                                       ds_feat_host.size() * sizeof(uint16_t))));
 
     // Run scatter-add. Each row at positions[t] becomes 1.0 + 0.5 = 1.5;
     // every other row stays at 1.0.

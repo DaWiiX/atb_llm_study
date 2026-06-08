@@ -177,7 +177,7 @@ Status Qwen3VLModel::Forward(const InferRequest& request, InferResult& result) {
     int32_t hd;
     int64_t vis_embed_dim;
     std::vector<float> cos_f32, sin_f32, mask;
-    std::vector<std::vector<uint16_t>> ds_features;
+    std::vector<NpuTensor> ds_features;
     std::vector<int64_t> image_token_positions;
 
     Status s = PrepareInputs(request, inputs_embeds, seq_len, hidden_size,
@@ -239,7 +239,7 @@ Status Qwen3VLModel::ForwardWithTiming(const InferRequest& request,
     // ── Vision pipeline (if image provided) ──────────────────
     std::vector<uint16_t> vis_embeds_host;
     std::vector<int64_t> grid_thw_host;
-    std::vector<std::vector<uint16_t>> ds_features;
+    std::vector<NpuTensor> ds_features;
     std::vector<int64_t> image_token_positions;
     int64_t num_images = 0;
     bool has_image = (request.mode == InputMode::IMAGE_AND_TEXT ||
@@ -535,7 +535,7 @@ Status Qwen3VLModel::ForwardWithTiming(const InferRequest& request,
             if (s != STATUS_OK) return s;
             h_npu = std::move(h_out);
             if (li < static_cast<int32_t>(ds_features.size()) &&
-                !ds_features[li].empty() && !image_token_positions.empty()) {
+                ds_features[li] && !image_token_positions.empty()) {
                 deepstack_fusion_->InjectFeatures(
                     h_npu, ds_features[li], image_token_positions,
                     n, hidden_size, vis_embed_dim, runtime_);
@@ -584,7 +584,7 @@ Status Qwen3VLModel::PrepareInputs(const InferRequest& request,
                                    int64_t& vis_embed_dim,
                                    std::vector<float>& cos_f32, std::vector<float>& sin_f32,
                                    std::vector<float>& mask,
-                                   std::vector<std::vector<uint16_t>>& ds_features,
+                                   std::vector<NpuTensor>& ds_features,
                                    std::vector<int64_t>& image_token_positions) {
     const int64_t* input_ids = request.text.input_ids;
     seq_len = request.text.seq_length;
@@ -670,7 +670,7 @@ Status Qwen3VLModel::PrepareInputs(const InferRequest& request,
 
 Status Qwen3VLModel::RunTextDecoder(uint16_t* hidden_states, int32_t seq_len,
                                     const float* cos, const float* sin, const float* mask,
-                                    const std::vector<std::vector<uint16_t>>& ds_features,
+                                    const std::vector<NpuTensor>& ds_features,
                                     const std::vector<int64_t>& image_token_positions) {
     auto* alloc = runtime_->GetAllocator();
     int64_t hs = config_.text_hidden_size;
@@ -722,7 +722,7 @@ Status Qwen3VLModel::RunTextDecoder(uint16_t* hidden_states, int32_t seq_len,
         }
         h_npu = std::move(h_out);
         if (li < static_cast<int32_t>(ds_features.size()) &&
-            !ds_features[li].empty() && !image_token_positions.empty()) {
+            ds_features[li] && !image_token_positions.empty()) {
             deepstack_fusion_->InjectFeatures(h_npu, ds_features[li], image_token_positions, n, hs, ved, runtime_);
         }
     }
@@ -749,7 +749,7 @@ Status Qwen3VLModel::RunTextDecoder(uint16_t* hidden_states, int32_t seq_len,
 Status Qwen3VLModel::RunVision(const uint16_t* pixel_values, int64_t num_patches,
                                const int64_t* grid_thw, int64_t num_images,
                                uint16_t* vis_embeds_out, int64_t vis_embed_dim,
-                               std::vector<std::vector<uint16_t>>& ds_features) {
+                               std::vector<NpuTensor>& ds_features) {
     auto* alloc = runtime_->GetAllocator();
 
     int64_t vis_hs = config_.vis_hidden_size;

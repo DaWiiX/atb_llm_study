@@ -28,25 +28,25 @@ public:
     /// @param layer_idx     Vision block layer index (used to decide whether to extract)
     /// @param fusion_idx    Output: fusion feature index
     /// @param runtime       Runtime interface
-    /// @param[out] ds_features  Output deepstack features (host fp16)
+    /// @param[out] ds_features  Output deepstack features (NPU fp16)
     /// @return STATUS_OK on success
     virtual Status ExtractFeatures(NpuTensor& hidden_npu,
                                    int64_t total_tokens,
                                    int32_t layer_idx,
                                    size_t& fusion_idx,
                                    IRuntime* runtime,
-                                   std::vector<std::vector<uint16_t>>& ds_features) = 0;
+                                   std::vector<NpuTensor>& ds_features) = 0;
 
     /// Inject fusion features into text hidden states.
     /// @param hidden_npu   Text hidden states (NPU, modified in-place)
-    /// @param ds_feat      Deepstack features (host fp16)
+    /// @param ds_feat      Deepstack features (NPU fp16)
     /// @param positions    Image token positions in text sequence
     /// @param seq_len      Text sequence length
     /// @param hidden_size  Text hidden dimension
     /// @param feat_dim     Deepstack feature dimension
     /// @param runtime      Runtime interface
     virtual void InjectFeatures(NpuTensor& hidden_npu,
-                                const std::vector<uint16_t>& ds_feat,
+                                const NpuTensor& ds_feat,
                                 const std::vector<int64_t>& positions,
                                 int64_t seq_len, int64_t hidden_size,
                                 int64_t feat_dim,

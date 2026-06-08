@@ -208,6 +208,7 @@ add_atb_test(test_vision_merger_precision       tests/level2_op_precision/test_v
 
 # Level 3 integration tests (Wave 4)
 add_atb_test(test_deepstack              tests/level3_integration/test_deepstack.cpp)
+add_atb_test(test_deepstack_npu_tensor   tests/level3_integration/test_deepstack_npu_tensor.cpp)
 add_atb_test(test_vision_runner_full     tests/level3_integration/test_vision_runner_full.cpp)
 add_atb_test(test_text_runner_full       tests/level3_integration/test_text_runner_full.cpp)
 
