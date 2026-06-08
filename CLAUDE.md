@@ -42,6 +42,10 @@ Tests require a model checkpoint at `/mnt/workspace/gitCode/models/Qwen3-VL-Embe
 
 All unit tests validate ATB output against the transformers reference implementation using cosine similarity (threshold typically 0.99).
 
+## 测试精度原则
+
+**绝不通过降低验收标准来"通过"测试。** 如果 C++ 和 Python 在相同输入下余弦相似度低于 0.99，说明存在 bug，必须定位并修复根因，而不是放宽阈值。在有 Python 参考实现的情况下，C++ 应严格对齐 Python 的计算逻辑，逐阶段排查差异直到余弦相似度 ≥ 0.99。
+
 ## Architecture
 
 ### Split-graph strategy

@@ -1,0 +1,288 @@
+# Python → C++ 迁移项目：增量测试策略指南
+
+## 核心原则
+
+**永不通过降低阈值来“通过”测试。** 如果 C++ 和 Python 在相同输入下余弦相似度低于 0.99，说明存在 bug，必须定位并修复根因。
+
+参考 [REFACTOR_PLAN.md](./REFACTOR_PLAN.md) 中已修复的 Bug —— 每一个 Bug 都对应着一个本应更早被发现的测试缺口。
+
+---
+
+## 一、测试层次设计
+
+理想的测试金字塔应如下（下层越厚越好）：
+
+```
+          ┌──────────────┐
+          │   E2E        │  3 个模式 × 2 套验证 = 6 个 case
+          │   (Level 4)  │  ATB vs Python 最终输出
+          ├──────────────┤
+          │   集成       │  每个子模型 (Vision/Text) 1-2 个 case
+          │   (Level 3)  │  多组件组合，验证数据流正确
+          ├──────────────┤
+          │   算子精度    │  每个 Graph 组件 2-4 个 case
+          │   (Level 2)  │  相同 input+weights → ATB vs NumPy/PyTorch
+          ├──────────────┤
+          │  CPU 纯函数  │  每个纯函数 ≥ 3 个 case
+          │   (Level 1)  │  相同输入 → 逐元素精确匹配/byte-exact
+          ├──────────────┤
+          │   基础框架   │  框架正确性，不依赖模型
+          │   (Level 0)  │  内存分配、JSON 解析、RAII 安全
+          └──────────────┘
+```
+
+### Level 0: 基础框架测试 (CPU, 无 NPU)
+
+- **目的**: 确保基础设施可用
+- **覆盖**: ContextManager 创建, TensorAllocator 分配/释放, GraphBuilder 构建, BufferPool 扩容, JsonConfig 解析, NpuTensor RAII 安全
+- **验证**: Doctest 断言, 不需要精度对比
+- **当前状态**: ✅ `test_core.cpp`, `test_io_adapters.cpp` 已有
+
+### Level 1: CPU 纯函数测试 (最重要的缺失层)
+
+- **目的**: 验证所有不依赖 NPU 的计算逻辑，在 CI 上即可运行
+- **覆盖**: 位置编码、RoPE 频率计算、图像尺寸 resize、mask 生成、token 索引计算
+- **验证**: 相同输入 → 逐元素精确匹配 (Python `get_rope_index` ↔ C++ `GetRopeIndex`)
+- **当前状态**: ❌ 几乎完全缺失
+- **速度**: 毫秒级，可在 CI 上运行
+
+#### Level 1 必须测试的函数清单
+
+| 函数 | C++ 位置 | Python 参考 | 优先级 |
+|---|---|---|---|
+| `GetRopeIndex` | `components/common/mrope.cpp` | `engine_utils.py:get_rope_index` | 🔴 最高 |
+| `MRoPE::Compute` | `components/common/mrope.cpp` | `rotary_emb(pid)` | 🔴 最高 |
+| `MRoPE::ApplyInterleaved` | `components/common/mrope.cpp` | MRoPE 内部逻辑 | 🟡 |
+| `VisionRotaryEmbedding::ComputeFreqTable` | `components/common/mrope.cpp` | `Qwen3VLVisionRotaryEmbedding(mh)` | 🔴 最高 |
+| `VisionRotaryEmbedding::ComputeRoPE` | `components/common/mrope.cpp` | `vm.rot_pos_emb(gth)` | 🔴 最高 |
+| `ComputeVisionRotPosEmb` | `components/common/mrope.cpp` | 视觉 RoPE 计算 | 🔴 最高 |
+| `ComputePosEmbedInterp` | `components/vision/pos_embed_interp.cpp` | `fast_pos_embed_interpolate()` | 🔴 最高 |
+| `MakeCausalMask` | `runners/text_runner.cpp` | `text_model.py:make_causal_mask` | 🟡 |
+| `SmartResize` | `adapters/.../qwen3vl_preprocess.cpp` | `preprocess.py` | 🔴 最高 |
+
+#### Level 1 测试的侵入式策略
+
+测试纯 CPU 函数时，不要只对比最终模型的输出。要**在相同的已知输入下，分别调用 Python 和 C++ 的对应函数，逐元素比较输出**。
+
+**示例: GetRopeIndex 测试**
+
+```cpp
+// test_mrope_cpu.cpp — 不依赖 NPU
+TEST_CASE("GetRopeIndex against Python reference") {
+    // 1. 准备输入 (与 Python 完全一致)
+    int64_t input_ids[] = {151652, 151655, 151655, 151655, 151655};  // vision_start + 4 image tokens
+    int64_t grid_thw[] = {1, 2, 2};                                   // 1×2×2 grid
+    int64_t position_ids[3 * 1 * 5];                                  // (3, B=1, S=5)
+
+    // 2. 调用 C++ 函数
+    GetRopeIndex(input_ids, 1, 5, grid_thw, 1,
+                 151655, 151652, 2, position_ids);
+
+    // 3. 与 Python 参考值比较 (预计算的已知正确值)
+    // Python: get_rope_index(...) → 3D position_ids
+    int64_t expected[15] = {
+        /* T: */ 0, 0,1,2, 0,1,2,3, 3,
+        /* H: */ 0, 0,0,0, 1,1,1,1, 3,
+        /* W: */ 0, 0,1,0, 01,0,1,0,1,2,3, 3
+    };
+    // 逐元素比较
+    for (int i = 0; i < 15; i++) {
+        CHECK(position_ids[i] == expected[i]);
+    }
+}
+```
+
+关键: 不要用模型推理的最终结果来验证。用**独立计算的小输入**来验证。
+
+### Level 2: 算子精度测试 (NPU 依赖)
+
+- **目的**: 验证每个 ATB graph 组件的数值精度
+- **覆盖**: RmsNorm, Linear, SwiGLU, SelfAttention, VisionAttention, VisionMLP, LayerNorm, PatchEmbed
+- **验证**: 相同随机输入 + 相同权重 → ATB vs PyTorch/NumPy cosine ≥ 0.999
+- **当前状态**: ✅ Python 侧很完善, ❌ C++ 侧完全缺失
+
+#### C++ 侧缺失的算子精度测试
+
+每个算子需要 2-4 个 case:
+- **正常尺寸**: 模拟实际模型的维度
+- **边界尺寸**: seq_len=1, 最小 hidden_size
+- **不同精度组合**: fp16 vs fp32
+
+```cpp
+// test_rms_norm_precision.cpp 示例
+TEST_CASE("RmsNorm precision vs PyTorch") {
+    // 1. 随机种子 42, 生成 hidden_states [4, 64] fp32
+    // 2. 权重全 1.0 (或随机但 C++/Python 一致)
+    // 3. C++ RmsNormGraph → 输出 fp16 → 转 fp32
+    // 4. Python F.rms_norm(x, [64], weight, eps=1e-6) → fp32
+    // 5. cosine ≥ 0.999
+}
+```
+
+### Level 3: 集成测试
+
+- **目的**: 验证多个组件组合后的数据流正确
+- **覆盖**: VisionModel (first_layer → blocks → merger), TextModel (多层 loop + norm), Deepstack 注入
+- **验证**: 固定输入 → ATB vs TF cosine ≥ 0.99
+- **当前状态**: ✅ Python 侧有, 🟡 C++ 侧只有 build 验证
+
+### Level 4: E2E 测试
+
+- **目的**: 验证完整推理管线的最终输出
+- **覆盖**: TEXT_ONLY, IMAGE_ONLY, IMAGE_AND_TEXT 三种模式
+- **验证**: ATB vs Python/TF 最终 embedding cosine ≥ 0.99
+- **当前状态**: ✅ 两侧都有
+
+---
+
+## 二、增量测试策略：跟着代码走
+
+以下是在迁移 Python → C++ 的每个阶段应该同步编写的测试：
+
+### 阶段 1: 基础框架 (Phase 0-2)
+
+**写什么代码**: ContextManager, TensorAllocator, GraphBuilder, JsonConfig
+**同步写什么测试**:
+- `test_core.cpp` — 每个类的创建、基本操作、错误路径
+- 纯 CPU, 不依赖模型
+
+### 阶段 2: 配置和数据加载 (Phase 3-4)
+
+**写什么代码**: Qwen3VLConfig, SafetensorsReader, WeightLoader
+**同步写什么测试**:
+- `test_io_adapters.cpp` — JSON 解析正确性、safetensors 读取、weight 形状验证
+- 先创建最小的 safetensors 文件作为 test fixture
+
+### 阶段 3: CPU 纯计算函数 (关键阶段！)
+
+**写什么代码**: GetRopeIndex, MRoPE, VisionRotaryEmbedding, ComputePosEmbedInterp, SmartResize
+**同步写什么测试**:
+- **每个函数至少 3 个 case**: 正常尺寸、边界条件、多图像/多 batch
+- 用 Python 生成 reference 数据（byte-exact 的 int64 数组或 float 数组）
+- 这些测试**不依赖 NPU**，应该在 CI 上毫秒级完成
+
+**为什么这一层至关重要**:
+- GetRopeIndex 是一个 ~100 行的纯逻辑函数，但包含了 image_token 识别、2D grid 位置生成、连续位置计数等复杂逻辑
+- 如果在这个阶段就写好了 Python ↔ C++ 逐元素对比测试
+- GetRopeIndex 的 bug（是我们项目中最严重的精度问题，IMAGE_ONLY cosine 仅 0.844）会在**写好函数后 5 分钟内**就被发现和修复
+- 而不是在整个模型 E2E 跑通后才从 0.844 的 cosine 反向定位
+
+### 阶段 4: 基础算子 (Phase 5-7)
+
+**写什么代码**: RmsNormGraph, LinearOp, ElewiseOp, SplitOp
+**同步写什么测试**:
+- `test_rms_norm_precision.cpp` — 与 PyTorch F.rms_norm 对比
+- `test_linear_precision.cpp` — 与 PyTorch F.linear 对比
+- **每个算子 2-4 个 case**: 不同维度、不同精度
+
+### 阶段 5: 子图组件 (Phase 8-11)
+
+**写什么代码**: SwiGluMlpGraph, SelfAttentionGraph, VisionAttentionGraph, VisionMLPGraph, VisionBlockGraph
+**同步写什么测试**:
+- 每个 component graph 至少 1 个精度测试: 随机输入 + 随机权重 → ATB vs TF/numpy
+- VisionBlock 包含 RoPE → 验证 RoPE 集成正确
+
+### 阶段 6: 子模型 Runner (Phase 12-14)
+
+**写什么代码**: VisionRunner, TextRunner, DeepstackFusion
+**同步写什么测试**:
+- VisionRunner: 相同 pixel_values + weights → ATB vs TF cosine ≥ 0.99
+- TextRunner: 相同 inputs_embeds + position_ids → ATB vs TF cosine ≥ 0.99
+- Deepstack: 验证 feature 注入正确性（位置、值）
+
+### 阶段 7: 适配器和引擎 (Phase 15-16)
+
+**写什么代码**: Qwen3VLModel, LLMEngine, Preprocess
+**同步写什么测试**:
+- 三模式 E2E 测试
+- 错误路径测试 (null input, batch_size≠1, seq_len=0)
+
+---
+
+## 三、测试辅助工具建议
+
+### 1. Python Reference Generator（应该统一为一个）
+
+当前 C++ 项目有 5+ 个不同的 Python reference 生成脚本 (`gen_python_reference.py`, `gen_stage_reference.py`, `test_first_layer_ref.py`, `test_vision_block_ref.py`, `test_stage_reference.py`)，应该统一为一个 `gen_reference.py`，支持：
+
+```bash
+python tests/gen_reference.py --stage get_rope_index   # 生成 position_ids
+python tests/gen_reference.py --stage mrope            # 生成 cos/sin
+python tests/gen_reference.py --stage vision_rope      # 生成 vision cos/sin
+python tests/gen_reference.py --stage all              # 生成所有 stage
+```
+
+### 2. 统一测试输入
+
+建议建立一个 `test_inputs/` 目录：
+
+```
+test_inputs/
+  images/
+    gradient_720x1280.bin       # 梯度图 raw bytes
+    solid_red_64x64.bin          # 纯色图
+    solid_blue_120x200.bin       # 纯色图
+  tokens/
+    text_desc.json               # "Describe the image." token IDs
+    image_only_880tokens.json    # IMAGE_ONLY token IDs
+  references/
+    position_ids_1x2x2.bin       # GetRopeIndex 期望输出
+    mrope_cos_sin_3tokens.bin    # MRoPE 期望输出
+    ...
+```
+
+### 3. CI 流水线分层
+
+```
+Layer 0 (CPU only, 秒级):  test_core, test_io_adapters, test_*_cpu (Level 1 pure functions)
+Layer 1 (NPU, 分钟级):     test_*_precision (Level 2 op precision + Level 3 integration)
+Layer 2 (NPU, 10 分钟级):  test_accuracy, test_e2e (Level 4 E2E)
+```
+
+---
+
+## 四、从已有 Bug 反推缺失的测试
+
+### Bug #1: GetRopeIndex 位置编码错误
+
+- **影响**: IMAGE_ONLY cosine 0.844, IMAGE_AND_TEXT cosine 0.987
+- **根因**: C++ 直接识别 image_token_id 生成 2D grid 位置，绕过了 vision_start_token_id 检查
+- **缺失的测试**: Level 1 — `test_mrope_cpu.cpp` 中缺少 `GetRopeIndex` 的纯 CPU 测试
+- **应该如何测**: 构造 `[vision_start_token_id, image_token_id, ...]` 输入，与 Python `get_rope_index` 逐元素对比
+
+### Bug #2: LayerNorm epsilon 和 axis 参数
+
+- **影响**: 视觉模型精度偏差
+- **根因**: `beginNormAxis` 和 `beginParamsAxis` 默认为 `-1` 而 Python 用的 `1`
+- **缺失的测试**: Level 2 — `test_layer_norm_precision.cpp`，相同输入 + 权重 vs PyTorch `F.layer_norm`
+- **应该如何测**: 构造 `[seq_len, hidden_size]` 输入，epsilon=1e-6，与 PyTorch 对比
+
+### Bug #3: SmartResize banker's rounding
+
+- **影响**: 预处理输出不一致
+- **根因**: C++ 用标准四舍五入，Python 用 banker's rounding
+- **缺失的测试**: Level 1 — `test_smart_resize.cpp` 中对特定尺寸（如 720→704）的精确验证
+- **应该如何测**: 输入 (720, 1280)，验证 resize 结果与 Python 的 `smart_resize` 完全一致
+
+---
+
+## 五、快速检查清单
+
+在新模块迁移到 C++ 时，问自己：
+
+- [ ] 这个模块有没有纯 CPU 的计算逻辑？→ 写 Level 1 测试，与 Python 逐元素对比
+- [ ] 这个 graph/算子可以用随机输入+随机权重独立跑吗？→ 写 Level 2 精度测试
+- [ ] 这个模块的边界条件是什么？（seq_len=1, batch_size>1, 空输入）→ 每种边界一个 case
+- [ ] 这个模块的输入输出是否与 Python 参考实现有 1:1 的对应关系？→ 用相同的 numpy seed 生成输入
+- [ ] 之前修复过的类似 bug 在这里可能重复出现吗？→ 参考 Bug Fixes 列表
+
+---
+
+## 六、与 Python 项目自身测试的关系
+
+Python 项目的测试（`atb_python_qwen3vl_embedding/tests/`）提供了**参考实现**：
+- Python 测试的 `data_utils.generate_base_data()` 生成随机输入 → 可用于 C++ 测试
+- Python 测试的 `transformers_runner.py` 提供了 TF reference → 可用于 C++ 测试的参考值
+- Python 诊断测试 (`test_*_diagnostics.py`) 的模式可以直接搬用到 C++
+
+**建议**: 对于 C++ 项目的每个新模块，在 Python 项目中先写一个对应的 reference 生成函数，输出 binary 文件。C++ 测试读取这个 binary 文件进行精度对比。这样两端使用**完全相同的输入和参考值**。
