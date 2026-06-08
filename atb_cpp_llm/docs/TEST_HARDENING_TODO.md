@@ -65,7 +65,7 @@
 
 | ID | 文件 / 函数 | 问题 | Coder | Reviewer | Status |
 |----|------------|------|-------|----------|--------|
-| H1 | `test_preprocess_cpu.cpp::TestSmartResizeBoundary` | 函数末尾固定 `return true`，所有断言失效 | coder (a5348570) | reviewer (afe0f7d2) ✅ Test 3: 4/4 PASS | **done** |
+| H1 | `test_preprocess_cpu.cpp::TestSmartResizeBoundary` | 函数末尾固定 `return true`，所有断言失效 | coder x3 (a5348570 → a90fe519 重做) | reviewer (a80b2328) ✅ 4/4 PASS + 反向 ✅ | **done** (commit cf72b86) |
 | H2 | `test_vision_rope_cpu.cpp::TestVisionRoPEEdgeCases` | 同上，全部 LOG_INFO 末尾 `return true` | coder (af21493c) | reviewer (a1947971) ✅ 真实有效 | **done** |
 | H3 | `test_vision_rope_cpu.cpp::TestVisionRoPEMultiImage` | 只检 sin/cos∈[-1,1]（trivial），无数值对照 | coder (af21493c) | reviewer (a1947971) ✅ cosine=1.0 | **done** |
 | H13↑ | `test_mrope_cpu.cpp::TestGetRopeIndexEdgeCases` | Case A 不聚合，Case B 无断言 | coder (a5bfcd50) | reviewer (a2b0a129) ✅ | **done** |
@@ -74,7 +74,7 @@
 
 | ID | 文件 / 函数 | 问题 | Coder | Reviewer | Status |
 |----|------------|------|-------|----------|--------|
-| H4 | `test_preprocess_cpu.cpp` | 完全缺 BicubicResize / PreprocessImage 的 Python ref 对比 | coder (a93fb6f0) + 重写 coder TBD | reviewer (a2b0a129) ⚠️ 修复被反向验证 git checkout 清除 | **pending-重做** (gen_cpu_reference.py 已保留，bin 仍在，只需重写 .cpp 部分；同时修 random_8x8 量化误差 bug) |
+| H4 | `test_preprocess_cpu.cpp` | 完全缺 BicubicResize / PreprocessImage 的 Python ref 对比 | coder (a93fb6f0 → a90fe519 重做 + 自 commit) | reviewer (a80b2328) ✅ 5/5 PASS + 反向 ✅ | **done** (commit cf72b86) |
 | H5 | `test_io_adapters.cpp::PreprocessImage` | uniform pixel 无法发现 channel-mean 顺序 bug | - | - | pending |
 | H6 | `test_io_adapters.cpp::BicubicResize` | magic numbers 无注释来源 | coder (a93fb6f0) | reviewer (a2b0a129) ✅ 36/36 PASS | **done** |
 | H7 | `test_vision_attention_precision.cpp` | cos=1,sin=0 identity RoPE，集成层未测真实 RoPE | - | - | pending |
@@ -134,3 +134,5 @@
 - 2026-06-08: **Wave A+ / Wave B** 派发 H13 (coder a5bfcd50)、H4+H6 (coder a93fb6f0)。H4 coder 发现 C++ Catmull-Rom 实际**不**匹配 PyTorch bicubic（注释撒谎），改用 NumPy 复现 C++ 算法做 ref；同时发现 H6 注释加得正确
 - 2026-06-08: reviewer (a2b0a129) 验证：H13 ✅、H6 ✅、H4 ⚠️ random_8x8 案例真实超阈值（0.62 > 1e-3）由 Python ref 用 fp 输入 vs C++ 用 uint8 量化误差导致；**且 reviewer 反向验证 `git checkout` 误删了 H4 的 310 行 C++ 修改（python ref 和 bin 都保留）**
 - 2026-06-08: 架构师补充流程规则（绝不允许 reviewer git checkout 未提交修改），派发 H4 重做
+- 2026-06-08: H1+H4 重做 by coder (a90fe519) 完成并 commit (cf72b86)；reviewer (a80b2328) 用 cp 备份做反向验证，全部 ✅ 5/5 PASS，git 干净，回归全绿
+- 2026-06-08: **P0 全部完成**（H1 ✅ H2 ✅ H3 ✅ H13 ✅）+ H6 ✅。下一步派发 Wave C (H5)，Wave D (H9), Wave E (H7/H8)，Wave F (H10/H11)
