@@ -1,9 +1,12 @@
 /**
  * Level 2 precision test: VisionAttentionGraph vs PyTorch reference.
  *
- * Pipeline (cos=1, sin=0 identity RoPE):
- *   hidden -> QKV Linear(+bias) -> reshape(N, 3, nh, hd) -> Split
- *   Q,K,V (no rotation) -> SelfAttention(PA_ENCODER, BSND) -> proj Linear(+bias)
+ * Pipelines tested:
+ *   1) cos=1, sin=0 identity RoPE  (historical case, validates the
+ *      QKV / SDPA / projection arithmetic without exercising rotation).
+ *   2) Real vision RoPE cos/sin built from VisionRotaryEmbedding (matches
+ *      what the Python engine feeds into ATB RopeOp). This actually
+ *      exercises the half-rotation branch end-to-end.
  *
  * Prerequisites:
  *     python tests/gen_cpu_reference.py --stage vision_attention
@@ -173,4 +176,92 @@ TEST_CASE("VisionAttentionGraph precision: N=16 nh=4 hd=32") {
     float cs = CosineSim(out_f32.data(), ref_f32.data(), out_f32.size());
     LOG_INFO("  cosine = %.6f", cs);
     CHECK(cs >= 0.99f);
+}
+
+// ═════════════════════════════════════════════════════════════════
+// Case: VisionAttention end-to-end precision with REAL vision RoPE
+//   Loads cpu_vision_attn_{cos,sin,ref}_real.bin which were built from
+//   VisionRotaryEmbedding (grid [[1,4,4]] → 16 tokens, hd=32). Same
+//   weights/input as the identity case; only cos/sin and ref change.
+// ═════════════════════════════════════════════════════════════════
+TEST_CASE("VisionAttentionGraph precision: real RoPE N=16 nh=4 hd=32") {
+    LOG_INFO("=== VisionAttention precision (real RoPE) ===");
+
+    ArrayFp16 x, qkv_w, qkv_b, proj_w, proj_b, cos, sin, ref;
+    MetaI32 meta;
+    REQUIRE(x.Load("/tmp/cpu_vision_attn_x.bin"));
+    REQUIRE(qkv_w.Load("/tmp/cpu_vision_attn_qkv_w.bin"));
+    REQUIRE(qkv_b.Load("/tmp/cpu_vision_attn_qkv_b.bin"));
+    REQUIRE(proj_w.Load("/tmp/cpu_vision_attn_proj_w.bin"));
+    REQUIRE(proj_b.Load("/tmp/cpu_vision_attn_proj_b.bin"));
+    REQUIRE(cos.Load("/tmp/cpu_vision_attn_cos_real.bin"));
+    REQUIRE(sin.Load("/tmp/cpu_vision_attn_sin_real.bin"));
+    REQUIRE(ref.Load("/tmp/cpu_vision_attn_ref_real.bin"));
+    REQUIRE(meta.Load("/tmp/cpu_vision_attn_meta.bin"));
+    REQUIRE(meta.data.size() == 3);
+    int64_t N  = meta.data[0];
+    int64_t nh = meta.data[1];
+    int64_t hd = meta.data[2];
+    int64_t hidden = nh * hd;
+
+    auto runtime = atb_llm::CreateRuntime(0, 2LL * 1024 * 1024 * 1024);
+    REQUIRE(runtime != nullptr);
+    auto* alloc = runtime->GetAllocator();
+    auto* ctx   = runtime->GetContext();
+
+    atb_llm::OperationHandle op;
+    REQUIRE(IS_OK(atb_llm::components::VisionAttentionGraph::Build(
+        "VAttnPrecReal", static_cast<int32_t>(nh), static_cast<int32_t>(hd), op)));
+    REQUIRE(op.get() != nullptr);
+
+    atb::Tensor x_t, qkvw_t, qkvb_t, projw_t, projb_t, cos_t, sin_t, seqlen_t, out_t;
+    REQUIRE(IS_OK(alloc->AllocFloat16(x_t,     {N, hidden})));
+    REQUIRE(IS_OK(alloc->AllocFloat16(qkvw_t,  {3 * hidden, hidden})));
+    REQUIRE(IS_OK(alloc->AllocFloat16(qkvb_t,  {3 * hidden})));
+    REQUIRE(IS_OK(alloc->AllocFloat16(projw_t, {hidden, hidden})));
+    REQUIRE(IS_OK(alloc->AllocFloat16(projb_t, {hidden})));
+    REQUIRE(IS_OK(alloc->AllocFloat16(cos_t,   {N, hd})));
+    REQUIRE(IS_OK(alloc->AllocFloat16(sin_t,   {N, hd})));
+    REQUIRE(IS_OK(alloc->AllocFloat16(out_t,   {N, hidden})));
+
+    REQUIRE(IS_OK(alloc->CopyToDevice(x_t,     x.data.data(),      x.data.size()      * 2)));
+    REQUIRE(IS_OK(alloc->CopyToDevice(qkvw_t,  qkv_w.data.data(),  qkv_w.data.size()  * 2)));
+    REQUIRE(IS_OK(alloc->CopyToDevice(qkvb_t,  qkv_b.data.data(),  qkv_b.data.size()  * 2)));
+    REQUIRE(IS_OK(alloc->CopyToDevice(projw_t, proj_w.data.data(), proj_w.data.size() * 2)));
+    REQUIRE(IS_OK(alloc->CopyToDevice(projb_t, proj_b.data.data(), proj_b.data.size() * 2)));
+    REQUIRE(IS_OK(alloc->CopyToDevice(cos_t,   cos.data.data(),    cos.data.size()    * 2)));
+    REQUIRE(IS_OK(alloc->CopyToDevice(sin_t,   sin.data.data(),    sin.data.size()    * 2)));
+
+    int32_t seqlen_val = static_cast<int32_t>(N);
+    seqlen_t.desc.dtype     = ACL_INT32;
+    seqlen_t.desc.format    = ACL_FORMAT_ND;
+    seqlen_t.desc.shape.dimNum = 1;
+    seqlen_t.desc.shape.dims[0] = 1;
+    seqlen_t.dataSize = sizeof(int32_t);
+    seqlen_t.hostData = &seqlen_val;
+
+    atb::VariantPack vp;
+    vp.inTensors  = {x_t, qkvw_t, qkvb_t, projw_t, projb_t, cos_t, sin_t, seqlen_t};
+    vp.outTensors = {out_t};
+
+    uint64_t ws_size = 0;
+    REQUIRE(op.get()->Setup(vp, ws_size, ctx) == atb::NO_ERROR);
+    uint8_t* ws_ptr = nullptr;
+    if (ws_size > 0) {
+        auto [ws, ws_st] = runtime->GetWorkspace(ws_size);
+        REQUIRE(IS_OK(ws_st));
+        ws_ptr = ws;
+    }
+    REQUIRE(op.get()->Execute(vp, ws_ptr, ws_size, ctx) == atb::NO_ERROR);
+    runtime->Synchronize();
+
+    std::vector<uint16_t> host_out(N * hidden);
+    REQUIRE(IS_OK(alloc->CopyToHost(host_out.data(), out_t, host_out.size() * 2)));
+    auto out_f32 = Fp16ToF32(host_out);
+    auto ref_f32 = Fp16ToF32(ref.data);
+    REQUIRE(out_f32.size() == ref_f32.size());
+
+    float cs = CosineSim(out_f32.data(), ref_f32.data(), out_f32.size());
+    LOG_INFO("  cosine (real RoPE) = %.6f", cs);
+    CHECK(cs >= 0.999f);
 }

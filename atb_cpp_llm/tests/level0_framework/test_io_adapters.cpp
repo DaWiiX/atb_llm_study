@@ -27,10 +27,14 @@
 #include <cstdio>
 #include <cstring>
 #include <cmath>
+#include <cstdint>
+#include <limits>
 #include <string>
 #include <vector>
 #include <fstream>
 #include <array>
+
+#include "utils/float_utils.h"
 
 // ── Helper: create a minimal safetensors file with known tensors ─────
 static std::string CreateTestSafetensors(const std::string& path) {
@@ -129,6 +133,41 @@ static void Mkdir(const std::string& dir) {
     int ret = system(cmd.c_str());
     (void)ret;
 }
+
+// ── Helper: load a typed binary file dumped by gen_cpu_reference.py ──
+// Format: [ndim: int64] [shape: int64[ndim]] [data: T[]].
+namespace {
+template <typename T>
+bool LoadBin(const char* path,
+             std::vector<T>& data,
+             std::vector<int64_t>& shape) {
+    FILE* f = std::fopen(path, "rb");
+    if (f == nullptr) return false;
+    int64_t ndim = 0;
+    if (std::fread(&ndim, sizeof(int64_t), 1, f) != 1) {
+        std::fclose(f);
+        return false;
+    }
+    if (ndim <= 0 || ndim > 8) {
+        std::fclose(f);
+        return false;
+    }
+    shape.assign(static_cast<size_t>(ndim), 0);
+    if (std::fread(shape.data(), sizeof(int64_t),
+                   static_cast<size_t>(ndim), f) !=
+        static_cast<size_t>(ndim)) {
+        std::fclose(f);
+        return false;
+    }
+    int64_t total = 1;
+    for (int64_t i = 0; i < ndim; i++) total *= shape[static_cast<size_t>(i)];
+    data.assign(static_cast<size_t>(total), T{});
+    size_t got = std::fread(data.data(), sizeof(T),
+                            static_cast<size_t>(total), f);
+    std::fclose(f);
+    return got == static_cast<size_t>(total);
+}
+}  // namespace
 
 // ═══════════════════════════════════════════════════════════════════
 // SafetensorsReader Tests
@@ -859,6 +898,26 @@ TEST_CASE("PreprocessImage - small image basic") {
         }
     }
     CHECK(any_nonzero);
+
+    // Stronger check: uniform input 128 with default mean=0.5/std=0.5 and
+    // pixel scaling /255 should yield (128/255 - 0.5)/0.5 ≈ 0.00392 across
+    // ALL pixels. If channel-mean order, normalize order, or spatial layout
+    // is wrong, the variance across the buffer will spike — a uniform input
+    // can never produce a non-uniform output. We assert max-min < 0.01 and
+    // mean ≈ expected.
+    const float expected = (128.0f / 255.0f - 0.5f) / 0.5f;
+    float pv_min = std::numeric_limits<float>::infinity();
+    float pv_max = -std::numeric_limits<float>::infinity();
+    double pv_sum = 0.0;
+    for (int64_t i = 0; i < num_patches * patch_dim; i++) {
+        float v = atb_llm::Fp16ToF32(pixel_values[i]);
+        if (v < pv_min) pv_min = v;
+        if (v > pv_max) pv_max = v;
+        pv_sum += v;
+    }
+    float pv_mean = static_cast<float>(pv_sum / (num_patches * patch_dim));
+    CHECK((pv_max - pv_min) < 0.01f);   // uniform input -> uniform output
+    CHECK(pv_mean == doctest::Approx(expected).epsilon(0.01));
 }
 
 TEST_CASE("PreprocessImage - output shape consistency") {
@@ -891,4 +950,116 @@ TEST_CASE("PreprocessImage - output shape consistency") {
     CHECK(out_num_patches == num_patches);
     CHECK(grid_thw[1] == grid_h);
     CHECK(grid_thw[2] == grid_w);
+}
+
+TEST_CASE("PreprocessImage - gradient image vs Python ref") {
+    // Compares against the Python reference produced by
+    // tests/python_reference/gen_cpu_reference.py::gen_bicubic_preprocess
+    // for the "gradient_64x64" case (per-channel gradient RGB: R horizontal,
+    // G vertical, B diagonal). A uniform fill cannot expose channel-mean
+    // order, normalize order, or spatial-layout bugs; a gradient does.
+    //
+    // Reference files (regenerate via `python tests/python_reference/gen_cpu_reference.py`):
+    //   /tmp/preprocess_gradient_64x64_input.bin   — f32 [3,64,64], cast to u8 in C++
+    //   /tmp/preprocess_gradient_64x64_output.bin  — fp16 pixel_values
+    //   /tmp/preprocess_gradient_64x64_grid.bin    — i64 [1,3] grid_thw
+    //
+    // Threshold: cosine ≥ 0.999 (matches H4; small bicubic boundary
+    // difference between C++ Catmull-Rom-edge-clamp and torch reflect
+    // pad is absorbed under that tolerance).
+    const char* input_path  = "/tmp/preprocess_gradient_64x64_input.bin";
+    const char* output_path = "/tmp/preprocess_gradient_64x64_output.bin";
+    const char* grid_path   = "/tmp/preprocess_gradient_64x64_grid.bin";
+
+    std::vector<float>   ref_input_f32;
+    std::vector<int64_t> input_shape;
+    std::vector<uint16_t> ref_output_fp16;
+    std::vector<int64_t> output_shape;
+    std::vector<int64_t> ref_grid;
+    std::vector<int64_t> grid_shape;
+
+    bool input_loaded  = LoadBin<float>(input_path, ref_input_f32, input_shape);
+    bool output_loaded = LoadBin<uint16_t>(output_path, ref_output_fp16, output_shape);
+    bool grid_loaded   = LoadBin<int64_t>(grid_path, ref_grid, grid_shape);
+
+    if (!input_loaded || !output_loaded || !grid_loaded) {
+        WARN("Skipping: Python reference bin(s) missing under /tmp. "
+             "Regenerate via tests/python_reference/gen_cpu_reference.py");
+        return;
+    }
+
+    REQUIRE(input_shape.size() == 3);   // [C, H, W]
+    REQUIRE(input_shape[0] == 3);
+    const int32_t C = static_cast<int32_t>(input_shape[0]);
+    const int32_t H = static_cast<int32_t>(input_shape[1]);
+    const int32_t W = static_cast<int32_t>(input_shape[2]);
+
+    // Round-and-clip f32 reference back to uint8 (matches what the Python
+    // ref consumed: image.astype(np.uint8) on a [0,255] gradient).
+    std::vector<uint8_t> image_u8(static_cast<size_t>(C) * H * W);
+    for (size_t i = 0; i < image_u8.size(); i++) {
+        float v = ref_input_f32[i];
+        if (v < 0.0f) v = 0.0f;
+        if (v > 255.0f) v = 255.0f;
+        image_u8[i] = static_cast<uint8_t>(v + 0.5f);
+    }
+
+    atb_llm::adapters::Qwen3VLConfig cfg;
+    // Defaults: patch_size=16, temporal_patch_size=2, merge_size=2,
+    // min_pixels=4096, max_pixels=1310720. 64x64 stays 64x64.
+
+    int32_t new_h, new_w;
+    atb_llm::adapters::SmartResize(
+        H, W, cfg.pp_patch_size * cfg.pp_merge_size,
+        cfg.pp_min_pixels, cfg.pp_max_pixels, new_h, new_w);
+    int32_t grid_h = new_h / cfg.pp_patch_size;
+    int32_t grid_w = new_w / cfg.pp_patch_size;
+    int64_t num_patches = static_cast<int64_t>(grid_h) * grid_w;
+    int64_t patch_dim = static_cast<int64_t>(C) * cfg.pp_temporal_patch_size *
+                        cfg.pp_patch_size * cfg.pp_patch_size;
+
+    std::vector<uint16_t> pixel_values(static_cast<size_t>(num_patches * patch_dim), 0);
+    int64_t out_num_patches = 0;
+    int64_t grid_thw[3] = {};
+
+    atb_llm::Status s = atb_llm::adapters::PreprocessImage(
+        image_u8.data(), C, H, W, cfg,
+        pixel_values.data(), out_num_patches, grid_thw);
+
+    bool all_ok = true;
+    bool ok;
+
+    ok = (s == atb_llm::STATUS_OK);
+    CHECK(ok); all_ok &= ok;
+
+    ok = (out_num_patches == num_patches);
+    CHECK(ok); all_ok &= ok;
+
+    // Exact grid_thw match.
+    REQUIRE(ref_grid.size() == 3);
+    ok = (grid_thw[0] == ref_grid[0]);
+    CHECK(ok); all_ok &= ok;
+    ok = (grid_thw[1] == ref_grid[1]);
+    CHECK(ok); all_ok &= ok;
+    ok = (grid_thw[2] == ref_grid[2]);
+    CHECK(ok); all_ok &= ok;
+
+    // Size match between C++ output and Python ref.
+    const size_t total = static_cast<size_t>(num_patches * patch_dim);
+    ok = (ref_output_fp16.size() == total);
+    CHECK(ok); all_ok &= ok;
+
+    if (all_ok) {
+        // Cosine similarity in fp32 space.
+        double dot = 0.0, na = 0.0, nb = 0.0;
+        for (size_t i = 0; i < total; i++) {
+            float a = atb_llm::Fp16ToF32(pixel_values[i]);
+            float b = atb_llm::Fp16ToF32(ref_output_fp16[i]);
+            dot += static_cast<double>(a) * b;
+            na  += static_cast<double>(a) * a;
+            nb  += static_cast<double>(b) * b;
+        }
+        double cos = dot / (std::sqrt(na) * std::sqrt(nb) + 1e-12);
+        CHECK(cos >= 0.999);
+    }
 }

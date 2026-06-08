@@ -1,9 +1,13 @@
 /**
  * Level 2 precision test: VisionBlockGraph vs PyTorch reference.
  *
- * Pipeline (cos=1, sin=0 identity RoPE):
- *   hidden -> LayerNorm -> VisionAttention(+residual)
- *          -> LayerNorm -> VisionMLP(+residual) -> output
+ * Pipelines tested (per TEST_CASE):
+ *   * cos=1, sin=0 identity RoPE (historical small case -- back-compat).
+ *   * Real vision RoPE built from VisionRotaryEmbedding for two shapes:
+ *       - small    (N=16,  nh=4,  hd=16)  grid [[1,4,4]]
+ *       - typical  (N=256, nh=16, hd=64)  grid [[1,16,16]]   -- Qwen3VL scale
+ *     (matches the engine-side cos/sin path so the RoPE half-rotation
+ *      branch is actually exercised through the block.)
  *
  * Prerequisites:
  *     python tests/gen_cpu_reference.py --stage vision_block
@@ -87,36 +91,28 @@ std::vector<float> Fp16ToF32(const std::vector<uint16_t>& src) {
     return dst;
 }
 
-}  // namespace
-
-// ═════════════════════════════════════════════════════════════════
-// Case: VisionBlock end-to-end precision (LN → Attn → LN → MLP)
-// ═════════════════════════════════════════════════════════════════
-TEST_CASE("VisionBlockGraph precision: N=16 nh=4 hd=32") {
-    LOG_INFO("=== VisionBlock precision ===");
+void RunBlockTest(const std::string& prefix, const std::string& test_label) {
+    LOG_INFO("=== VisionBlock precision: %s ===", test_label.c_str());
 
     ArrayFp16 x, qkv_w, qkv_b, proj_w, proj_b;
     ArrayFp16 fc1_w, fc1_b, fc2_w, fc2_b;
     ArrayFp16 n1_w, n1_b, n2_w, n2_b;
     ArrayFp16 cos, sin, ref;
     MetaI32 meta;
-    REQUIRE(x.Load("/tmp/cpu_vision_block_x.bin"));
-    REQUIRE(qkv_w.Load("/tmp/cpu_vision_block_qkv_w.bin"));
-    REQUIRE(qkv_b.Load("/tmp/cpu_vision_block_qkv_b.bin"));
-    REQUIRE(proj_w.Load("/tmp/cpu_vision_block_proj_w.bin"));
-    REQUIRE(proj_b.Load("/tmp/cpu_vision_block_proj_b.bin"));
-    REQUIRE(fc1_w.Load("/tmp/cpu_vision_block_fc1_w.bin"));
-    REQUIRE(fc1_b.Load("/tmp/cpu_vision_block_fc1_b.bin"));
-    REQUIRE(fc2_w.Load("/tmp/cpu_vision_block_fc2_w.bin"));
-    REQUIRE(fc2_b.Load("/tmp/cpu_vision_block_fc2_b.bin"));
-    REQUIRE(n1_w.Load("/tmp/cpu_vision_block_n1_w.bin"));
-    REQUIRE(n1_b.Load("/tmp/cpu_vision_block_n1_b.bin"));
-    REQUIRE(n2_w.Load("/tmp/cpu_vision_block_n2_w.bin"));
-    REQUIRE(n2_b.Load("/tmp/cpu_vision_block_n2_b.bin"));
-    REQUIRE(cos.Load("/tmp/cpu_vision_block_cos.bin"));
-    REQUIRE(sin.Load("/tmp/cpu_vision_block_sin.bin"));
-    REQUIRE(ref.Load("/tmp/cpu_vision_block_ref.bin"));
-    REQUIRE(meta.Load("/tmp/cpu_vision_block_meta.bin"));
+
+    auto load = [&](const std::string& name, ArrayFp16& arr) {
+        REQUIRE(arr.Load("/tmp/cpu_vision_block" + prefix + "_" + name + ".bin"));
+    };
+    load("x",      x);
+    load("qkv_w",  qkv_w);  load("qkv_b",  qkv_b);
+    load("proj_w", proj_w); load("proj_b", proj_b);
+    load("fc1_w",  fc1_w);  load("fc1_b",  fc1_b);
+    load("fc2_w",  fc2_w);  load("fc2_b",  fc2_b);
+    load("n1_w",   n1_w);   load("n1_b",   n1_b);
+    load("n2_w",   n2_w);   load("n2_b",   n2_b);
+    load("cos",    cos);    load("sin",    sin);
+    load("ref",    ref);
+    REQUIRE(meta.Load("/tmp/cpu_vision_block" + prefix + "_meta.bin"));
     REQUIRE(meta.data.size() == 4);
     int64_t N  = meta.data[0];
     int64_t nh = meta.data[1];
@@ -131,7 +127,7 @@ TEST_CASE("VisionBlockGraph precision: N=16 nh=4 hd=32") {
 
     atb_llm::OperationHandle op;
     REQUIRE(IS_OK(atb_llm::components::VisionBlockGraph::Build(
-        "VBlockPrec",
+        "VBlock" + prefix,
         static_cast<int32_t>(nh), static_cast<int32_t>(hd), 1e-6f, op)));
     REQUIRE(op.get() != nullptr);
 
@@ -206,5 +202,28 @@ TEST_CASE("VisionBlockGraph precision: N=16 nh=4 hd=32") {
 
     float cs = CosineSim(out_f32.data(), ref_f32.data(), out_f32.size());
     LOG_INFO("  cosine = %.6f", cs);
-    CHECK(cs >= 0.99f);
+    CHECK(cs >= 0.999f);
+}
+
+}  // namespace
+
+// ═════════════════════════════════════════════════════════════════
+// Case 1: identity RoPE (original small case, back-compat)
+// ═════════════════════════════════════════════════════════════════
+TEST_CASE("VisionBlockGraph precision: identity RoPE N=16 nh=4 hd=32") {
+    RunBlockTest("", "identity RoPE (small, back-compat)");
+}
+
+// ═════════════════════════════════════════════════════════════════
+// Case 2: real RoPE, small shape  (N=16,  nh=4,  hd=16)
+// ═════════════════════════════════════════════════════════════════
+TEST_CASE("VisionBlockGraph precision: real RoPE small N=16 nh=4 hd=16") {
+    RunBlockTest("_real_small", "real RoPE (small)");
+}
+
+// ═════════════════════════════════════════════════════════════════
+// Case 3: real RoPE, Qwen3VL typical scale  (N=256, nh=16, hd=64)
+// ═════════════════════════════════════════════════════════════════
+TEST_CASE("VisionBlockGraph precision: real RoPE typical H=1024 N=256") {
+    RunBlockTest("_real_typical", "real RoPE (typical Qwen3VL)");
 }

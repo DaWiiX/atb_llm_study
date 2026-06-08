@@ -31,12 +31,13 @@
 - **绝不**通过降低阈值"通过"测试（CLAUDE.md 明文规定）
 - magic number 必须**注释出处**（"由 Python `xxx.py` 生成"）
 
-**派发流程改进**（2026-06-08 H4 教训）：
-- ⚠️ **绝不**让 reviewer 用 `git checkout <file>` 做反向验证清理 —— 会清掉 coder 未提交的修改
-- ✅ reviewer 反向验证修改前**必须** `git diff <file> > /tmp/<id>_reviewer_inject.patch` 备份
-- ✅ 反向验证完成后用 `git checkout <file>` 还原到 working tree 当前状态，然后 `git apply /tmp/<id>_reviewer_inject.patch -R` 撤销注入 — 不对，更稳的方式：
-- ✅ **推荐**：让 reviewer 反向验证时用 `sed` 临时改 + 立即跑 + 立即 `sed` 改回（不碰 git）
-- ✅ 或：reviewer 反向验证前先 `git stash push -m "preserve-coder-fix-<id>" -- <file>`，验证完 `git stash pop`
+**派发流程改进**（2026-06-08 H4 教训 + 用户新规则）：
+- ⚠️ **subagent 绝对禁止做任何 git 操作**（add / commit / checkout / stash / push） — 全部由用户做
+- ⚠️ **architect 自己也不做 git 操作** — 由用户统一处理（用户明确要求）
+- ⚠️ **绝不**让 reviewer 用 `git checkout <file>` 做反向验证清理 — 会清掉 coder 未提交的修改
+- ✅ coder 完成后**只**编辑文件，不 commit；architect 只更新 TODO 文档，等用户 commit
+- ✅ reviewer 反向验证：先 `cp <file> /tmp/<id>_bak.cpp` 备份，sed 改注入，跑测试，**用 `cp` 还原**不碰 git
+- ✅ reviewer 结束时 `git diff <file>` 必须为空（与 HEAD 对比可有合法 coder 修改），作为输出的一部分
 
 ---
 
@@ -75,13 +76,13 @@
 | ID | 文件 / 函数 | 问题 | Coder | Reviewer | Status |
 |----|------------|------|-------|----------|--------|
 | H4 | `test_preprocess_cpu.cpp` | 完全缺 BicubicResize / PreprocessImage 的 Python ref 对比 | coder (a93fb6f0 → a90fe519 重做 + 自 commit) | reviewer (a80b2328) ✅ 5/5 PASS + 反向 ✅ | **done** (commit cf72b86) |
-| H5 | `test_io_adapters.cpp::PreprocessImage` | uniform pixel 无法发现 channel-mean 顺序 bug | - | - | pending |
+| H5 | `test_io_adapters.cpp::PreprocessImage` | uniform pixel 无法发现 channel-mean 顺序 bug | coder (a11d10de) | reviewer (a91ac674) ✅ 37/37 PASS + 反向 ✅ | **done** |
 | H6 | `test_io_adapters.cpp::BicubicResize` | magic numbers 无注释来源 | coder (a93fb6f0) | reviewer (a2b0a129) ✅ 36/36 PASS | **done** |
-| H7 | `test_vision_attention_precision.cpp` | cos=1,sin=0 identity RoPE，集成层未测真实 RoPE | - | - | pending |
-| H8 | `test_vision_block_precision.cpp` | 同 H7 + 只 1 个 case，缺真实规模 | - | - | pending |
-| H9 | `test_rms_norm_precision.cpp` | PRENORM / POSTNORM 只测 Create 成功，零精度覆盖 | - | - | pending |
-| H10 | `test_vision_mlp_precision.cpp` | 只 1 个 case，缺真实规模 (H=1024, I=4096) | - | - | pending |
-| H11 | `test_patch_embed_precision.cpp` | 只 1 个 case，缺真实 Qwen3VL embed=1024 | - | - | pending |
+| H7 | `test_vision_attention_precision.cpp` | cos=1,sin=0 identity RoPE，集成层未测真实 RoPE | coder (adb2c1dc) | reviewer (a0f75dc3) ✅ identity + real RoPE 均 cosine=1.0 | **done** |
+| H8 | `test_vision_block_precision.cpp` | 同 H7 + 只 1 个 case，缺真实规模 | coder (adb2c1dc) | reviewer (a0f75dc3) ✅ 3 cases (identity/real_small/real_typical) cosine≥0.999996 | **done** |
+| H9 | `test_rms_norm_precision.cpp` | PRENORM / POSTNORM 只测 Create 成功，零精度覆盖 | coder (a6aa8bbb) | reviewer (a91ac674) ✅ 7/7 PASS (cosine=1.0) + 反向 ✅ | **done** |
+| H10 | `test_vision_mlp_precision.cpp` | 只 1 个 case，缺真实规模 (H=1024, I=4096) | coder (a4dbdd1d) | reviewer (a0f75dc3) ✅ 3 cases cosine=1.0 | **done** |
+| H11 | `test_patch_embed_precision.cpp` | 只 1 个 case，缺真实 Qwen3VL embed=1024 | coder (a4dbdd1d) | reviewer (a0f75dc3) ✅ 3 cases cosine=1.0 | **done** |
 
 ### 🟡 P2 — 低危：质量改进
 
@@ -136,3 +137,13 @@
 - 2026-06-08: 架构师补充流程规则（绝不允许 reviewer git checkout 未提交修改），派发 H4 重做
 - 2026-06-08: H1+H4 重做 by coder (a90fe519) 完成并 commit (cf72b86)；reviewer (a80b2328) 用 cp 备份做反向验证，全部 ✅ 5/5 PASS，git 干净，回归全绿
 - 2026-06-08: **P0 全部完成**（H1 ✅ H2 ✅ H3 ✅ H13 ✅）+ H6 ✅。下一步派发 Wave C (H5)，Wave D (H9), Wave E (H7/H8)，Wave F (H10/H11)
+- 2026-06-08: **Batch 1**: H5 (coder a11d10de) + H9 (coder a6aa8bbb) 编码完成，reviewer (a91ac674) ✅ 
+  - H5: test_io_adapters 新增 gradient image vs Python ref 用例 + uniform case max-min < 0.01
+  - H9: test_rms_norm 新增 PRENORM/POSTNORM × typical/small 共 4 个精度 case，cosine=1.0
+- 2026-06-08: **Batch 2 + 3 reviewer (a0f75dc3) 验证全部 ✅**
+  - H7: identity + real RoPE 均 cosine=1.000000
+  - H8: 3 cases (identity 0.999999 / real_small 1.000000 / real_typical Qwen3VL 0.999996)
+  - H10: 3 cases (原 + typical Qwen3VL + nobias) 全 cosine=1.000000
+  - H11: 3 cases (原 + typical Qwen3VL + tiny minimal) 全 cosine=1.000000
+  - 反向验证 4 个 ID 全部成功触发 FAIL；回归 test_rms_norm/io_adapters/preprocess 全绿
+- 2026-06-08: **P1 全部完成（11/11）**：H4 ✅ H5 ✅ H6 ✅ H7 ✅ H8 ✅ H9 ✅ H10 ✅ H11 ✅，等待用户统一 commit

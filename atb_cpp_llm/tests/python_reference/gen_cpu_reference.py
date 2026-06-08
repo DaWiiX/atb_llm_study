@@ -653,34 +653,91 @@ def gen_float_utils():
 def gen_rms_norm():
     """Generate fp32 reference for RmsNorm precision tests.
 
-    Three cases:
+    NORM cases (output = RmsNorm(x) * w):
       * "typical"  — Qwen3VL hidden=2048, seq=16
       * "small"    — seq=4, hidden=64 for debug
-      * "prenorm"  — same shape as small, but the test exercises PRENORM/POSTNORM
-                     variants which share the same NORM math for the y output.
+      * "medium"   — seq=8, hidden=256
 
-    File layout (per case): one bin for x (fp32), one for w (fp32),
-    one for expected output (fp32).
+    PRENORM cases (output = RmsNorm(x + residual) * w, resOut = x + residual):
+      ATB layout per doc: inTensors=[x, residual, gamma], outTensors=[output, resOut].
+      Note: the C++ op currently leaves ``preNormParam.epsilon`` at the ATB
+      default of 1e-5, so the reference uses ``1e-5`` to align.
+      * "prenorm_typical" — seq=16, hidden=2048
+      * "prenorm_small"   — seq=4,  hidden=64
+
+    POSTNORM cases (output = RmsNorm(x + residual) * w):
+      ATB layout per doc: inTensors=[x, residual, gamma], outTensors=[output].
+      Note: ``postNormParam.epsilon`` likewise defaults to 1e-5 in the op.
+      * "postnorm_typical" — seq=16, hidden=2048
+      * "postnorm_small"   — seq=4,  hidden=64
+
+    File layout (per NORM case): one bin for x, one for w, one for output.
+    File layout (per PRENORM/POSTNORM case): one bin for x, residual, weight,
+    output, and (PRENORM only) res_out.
     """
     print("[gen] RmsNorm — fp32 reference")
 
-    eps = 1e-6
+    # ── NORM variants ──────────────────────────────────────────────
+    eps_norm = 1e-6
 
-    def _make(name: str, S: int, H: int):
+    def _make_norm(name: str, S: int, H: int):
         torch.manual_seed(42 + S + H)
         x = torch.randn(S, H, dtype=torch.float32)
         w = (torch.rand(H, dtype=torch.float32) - 0.5) * 0.4 + 1.0
         # RMSNorm: x / sqrt(mean(x^2) + eps) * w
-        norm = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)
+        norm = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps_norm)
         out = norm * w
         write_f32(f"{OUTPUT_DIR}/cpu_op_rms_norm_{name}_input.bin",  x.numpy())
         write_f32(f"{OUTPUT_DIR}/cpu_op_rms_norm_{name}_weight.bin", w.numpy())
         write_f32(f"{OUTPUT_DIR}/cpu_op_rms_norm_{name}_output.bin", out.numpy())
         print(f"  → {name}: x{tuple(x.shape)} w{tuple(w.shape)} out{tuple(out.shape)}")
 
-    _make("typical", 16,  2048)
-    _make("small",    4,    64)
-    _make("medium",   8,   256)
+    _make_norm("typical", 16,  2048)
+    _make_norm("small",    4,    64)
+    _make_norm("medium",   8,   256)
+
+    # ── PRENORM / POSTNORM variants ────────────────────────────────
+    # The current C++ op (rms_norm_op.cpp) only writes normParam.epsilon when
+    # building the param struct, leaving preNormParam.epsilon / postNormParam.epsilon
+    # at the ATB default of 1e-5. We match that default here so the reference is
+    # bit-for-bit comparable with what NPU computes.
+    eps_pre_post = 1e-5
+
+    def _make_prenorm(name: str, S: int, H: int):
+        torch.manual_seed(7 + S + H)
+        x        = torch.randn(S, H, dtype=torch.float32)
+        residual = torch.randn(S, H, dtype=torch.float32)
+        w        = (torch.rand(H, dtype=torch.float32) - 0.5) * 0.4 + 1.0
+        res_out  = x + residual
+        norm     = res_out * torch.rsqrt(res_out.pow(2).mean(-1, keepdim=True) + eps_pre_post)
+        output   = norm * w
+        write_f32(f"{OUTPUT_DIR}/cpu_op_rms_norm_prenorm_{name}_input.bin",    x.numpy())
+        write_f32(f"{OUTPUT_DIR}/cpu_op_rms_norm_prenorm_{name}_residual.bin", residual.numpy())
+        write_f32(f"{OUTPUT_DIR}/cpu_op_rms_norm_prenorm_{name}_weight.bin",   w.numpy())
+        write_f32(f"{OUTPUT_DIR}/cpu_op_rms_norm_prenorm_{name}_output.bin",   output.numpy())
+        write_f32(f"{OUTPUT_DIR}/cpu_op_rms_norm_prenorm_{name}_res_out.bin",  res_out.numpy())
+        print(f"  → prenorm_{name}: x{tuple(x.shape)} residual{tuple(residual.shape)}"
+              f" out{tuple(output.shape)} res_out{tuple(res_out.shape)}")
+
+    def _make_postnorm(name: str, S: int, H: int):
+        torch.manual_seed(11 + S + H)
+        x        = torch.randn(S, H, dtype=torch.float32)
+        residual = torch.randn(S, H, dtype=torch.float32)
+        w        = (torch.rand(H, dtype=torch.float32) - 0.5) * 0.4 + 1.0
+        sum_xr   = x + residual
+        norm     = sum_xr * torch.rsqrt(sum_xr.pow(2).mean(-1, keepdim=True) + eps_pre_post)
+        output   = norm * w
+        write_f32(f"{OUTPUT_DIR}/cpu_op_rms_norm_postnorm_{name}_input.bin",    x.numpy())
+        write_f32(f"{OUTPUT_DIR}/cpu_op_rms_norm_postnorm_{name}_residual.bin", residual.numpy())
+        write_f32(f"{OUTPUT_DIR}/cpu_op_rms_norm_postnorm_{name}_weight.bin",   w.numpy())
+        write_f32(f"{OUTPUT_DIR}/cpu_op_rms_norm_postnorm_{name}_output.bin",   output.numpy())
+        print(f"  → postnorm_{name}: x{tuple(x.shape)} residual{tuple(residual.shape)}"
+              f" out{tuple(output.shape)}")
+
+    _make_prenorm("typical", 16, 2048)
+    _make_prenorm("small",    4,   64)
+    _make_postnorm("typical", 16, 2048)
+    _make_postnorm("small",    4,   64)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -1455,16 +1512,45 @@ def _gelu_tanh(x: np.ndarray) -> np.ndarray:
     return F.gelu(torch.from_numpy(x), approximate="tanh").numpy()
 
 
+def _build_vision_rope_cos_sin(grid_thw_list, hd: int, merge_size: int = 2):
+    """Build true vision-RoPE cos/sin matching what the Python engine feeds
+    into the ATB RopeOp (rotary_coeff=2, LLAMA half-rotation).
+
+    Pipeline mirrors engine_utils.compute_rot_pos_emb + the Python builder:
+        rope_dim = hd // 2
+        vis_rope = VisionRotaryEmbedding(dim=rope_dim)
+        rope     = compute_rot_pos_emb(grid, vis_rope, merge_size)   # (N, rope_dim*2)
+        emb      = cat(rope, rope, dim=-1)                            # (N, hd)
+        cos/sin  = emb.cos(), emb.sin()
+
+    Returns: (cos_f32, sin_f32) both shape (total_tokens, hd).
+    """
+    rope_dim = hd // 2
+    vis_rope = VisionRotaryEmbedding(dim=rope_dim)
+    grid_thw = torch.tensor(grid_thw_list, dtype=torch.long)
+    rope = compute_rot_pos_emb(grid_thw, vis_rope, merge_size)   # (N, rope_dim*2)
+    emb = torch.cat((rope, rope), dim=-1)                         # (N, hd)
+    return emb.cos().numpy().astype(np.float32), emb.sin().numpy().astype(np.float32)
+
+
 def gen_vision_attention():
     """VisionAttention precision reference.
 
-    Pipeline (with cos=1, sin=0):
+    Writes two cases:
+      1) Identity RoPE (cos=1, sin=0) — historical files use the
+         `cpu_vision_attn_*` prefix (no _real suffix). Keeps the existing
+         test working unchanged.
+      2) Real vision RoPE — files use `cpu_vision_attn_*_real.bin` so the
+         RoPE half-rotation branch is actually exercised. cos/sin are built
+         via VisionRotaryEmbedding for grid [[1,4,4]] (16 tokens, matching N).
+
+    Pipeline:
         hidden -> qkv Linear(+bias) -> reshape(N, 3, nh, hd) -> Split
-        Q,K,V (identity RoPE) -> SDPA -> proj Linear(+bias)
+        Q,K,V (apply RoPE on Q,K only) -> SDPA -> proj Linear(+bias)
 
     Small case: N=16, nh=4, hd=32 (hidden=128).
     """
-    print("[gen] vision_attention — full attention pipeline (identity RoPE)")
+    print("[gen] vision_attention — full attention pipeline")
     rng = np.random.default_rng(5101)
 
     N, nh, hd = 16, 4, 32
@@ -1475,200 +1561,318 @@ def gen_vision_attention():
     qkv_b  = rng.standard_normal((3 * hidden,)).astype(np.float32) * 0.05
     proj_w = rng.standard_normal((hidden, hidden)).astype(np.float32) * 0.1
     proj_b = rng.standard_normal((hidden,)).astype(np.float32) * 0.05
-    cos    = np.ones((N, hd), dtype=np.float32)
-    sin    = np.zeros((N, hd), dtype=np.float32)
 
     x16    = _fp16_roundtrip(x)
     qw16   = _fp16_roundtrip(qkv_w)
     qb16   = _fp16_roundtrip(qkv_b)
     pw16   = _fp16_roundtrip(proj_w)
     pb16   = _fp16_roundtrip(proj_b)
-    cos16  = _fp16_roundtrip(cos)
-    sin16  = _fp16_roundtrip(sin)
 
-    # Reference: linear → reshape → SDPA → linear
-    qkv = x16 @ qw16.T + qb16
-    qkv = qkv.reshape(N, 3, nh, hd)
-    q, k, v = qkv[:, 0], qkv[:, 1], qkv[:, 2]
-    q_t = torch.from_numpy(q.astype(np.float32)).unsqueeze(0).transpose(1, 2)
-    k_t = torch.from_numpy(k.astype(np.float32)).unsqueeze(0).transpose(1, 2)
-    v_t = torch.from_numpy(v.astype(np.float32)).unsqueeze(0).transpose(1, 2)
-    attn = F.scaled_dot_product_attention(q_t, k_t, v_t).transpose(1, 2).squeeze(0).numpy()
-    attn = attn.reshape(N, hidden)
-    out = attn @ pw16.T + pb16
-    ref = _fp16_roundtrip(out)
-
+    # Shared weights/input written once (used by both identity + real cases)
     write_fp16(f"{OUTPUT_DIR}/cpu_vision_attn_x.bin",       x16)
     write_fp16(f"{OUTPUT_DIR}/cpu_vision_attn_qkv_w.bin",   qw16)
     write_fp16(f"{OUTPUT_DIR}/cpu_vision_attn_qkv_b.bin",   qb16)
     write_fp16(f"{OUTPUT_DIR}/cpu_vision_attn_proj_w.bin",  pw16)
     write_fp16(f"{OUTPUT_DIR}/cpu_vision_attn_proj_b.bin",  pb16)
-    write_fp16(f"{OUTPUT_DIR}/cpu_vision_attn_cos.bin",     cos16)
-    write_fp16(f"{OUTPUT_DIR}/cpu_vision_attn_sin.bin",     sin16)
-    write_fp16(f"{OUTPUT_DIR}/cpu_vision_attn_ref.bin",     ref)
     write_i32s(f"{OUTPUT_DIR}/cpu_vision_attn_meta.bin",    [N, nh, hd])
-    print(f"  → vision_attn: N={N} nh={nh} hd={hd}")
+
+    # Shared QKV split (Q/K rotated per-case below, V never rotated)
+    qkv = x16 @ qw16.T + qb16
+    qkv = qkv.reshape(N, 3, nh, hd)
+    q, k, v = qkv[:, 0], qkv[:, 1], qkv[:, 2]
+    q16 = _fp16_roundtrip(q.astype(np.float32))
+    k16 = _fp16_roundtrip(k.astype(np.float32))
+    v16 = _fp16_roundtrip(v.astype(np.float32))
+
+    def _attn_proj(q3: torch.Tensor, k3: torch.Tensor, v3: torch.Tensor) -> np.ndarray:
+        """SDPA(q,k,v) -> proj. q/k/v: (N, nh, hd). Returns (N, hidden) fp32."""
+        q_t = q3.unsqueeze(0).transpose(1, 2)  # (1, nh, N, hd)
+        k_t = k3.unsqueeze(0).transpose(1, 2)
+        v_t = v3.unsqueeze(0).transpose(1, 2)
+        attn = F.scaled_dot_product_attention(q_t, k_t, v_t)
+        attn = attn.transpose(1, 2).squeeze(0).reshape(N, hidden).numpy()
+        return attn @ pw16.T + pb16
+
+    # ── Case 1: identity RoPE ──
+    cos_id = np.ones((N, hd), dtype=np.float32)
+    sin_id = np.zeros((N, hd), dtype=np.float32)
+    cos16_id = _fp16_roundtrip(cos_id)
+    sin16_id = _fp16_roundtrip(sin_id)
+    out_id = _attn_proj(torch.from_numpy(q16),
+                        torch.from_numpy(k16),
+                        torch.from_numpy(v16))
+    ref_id = _fp16_roundtrip(out_id)
+    write_fp16(f"{OUTPUT_DIR}/cpu_vision_attn_cos.bin", cos16_id)
+    write_fp16(f"{OUTPUT_DIR}/cpu_vision_attn_sin.bin", sin16_id)
+    write_fp16(f"{OUTPUT_DIR}/cpu_vision_attn_ref.bin", ref_id)
+    print(f"  → vision_attn (identity RoPE): N={N} nh={nh} hd={hd}")
+
+    # ── Case 2: real vision RoPE for grid [[1,4,4]] (16 tokens) ──
+    grid_thw_list = [[1, 4, 4]]
+    cos_real_f32, sin_real_f32 = _build_vision_rope_cos_sin(grid_thw_list, hd, merge_size=2)
+    assert cos_real_f32.shape == (N, hd), \
+        f"real RoPE shape {cos_real_f32.shape} != expected ({N}, {hd})"
+    cos16_real = _fp16_roundtrip(cos_real_f32)
+    sin16_real = _fp16_roundtrip(sin_real_f32)
+    cos_t = torch.from_numpy(cos16_real)
+    sin_t = torch.from_numpy(sin16_real)
+    # Apply LLAMA-style half-rotation (matches ATB rotary_coeff=2)
+    q_rope = _apply_rope_half(torch.from_numpy(q16), cos_t, sin_t)
+    k_rope = _apply_rope_half(torch.from_numpy(k16), cos_t, sin_t)
+    # Round-trip RoPE outputs through fp16 (mirrors NPU storage between
+    # RopeOp and SelfAttentionOp).
+    q_rope = torch.from_numpy(_fp16_roundtrip(q_rope.numpy()))
+    k_rope = torch.from_numpy(_fp16_roundtrip(k_rope.numpy()))
+    out_real = _attn_proj(q_rope, k_rope, torch.from_numpy(v16))
+    ref_real = _fp16_roundtrip(out_real)
+    write_fp16(f"{OUTPUT_DIR}/cpu_vision_attn_cos_real.bin", cos16_real)
+    write_fp16(f"{OUTPUT_DIR}/cpu_vision_attn_sin_real.bin", sin16_real)
+    write_fp16(f"{OUTPUT_DIR}/cpu_vision_attn_ref_real.bin", ref_real)
+    print(f"  → vision_attn (real RoPE):     N={N} nh={nh} hd={hd}  grid={grid_thw_list}")
 
 
 def gen_vision_mlp():
-    """VisionMLP precision reference.
+    """VisionMLP precision reference (3 cases).
 
     Pipeline: fc1 Linear(+bias) -> GELU(tanh) -> fc2 Linear(+bias)
-    Small case: N=8, hidden=64, inter=128.
+
+    Cases:
+      * default-shaped output (no suffix): N=8, hidden=64, inter=128
+        — kept for back-compat with the original small case
+      * "typical"  — Qwen3VL scale: N=256, hidden=1024, inter=4096, bias=non-zero
+      * "nobias"   — minimal shape: N=4, hidden=32, inter=64, bias=zeros
+        (the C++ VisionMlpGraph hard-codes bias inputs, so the "no-bias path"
+        is validated by feeding zero bias tensors — same graph, same path,
+        but bias contributes nothing to the output.)
     """
-    print("[gen] vision_mlp — fc1 -> GELU -> fc2")
-    rng = np.random.default_rng(5201)
+    print("[gen] vision_mlp — fc1 -> GELU -> fc2 (default + typical + nobias)")
 
-    N, hidden, inter = 8, 64, 128
-    x     = rng.standard_normal((N, hidden)).astype(np.float32) * 0.2
-    fc1_w = rng.standard_normal((inter, hidden)).astype(np.float32) * 0.1
-    fc1_b = rng.standard_normal((inter,)).astype(np.float32) * 0.05
-    fc2_w = rng.standard_normal((hidden, inter)).astype(np.float32) * 0.1
-    fc2_b = rng.standard_normal((hidden,)).astype(np.float32) * 0.05
+    def _make(prefix: str, N: int, hidden: int, inter: int, seed: int,
+              zero_bias: bool = False):
+        rng = np.random.default_rng(seed)
+        x     = rng.standard_normal((N, hidden)).astype(np.float32) * 0.2
+        fc1_w = rng.standard_normal((inter, hidden)).astype(np.float32) * 0.1
+        fc2_w = rng.standard_normal((hidden, inter)).astype(np.float32) * 0.1
+        if zero_bias:
+            fc1_b = np.zeros((inter,), dtype=np.float32)
+            fc2_b = np.zeros((hidden,), dtype=np.float32)
+        else:
+            fc1_b = rng.standard_normal((inter,)).astype(np.float32) * 0.05
+            fc2_b = rng.standard_normal((hidden,)).astype(np.float32) * 0.05
 
-    x16    = _fp16_roundtrip(x)
-    fc1w16 = _fp16_roundtrip(fc1_w)
-    fc1b16 = _fp16_roundtrip(fc1_b)
-    fc2w16 = _fp16_roundtrip(fc2_w)
-    fc2b16 = _fp16_roundtrip(fc2_b)
+        x16    = _fp16_roundtrip(x)
+        fc1w16 = _fp16_roundtrip(fc1_w)
+        fc1b16 = _fp16_roundtrip(fc1_b)
+        fc2w16 = _fp16_roundtrip(fc2_w)
+        fc2b16 = _fp16_roundtrip(fc2_b)
 
-    h1 = x16 @ fc1w16.T + fc1b16
-    h1 = _gelu_tanh(h1)
-    out = h1 @ fc2w16.T + fc2b16
-    ref = _fp16_roundtrip(out)
+        h1 = x16 @ fc1w16.T + fc1b16
+        h1 = _gelu_tanh(h1)
+        out = h1 @ fc2w16.T + fc2b16
+        ref = _fp16_roundtrip(out)
 
-    write_fp16(f"{OUTPUT_DIR}/cpu_vision_mlp_x.bin",     x16)
-    write_fp16(f"{OUTPUT_DIR}/cpu_vision_mlp_fc1_w.bin", fc1w16)
-    write_fp16(f"{OUTPUT_DIR}/cpu_vision_mlp_fc1_b.bin", fc1b16)
-    write_fp16(f"{OUTPUT_DIR}/cpu_vision_mlp_fc2_w.bin", fc2w16)
-    write_fp16(f"{OUTPUT_DIR}/cpu_vision_mlp_fc2_b.bin", fc2b16)
-    write_fp16(f"{OUTPUT_DIR}/cpu_vision_mlp_ref.bin",   ref)
-    write_i32s(f"{OUTPUT_DIR}/cpu_vision_mlp_meta.bin",  [N, hidden, inter])
-    print(f"  → vision_mlp: N={N} hidden={hidden} inter={inter}")
+        write_fp16(f"{OUTPUT_DIR}/cpu_vision_mlp{prefix}_x.bin",     x16)
+        write_fp16(f"{OUTPUT_DIR}/cpu_vision_mlp{prefix}_fc1_w.bin", fc1w16)
+        write_fp16(f"{OUTPUT_DIR}/cpu_vision_mlp{prefix}_fc1_b.bin", fc1b16)
+        write_fp16(f"{OUTPUT_DIR}/cpu_vision_mlp{prefix}_fc2_w.bin", fc2w16)
+        write_fp16(f"{OUTPUT_DIR}/cpu_vision_mlp{prefix}_fc2_b.bin", fc2b16)
+        write_fp16(f"{OUTPUT_DIR}/cpu_vision_mlp{prefix}_ref.bin",   ref)
+        write_i32s(f"{OUTPUT_DIR}/cpu_vision_mlp{prefix}_meta.bin",
+                   [N, hidden, inter])
+        kind = "(bias=0)" if zero_bias else ""
+        print(f"  → vision_mlp{prefix}: N={N} hidden={hidden} inter={inter} {kind}")
+
+    # Original small case — file names without suffix (back-compat)
+    _make("",         N=8,   hidden=64,   inter=128,  seed=5201)
+    # Qwen3VL typical
+    _make("_typical", N=256, hidden=1024, inter=4096, seed=5202)
+    # Minimal shape, zero bias (exercises path with zero contribution from bias)
+    _make("_nobias",  N=4,   hidden=32,   inter=64,   seed=5203, zero_bias=True)
 
 
 def gen_vision_block():
-    """VisionBlock precision reference.
+    """VisionBlock precision reference (3 cases).
 
-    Pipeline (with cos=1, sin=0):
+    Pipeline:
         x -> LN1 -> Attn (+x residual) -> LN2 -> MLP (+attn residual) -> out
 
-    Small case: N=16, nh=4, hd=32 (hidden=128), inter=256.
-    """
-    print("[gen] vision_block — LN -> Attn -> LN -> MLP (identity RoPE)")
-    rng = np.random.default_rng(5301)
+    Cases:
+      * Default small case (no suffix) — identity RoPE (cos=1, sin=0),
+        N=16, nh=4, hd=32. Kept for back-compat with the existing test.
+      * "_real_small"   — N=16, nh=4, hd=16   with real vision RoPE
+                          (grid [[1,4,4]], merge=2).
+      * "_real_typical" — Qwen3VL scale: hidden=1024, nh=16, hd=64,
+                          N=256 (grid [[1,16,16]], merge=2) with real RoPE.
 
-    N, nh, hd = 16, 4, 32
-    hidden = nh * hd
-    inter = 4 * hidden
+    The "_real_*" suffixed bins are loaded by the new TEST_CASE entries
+    that exercise the actual RoPE half-rotation through the block.
+    """
+    print("[gen] vision_block — LN -> Attn -> LN -> MLP (identity + real RoPE)")
+
     eps = 1e-6
 
-    x      = rng.standard_normal((N, hidden)).astype(np.float32) * 0.2
-    qkv_w  = rng.standard_normal((3 * hidden, hidden)).astype(np.float32) * 0.1
-    qkv_b  = rng.standard_normal((3 * hidden,)).astype(np.float32) * 0.05
-    proj_w = rng.standard_normal((hidden, hidden)).astype(np.float32) * 0.1
-    proj_b = rng.standard_normal((hidden,)).astype(np.float32) * 0.05
-    fc1_w  = rng.standard_normal((inter, hidden)).astype(np.float32) * 0.1
-    fc1_b  = rng.standard_normal((inter,)).astype(np.float32) * 0.05
-    fc2_w  = rng.standard_normal((hidden, inter)).astype(np.float32) * 0.1
-    fc2_b  = rng.standard_normal((hidden,)).astype(np.float32) * 0.05
-    n1_w = (rng.standard_normal((hidden,)).astype(np.float32) * 0.1) + 1.0
-    n1_b =  rng.standard_normal((hidden,)).astype(np.float32) * 0.05
-    n2_w = (rng.standard_normal((hidden,)).astype(np.float32) * 0.1) + 1.0
-    n2_b =  rng.standard_normal((hidden,)).astype(np.float32) * 0.05
-    cos = np.ones((N, hd), dtype=np.float32)
-    sin = np.zeros((N, hd), dtype=np.float32)
+    def _build_case(prefix: str, N: int, nh: int, hd: int, inter: int,
+                    seed: int, use_real_rope: bool, grid_thw_list=None):
+        rng = np.random.default_rng(seed)
+        hidden = nh * hd
 
-    x16     = _fp16_roundtrip(x)
-    qkv_w16 = _fp16_roundtrip(qkv_w);  qkv_b16  = _fp16_roundtrip(qkv_b)
-    proj_w16 = _fp16_roundtrip(proj_w); proj_b16 = _fp16_roundtrip(proj_b)
-    fc1_w16 = _fp16_roundtrip(fc1_w);  fc1_b16  = _fp16_roundtrip(fc1_b)
-    fc2_w16 = _fp16_roundtrip(fc2_w);  fc2_b16  = _fp16_roundtrip(fc2_b)
-    n1_w16  = _fp16_roundtrip(n1_w);   n1_b16   = _fp16_roundtrip(n1_b)
-    n2_w16  = _fp16_roundtrip(n2_w);   n2_b16   = _fp16_roundtrip(n2_b)
-    cos16   = _fp16_roundtrip(cos);    sin16    = _fp16_roundtrip(sin)
+        x      = rng.standard_normal((N, hidden)).astype(np.float32) * 0.2
+        qkv_w  = rng.standard_normal((3 * hidden, hidden)).astype(np.float32) * 0.1
+        qkv_b  = rng.standard_normal((3 * hidden,)).astype(np.float32) * 0.05
+        proj_w = rng.standard_normal((hidden, hidden)).astype(np.float32) * 0.1
+        proj_b = rng.standard_normal((hidden,)).astype(np.float32) * 0.05
+        fc1_w  = rng.standard_normal((inter, hidden)).astype(np.float32) * 0.1
+        fc1_b  = rng.standard_normal((inter,)).astype(np.float32) * 0.05
+        fc2_w  = rng.standard_normal((hidden, inter)).astype(np.float32) * 0.1
+        fc2_b  = rng.standard_normal((hidden,)).astype(np.float32) * 0.05
+        n1_w = (rng.standard_normal((hidden,)).astype(np.float32) * 0.1) + 1.0
+        n1_b =  rng.standard_normal((hidden,)).astype(np.float32) * 0.05
+        n2_w = (rng.standard_normal((hidden,)).astype(np.float32) * 0.1) + 1.0
+        n2_b =  rng.standard_normal((hidden,)).astype(np.float32) * 0.05
 
-    # LN1
-    ln1 = F.layer_norm(torch.from_numpy(x16), [hidden],
-                       weight=torch.from_numpy(n1_w16),
-                       bias=torch.from_numpy(n1_b16), eps=eps).numpy()
-    # Attention (identity RoPE)
-    qkv = ln1 @ qkv_w16.T + qkv_b16
-    qkv = qkv.reshape(N, 3, nh, hd)
-    q, k, v = qkv[:, 0], qkv[:, 1], qkv[:, 2]
-    q_t = torch.from_numpy(q.astype(np.float32)).unsqueeze(0).transpose(1, 2)
-    k_t = torch.from_numpy(k.astype(np.float32)).unsqueeze(0).transpose(1, 2)
-    v_t = torch.from_numpy(v.astype(np.float32)).unsqueeze(0).transpose(1, 2)
-    attn = F.scaled_dot_product_attention(q_t, k_t, v_t).transpose(1, 2).squeeze(0).numpy()
-    attn = attn.reshape(N, hidden)
-    attn_out = attn @ proj_w16.T + proj_b16
-    r1 = x16 + attn_out
-    # LN2
-    ln2 = F.layer_norm(torch.from_numpy(r1.astype(np.float32)), [hidden],
-                       weight=torch.from_numpy(n2_w16),
-                       bias=torch.from_numpy(n2_b16), eps=eps).numpy()
-    # MLP
-    h1 = ln2 @ fc1_w16.T + fc1_b16
-    h1 = _gelu_tanh(h1)
-    mlp_out = h1 @ fc2_w16.T + fc2_b16
-    out = r1 + mlp_out
-    ref = _fp16_roundtrip(out)
+        if use_real_rope:
+            assert grid_thw_list is not None
+            cos_f32, sin_f32 = _build_vision_rope_cos_sin(grid_thw_list, hd, merge_size=2)
+            assert cos_f32.shape == (N, hd), \
+                f"real RoPE shape {cos_f32.shape} != ({N}, {hd})"
+        else:
+            cos_f32 = np.ones((N, hd), dtype=np.float32)
+            sin_f32 = np.zeros((N, hd), dtype=np.float32)
 
-    write_fp16(f"{OUTPUT_DIR}/cpu_vision_block_x.bin",      x16)
-    write_fp16(f"{OUTPUT_DIR}/cpu_vision_block_qkv_w.bin",  qkv_w16)
-    write_fp16(f"{OUTPUT_DIR}/cpu_vision_block_qkv_b.bin",  qkv_b16)
-    write_fp16(f"{OUTPUT_DIR}/cpu_vision_block_proj_w.bin", proj_w16)
-    write_fp16(f"{OUTPUT_DIR}/cpu_vision_block_proj_b.bin", proj_b16)
-    write_fp16(f"{OUTPUT_DIR}/cpu_vision_block_fc1_w.bin",  fc1_w16)
-    write_fp16(f"{OUTPUT_DIR}/cpu_vision_block_fc1_b.bin",  fc1_b16)
-    write_fp16(f"{OUTPUT_DIR}/cpu_vision_block_fc2_w.bin",  fc2_w16)
-    write_fp16(f"{OUTPUT_DIR}/cpu_vision_block_fc2_b.bin",  fc2_b16)
-    write_fp16(f"{OUTPUT_DIR}/cpu_vision_block_n1_w.bin",   n1_w16)
-    write_fp16(f"{OUTPUT_DIR}/cpu_vision_block_n1_b.bin",   n1_b16)
-    write_fp16(f"{OUTPUT_DIR}/cpu_vision_block_n2_w.bin",   n2_w16)
-    write_fp16(f"{OUTPUT_DIR}/cpu_vision_block_n2_b.bin",   n2_b16)
-    write_fp16(f"{OUTPUT_DIR}/cpu_vision_block_cos.bin",    cos16)
-    write_fp16(f"{OUTPUT_DIR}/cpu_vision_block_sin.bin",    sin16)
-    write_fp16(f"{OUTPUT_DIR}/cpu_vision_block_ref.bin",    ref)
-    write_i32s(f"{OUTPUT_DIR}/cpu_vision_block_meta.bin",   [N, nh, hd, inter])
-    print(f"  → vision_block: N={N} nh={nh} hd={hd} inter={inter}")
+        x16     = _fp16_roundtrip(x)
+        qkv_w16 = _fp16_roundtrip(qkv_w);  qkv_b16  = _fp16_roundtrip(qkv_b)
+        proj_w16 = _fp16_roundtrip(proj_w); proj_b16 = _fp16_roundtrip(proj_b)
+        fc1_w16 = _fp16_roundtrip(fc1_w);  fc1_b16  = _fp16_roundtrip(fc1_b)
+        fc2_w16 = _fp16_roundtrip(fc2_w);  fc2_b16  = _fp16_roundtrip(fc2_b)
+        n1_w16  = _fp16_roundtrip(n1_w);   n1_b16   = _fp16_roundtrip(n1_b)
+        n2_w16  = _fp16_roundtrip(n2_w);   n2_b16   = _fp16_roundtrip(n2_b)
+        cos16   = _fp16_roundtrip(cos_f32); sin16   = _fp16_roundtrip(sin_f32)
+
+        # LN1
+        ln1 = F.layer_norm(torch.from_numpy(x16), [hidden],
+                           weight=torch.from_numpy(n1_w16),
+                           bias=torch.from_numpy(n1_b16), eps=eps).numpy()
+        # QKV split
+        qkv = ln1 @ qkv_w16.T + qkv_b16
+        qkv = qkv.reshape(N, 3, nh, hd)
+        q, k, v = qkv[:, 0], qkv[:, 1], qkv[:, 2]
+        q16 = _fp16_roundtrip(q.astype(np.float32))
+        k16 = _fp16_roundtrip(k.astype(np.float32))
+        v16 = _fp16_roundtrip(v.astype(np.float32))
+
+        if use_real_rope:
+            cos_t = torch.from_numpy(cos16); sin_t = torch.from_numpy(sin16)
+            q_rope = _apply_rope_half(torch.from_numpy(q16), cos_t, sin_t)
+            k_rope = _apply_rope_half(torch.from_numpy(k16), cos_t, sin_t)
+            # Round-trip RoPE outputs through fp16 (NPU storage between ops)
+            q_rope = torch.from_numpy(_fp16_roundtrip(q_rope.numpy()))
+            k_rope = torch.from_numpy(_fp16_roundtrip(k_rope.numpy()))
+        else:
+            q_rope = torch.from_numpy(q16)
+            k_rope = torch.from_numpy(k16)
+
+        # SDPA
+        q_t = q_rope.unsqueeze(0).transpose(1, 2)
+        k_t = k_rope.unsqueeze(0).transpose(1, 2)
+        v_t = torch.from_numpy(v16).unsqueeze(0).transpose(1, 2)
+        attn = F.scaled_dot_product_attention(q_t, k_t, v_t)
+        attn = attn.transpose(1, 2).squeeze(0).reshape(N, hidden).numpy()
+        attn_out = attn @ proj_w16.T + proj_b16
+        r1 = x16 + attn_out
+        # LN2
+        ln2 = F.layer_norm(torch.from_numpy(r1.astype(np.float32)), [hidden],
+                           weight=torch.from_numpy(n2_w16),
+                           bias=torch.from_numpy(n2_b16), eps=eps).numpy()
+        # MLP
+        h1 = ln2 @ fc1_w16.T + fc1_b16
+        h1 = _gelu_tanh(h1)
+        mlp_out = h1 @ fc2_w16.T + fc2_b16
+        out = r1 + mlp_out
+        ref = _fp16_roundtrip(out)
+
+        write_fp16(f"{OUTPUT_DIR}/cpu_vision_block{prefix}_x.bin",      x16)
+        write_fp16(f"{OUTPUT_DIR}/cpu_vision_block{prefix}_qkv_w.bin",  qkv_w16)
+        write_fp16(f"{OUTPUT_DIR}/cpu_vision_block{prefix}_qkv_b.bin",  qkv_b16)
+        write_fp16(f"{OUTPUT_DIR}/cpu_vision_block{prefix}_proj_w.bin", proj_w16)
+        write_fp16(f"{OUTPUT_DIR}/cpu_vision_block{prefix}_proj_b.bin", proj_b16)
+        write_fp16(f"{OUTPUT_DIR}/cpu_vision_block{prefix}_fc1_w.bin",  fc1_w16)
+        write_fp16(f"{OUTPUT_DIR}/cpu_vision_block{prefix}_fc1_b.bin",  fc1_b16)
+        write_fp16(f"{OUTPUT_DIR}/cpu_vision_block{prefix}_fc2_w.bin",  fc2_w16)
+        write_fp16(f"{OUTPUT_DIR}/cpu_vision_block{prefix}_fc2_b.bin",  fc2_b16)
+        write_fp16(f"{OUTPUT_DIR}/cpu_vision_block{prefix}_n1_w.bin",   n1_w16)
+        write_fp16(f"{OUTPUT_DIR}/cpu_vision_block{prefix}_n1_b.bin",   n1_b16)
+        write_fp16(f"{OUTPUT_DIR}/cpu_vision_block{prefix}_n2_w.bin",   n2_w16)
+        write_fp16(f"{OUTPUT_DIR}/cpu_vision_block{prefix}_n2_b.bin",   n2_b16)
+        write_fp16(f"{OUTPUT_DIR}/cpu_vision_block{prefix}_cos.bin",    cos16)
+        write_fp16(f"{OUTPUT_DIR}/cpu_vision_block{prefix}_sin.bin",    sin16)
+        write_fp16(f"{OUTPUT_DIR}/cpu_vision_block{prefix}_ref.bin",    ref)
+        write_i32s(f"{OUTPUT_DIR}/cpu_vision_block{prefix}_meta.bin",   [N, nh, hd, inter])
+        rope_kind = "real-RoPE" if use_real_rope else "identity-RoPE"
+        print(f"  -> vision_block{prefix} ({rope_kind}): N={N} nh={nh} hd={hd} inter={inter}")
+
+    # Original small identity-RoPE case — no suffix (back-compat).
+    # Keeps the historical shape: inter = 4 * hidden = 512.
+    _build_case("",              N=16,  nh=4,  hd=32, inter=512,
+                seed=5301, use_real_rope=False)
+
+    # Small real-RoPE case: grid [[1,4,4]] → 16 tokens.
+    # hd=16 keeps the rope_dim=8 small enough for clear debugging.
+    _build_case("_real_small",   N=16,  nh=4,  hd=16, inter=64,
+                seed=5302, use_real_rope=True,  grid_thw_list=[[1, 4, 4]])
+
+    # Typical Qwen3VL-scale real-RoPE case: grid [[1,16,16]] → 256 tokens,
+    # hidden=1024 nh=16 hd=64 inter=4096 (matches vision_config).
+    _build_case("_real_typical", N=256, nh=16, hd=64, inter=4096,
+                seed=5303, use_real_rope=True,  grid_thw_list=[[1, 16, 16]])
 
 
 def gen_patch_embed():
-    """PatchEmbed precision reference.
+    """PatchEmbed precision reference (3 cases).
 
     Pipeline: pixels (N*K,) -> reshape (N, K) -> Linear(+bias) -> (N, embed_dim)
     where K = in_channels * tp * p * p.
 
-    Small case: N=4, in_ch=3, tp=2, p=14 → K=1176, embed_dim=64.
+    Cases:
+      * default (no suffix): N=4, in_ch=3, tp=2, p=14 -> K=1176, embed_dim=64
+        — kept for back-compat with the original small case
+      * "typical"  — Qwen3VL real scale: in_ch=3, tp=2, p=14, embed_dim=1024, N=256
+        K = 3*2*14*14 = 1176
+      * "tiny"     — minimal/degenerate: in_ch=1, tp=1, p=2, embed_dim=16, N=1
+        K = 1*1*2*2 = 4
     """
-    print("[gen] patch_embed — flatten + Linear(+bias)")
-    rng = np.random.default_rng(5401)
+    print("[gen] patch_embed — flatten + Linear(+bias) (default + typical + tiny)")
 
-    N = 4
-    in_channels, tp, p = 3, 2, 14
-    embed_dim = 64
-    K = in_channels * tp * p * p  # 1176
+    def _make(prefix: str, N: int, in_channels: int, tp: int, p: int,
+              embed_dim: int, seed: int):
+        K = in_channels * tp * p * p
+        rng = np.random.default_rng(seed)
+        pixels = rng.standard_normal((N, K)).astype(np.float32) * 0.2
+        w      = rng.standard_normal((embed_dim, K)).astype(np.float32) * 0.05
+        b      = rng.standard_normal((embed_dim,)).astype(np.float32) * 0.05
 
-    pixels = rng.standard_normal((N, K)).astype(np.float32) * 0.2
-    w      = rng.standard_normal((embed_dim, K)).astype(np.float32) * 0.05
-    b      = rng.standard_normal((embed_dim,)).astype(np.float32) * 0.05
+        pixels16 = _fp16_roundtrip(pixels)
+        w16      = _fp16_roundtrip(w)
+        b16      = _fp16_roundtrip(b)
 
-    pixels16 = _fp16_roundtrip(pixels)
-    w16      = _fp16_roundtrip(w)
-    b16      = _fp16_roundtrip(b)
+        out = pixels16 @ w16.T + b16
+        ref = _fp16_roundtrip(out)
 
-    out = pixels16 @ w16.T + b16
-    ref = _fp16_roundtrip(out)
+        # C++ feeds pixels as flat (N*K,) tensor
+        write_fp16(f"{OUTPUT_DIR}/cpu_patch_embed{prefix}_pixels.bin", pixels16.reshape(-1))
+        write_fp16(f"{OUTPUT_DIR}/cpu_patch_embed{prefix}_w.bin",      w16)
+        write_fp16(f"{OUTPUT_DIR}/cpu_patch_embed{prefix}_b.bin",      b16)
+        write_fp16(f"{OUTPUT_DIR}/cpu_patch_embed{prefix}_ref.bin",    ref)
+        write_i32s(f"{OUTPUT_DIR}/cpu_patch_embed{prefix}_meta.bin",
+                   [N, in_channels, tp, p, embed_dim])
+        print(f"  -> patch_embed{prefix}: N={N} in_ch={in_channels} tp={tp} p={p} "
+              f"K={K} embed={embed_dim}")
 
-    # C++ feeds pixels as a flat (N*K,) tensor — store likewise
-    write_fp16(f"{OUTPUT_DIR}/cpu_patch_embed_pixels.bin", pixels16.reshape(-1))
-    write_fp16(f"{OUTPUT_DIR}/cpu_patch_embed_w.bin",      w16)
-    write_fp16(f"{OUTPUT_DIR}/cpu_patch_embed_b.bin",      b16)
-    write_fp16(f"{OUTPUT_DIR}/cpu_patch_embed_ref.bin",    ref)
-    write_i32s(f"{OUTPUT_DIR}/cpu_patch_embed_meta.bin",
-               [N, in_channels, tp, p, embed_dim])
-    print(f"  → patch_embed: N={N} K={K} embed_dim={embed_dim}")
+    # Original small case — no suffix (back-compat)
+    _make("",         N=4,   in_channels=3, tp=2, p=14, embed_dim=64,   seed=5401)
+    # Qwen3VL typical real scale
+    _make("_typical", N=256, in_channels=3, tp=2, p=14, embed_dim=1024, seed=5402)
+    # Minimal degenerate parameters
+    _make("_tiny",    N=1,   in_channels=1, tp=1, p=2,  embed_dim=16,   seed=5403)
 
 
 def gen_vision_merger():

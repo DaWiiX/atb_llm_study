@@ -157,3 +157,145 @@ TEST_CASE("PatchEmbedGraph precision: N=4 in_ch=3 tp=2 p=14 embed=64") {
     LOG_INFO("  cosine = %.6f", cs);
     CHECK(cs >= 0.99f);
 }
+
+// ═════════════════════════════════════════════════════════════════
+// Case: PatchEmbed typical Qwen3VL scale
+// ═════════════════════════════════════════════════════════════════
+TEST_CASE("PatchEmbedGraph precision: in_ch=3 tp=2 p=14 embed=1024 N=256 (Qwen3VL)") {
+    LOG_INFO("=== PatchEmbed precision (Qwen3VL scale) ===");
+
+    ArrayFp16 pixels, w, b, ref;
+    MetaI32 meta;
+    REQUIRE(pixels.Load("/tmp/cpu_patch_embed_typical_pixels.bin"));
+    REQUIRE(w.Load("/tmp/cpu_patch_embed_typical_w.bin"));
+    REQUIRE(b.Load("/tmp/cpu_patch_embed_typical_b.bin"));
+    REQUIRE(ref.Load("/tmp/cpu_patch_embed_typical_ref.bin"));
+    REQUIRE(meta.Load("/tmp/cpu_patch_embed_typical_meta.bin"));
+    REQUIRE(meta.data.size() == 5);
+    int64_t N           = meta.data[0];
+    int64_t in_channels = meta.data[1];
+    int64_t tp          = meta.data[2];
+    int64_t p           = meta.data[3];
+    int64_t embed_dim   = meta.data[4];
+    int64_t K = in_channels * tp * p * p;
+
+    auto runtime = atb_llm::CreateRuntime(0, 4LL * 1024 * 1024 * 1024);
+    REQUIRE(runtime != nullptr);
+    auto* alloc = runtime->GetAllocator();
+    auto* ctx   = runtime->GetContext();
+
+    atb_llm::OperationHandle op;
+    REQUIRE(IS_OK(atb_llm::components::PatchEmbedGraph::Build(
+        "PETypical",
+        static_cast<int32_t>(in_channels),
+        static_cast<int32_t>(tp),
+        static_cast<int32_t>(p),
+        static_cast<int32_t>(embed_dim), op)));
+    REQUIRE(op.get() != nullptr);
+
+    atb::Tensor pixels_t, w_t, b_t, out_t;
+    REQUIRE(IS_OK(alloc->AllocFloat16(pixels_t, {N * K})));
+    REQUIRE(IS_OK(alloc->AllocFloat16(w_t,      {embed_dim, K})));
+    REQUIRE(IS_OK(alloc->AllocFloat16(b_t,      {embed_dim})));
+    REQUIRE(IS_OK(alloc->AllocFloat16(out_t,    {N, embed_dim})));
+
+    REQUIRE(IS_OK(alloc->CopyToDevice(pixels_t, pixels.data.data(), pixels.data.size() * 2)));
+    REQUIRE(IS_OK(alloc->CopyToDevice(w_t,      w.data.data(),      w.data.size()      * 2)));
+    REQUIRE(IS_OK(alloc->CopyToDevice(b_t,      b.data.data(),      b.data.size()      * 2)));
+
+    atb::VariantPack vp;
+    vp.inTensors  = {pixels_t, w_t, b_t};
+    vp.outTensors = {out_t};
+
+    uint64_t ws_size = 0;
+    REQUIRE(op.get()->Setup(vp, ws_size, ctx) == atb::NO_ERROR);
+    uint8_t* ws_ptr = nullptr;
+    if (ws_size > 0) {
+        auto [ws, ws_st] = runtime->GetWorkspace(ws_size);
+        REQUIRE(IS_OK(ws_st));
+        ws_ptr = ws;
+    }
+    REQUIRE(op.get()->Execute(vp, ws_ptr, ws_size, ctx) == atb::NO_ERROR);
+    runtime->Synchronize();
+
+    std::vector<uint16_t> host_out(N * embed_dim);
+    REQUIRE(IS_OK(alloc->CopyToHost(host_out.data(), out_t, host_out.size() * 2)));
+    auto out_f32 = Fp16ToF32(host_out);
+    auto ref_f32 = Fp16ToF32(ref.data);
+    REQUIRE(out_f32.size() == ref_f32.size());
+
+    float cs = CosineSim(out_f32.data(), ref_f32.data(), out_f32.size());
+    LOG_INFO("  cosine = %.6f", cs);
+    CHECK(cs >= 0.999f);
+}
+
+// ═════════════════════════════════════════════════════════════════
+// Case: PatchEmbed minimal/degenerate parameters
+// ═════════════════════════════════════════════════════════════════
+TEST_CASE("PatchEmbedGraph precision: in_ch=1 tp=1 p=2 embed=16 N=1 (minimal)") {
+    LOG_INFO("=== PatchEmbed precision (minimal params) ===");
+
+    ArrayFp16 pixels, w, b, ref;
+    MetaI32 meta;
+    REQUIRE(pixels.Load("/tmp/cpu_patch_embed_tiny_pixels.bin"));
+    REQUIRE(w.Load("/tmp/cpu_patch_embed_tiny_w.bin"));
+    REQUIRE(b.Load("/tmp/cpu_patch_embed_tiny_b.bin"));
+    REQUIRE(ref.Load("/tmp/cpu_patch_embed_tiny_ref.bin"));
+    REQUIRE(meta.Load("/tmp/cpu_patch_embed_tiny_meta.bin"));
+    REQUIRE(meta.data.size() == 5);
+    int64_t N           = meta.data[0];
+    int64_t in_channels = meta.data[1];
+    int64_t tp          = meta.data[2];
+    int64_t p           = meta.data[3];
+    int64_t embed_dim   = meta.data[4];
+    int64_t K = in_channels * tp * p * p;
+
+    auto runtime = atb_llm::CreateRuntime(0, 2LL * 1024 * 1024 * 1024);
+    REQUIRE(runtime != nullptr);
+    auto* alloc = runtime->GetAllocator();
+    auto* ctx   = runtime->GetContext();
+
+    atb_llm::OperationHandle op;
+    REQUIRE(IS_OK(atb_llm::components::PatchEmbedGraph::Build(
+        "PETiny",
+        static_cast<int32_t>(in_channels),
+        static_cast<int32_t>(tp),
+        static_cast<int32_t>(p),
+        static_cast<int32_t>(embed_dim), op)));
+    REQUIRE(op.get() != nullptr);
+
+    atb::Tensor pixels_t, w_t, b_t, out_t;
+    REQUIRE(IS_OK(alloc->AllocFloat16(pixels_t, {N * K})));
+    REQUIRE(IS_OK(alloc->AllocFloat16(w_t,      {embed_dim, K})));
+    REQUIRE(IS_OK(alloc->AllocFloat16(b_t,      {embed_dim})));
+    REQUIRE(IS_OK(alloc->AllocFloat16(out_t,    {N, embed_dim})));
+
+    REQUIRE(IS_OK(alloc->CopyToDevice(pixels_t, pixels.data.data(), pixels.data.size() * 2)));
+    REQUIRE(IS_OK(alloc->CopyToDevice(w_t,      w.data.data(),      w.data.size()      * 2)));
+    REQUIRE(IS_OK(alloc->CopyToDevice(b_t,      b.data.data(),      b.data.size()      * 2)));
+
+    atb::VariantPack vp;
+    vp.inTensors  = {pixels_t, w_t, b_t};
+    vp.outTensors = {out_t};
+
+    uint64_t ws_size = 0;
+    REQUIRE(op.get()->Setup(vp, ws_size, ctx) == atb::NO_ERROR);
+    uint8_t* ws_ptr = nullptr;
+    if (ws_size > 0) {
+        auto [ws, ws_st] = runtime->GetWorkspace(ws_size);
+        REQUIRE(IS_OK(ws_st));
+        ws_ptr = ws;
+    }
+    REQUIRE(op.get()->Execute(vp, ws_ptr, ws_size, ctx) == atb::NO_ERROR);
+    runtime->Synchronize();
+
+    std::vector<uint16_t> host_out(N * embed_dim);
+    REQUIRE(IS_OK(alloc->CopyToHost(host_out.data(), out_t, host_out.size() * 2)));
+    auto out_f32 = Fp16ToF32(host_out);
+    auto ref_f32 = Fp16ToF32(ref.data);
+    REQUIRE(out_f32.size() == ref_f32.size());
+
+    float cs = CosineSim(out_f32.data(), ref_f32.data(), out_f32.size());
+    LOG_INFO("  cosine = %.6f", cs);
+    CHECK(cs >= 0.99f);
+}
