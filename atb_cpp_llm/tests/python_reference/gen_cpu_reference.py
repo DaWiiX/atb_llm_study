@@ -467,10 +467,18 @@ def _gen_bicubic_case(name: str, input_np: np.ndarray, out_h: int, out_w: int):
     dump input + output as f32 bins. The reference exactly mirrors the
     C++ algorithm (Catmull-Rom a=-0.5 + edge clamp), so the C++ test
     validates the implementation against a Python-side reproduction.
+
+    NOTE: the C++ BicubicResize signature accepts uint8 input. To make
+    the reference bit-for-bit comparable, we round-and-clip the input
+    to uint8 BEFORE computing the reference. The bin we dump is the
+    quantized float32 values, so the C++ test gets exactly the values
+    the Python ref consumed (after its own uint8 cast).
     """
     assert input_np.dtype == np.float32 and input_np.ndim == 3
-    y_np = _cpp_bicubic_resize(input_np, out_h, out_w).astype(np.float32)
-    write_f32(f"{OUTPUT_DIR}/bicubic_{name}_input.bin", input_np)
+    input_u8 = np.clip(np.round(input_np), 0.0, 255.0).astype(np.uint8)
+    input_q = input_u8.astype(np.float32)
+    y_np = _cpp_bicubic_resize(input_q, out_h, out_w).astype(np.float32)
+    write_f32(f"{OUTPUT_DIR}/bicubic_{name}_input.bin", input_q)
     write_f32(f"{OUTPUT_DIR}/bicubic_{name}_output.bin", y_np)
     print(f"  → bicubic_{name}: in{input_np.shape} -> out{y_np.shape}")
 

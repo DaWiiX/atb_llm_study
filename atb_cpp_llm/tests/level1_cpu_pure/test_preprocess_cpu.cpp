@@ -6,6 +6,7 @@
  *
  * Prerequisites:
  *     python tests/gen_cpu_reference.py --stage smart_resize
+ *     python tests/gen_cpu_reference.py --stage bicubic_preprocess
  *
  * Run: ./test_preprocess_cpu
  */
@@ -20,6 +21,7 @@
 #include <cmath>
 #include <cstdint>
 #include <algorithm>
+#include <string>
 
 namespace {
 
@@ -55,6 +57,142 @@ struct SmartResizeRef {
         return true;
     }
 };
+
+// ── Generic [ndim, shape..., data] binary loader ─────────────────
+struct LoadedArrayF32 {
+    std::vector<int64_t> shape;
+    std::vector<float> data;
+
+    bool Load(const std::string& path) {
+        FILE* f = fopen(path.c_str(), "rb");
+        if (!f) {
+            LOG_ERROR("Cannot open %s", path.c_str());
+            return false;
+        }
+        int64_t ndim;
+        if (fread(&ndim, sizeof(int64_t), 1, f) != 1) { fclose(f); return false; }
+        shape.resize(ndim);
+        int64_t total = 1;
+        for (int64_t i = 0; i < ndim; i++) {
+            if (fread(&shape[i], sizeof(int64_t), 1, f) != 1) { fclose(f); return false; }
+            total *= shape[i];
+        }
+        data.resize(total);
+        if (fread(data.data(), sizeof(float), total, f) != static_cast<size_t>(total)) {
+            fclose(f);
+            return false;
+        }
+        fclose(f);
+        return true;
+    }
+};
+
+struct LoadedArrayFp16 {
+    std::vector<int64_t> shape;
+    std::vector<uint16_t> data;  // raw fp16 bits
+
+    bool Load(const std::string& path) {
+        FILE* f = fopen(path.c_str(), "rb");
+        if (!f) {
+            LOG_ERROR("Cannot open %s", path.c_str());
+            return false;
+        }
+        int64_t ndim;
+        if (fread(&ndim, sizeof(int64_t), 1, f) != 1) { fclose(f); return false; }
+        shape.resize(ndim);
+        int64_t total = 1;
+        for (int64_t i = 0; i < ndim; i++) {
+            if (fread(&shape[i], sizeof(int64_t), 1, f) != 1) { fclose(f); return false; }
+            total *= shape[i];
+        }
+        data.resize(total);
+        if (fread(data.data(), sizeof(uint16_t), total, f) != static_cast<size_t>(total)) {
+            fclose(f);
+            return false;
+        }
+        fclose(f);
+        return true;
+    }
+};
+
+struct LoadedArrayI64 {
+    std::vector<int64_t> shape;
+    std::vector<int64_t> data;
+
+    bool Load(const std::string& path) {
+        FILE* f = fopen(path.c_str(), "rb");
+        if (!f) {
+            LOG_ERROR("Cannot open %s", path.c_str());
+            return false;
+        }
+        int64_t ndim;
+        if (fread(&ndim, sizeof(int64_t), 1, f) != 1) { fclose(f); return false; }
+        shape.resize(ndim);
+        int64_t total = 1;
+        for (int64_t i = 0; i < ndim; i++) {
+            if (fread(&shape[i], sizeof(int64_t), 1, f) != 1) { fclose(f); return false; }
+            total *= shape[i];
+        }
+        data.resize(total);
+        if (fread(data.data(), sizeof(int64_t), total, f) != static_cast<size_t>(total)) {
+            fclose(f);
+            return false;
+        }
+        fclose(f);
+        return true;
+    }
+};
+
+// IEEE-754 fp16 (uint16) → float32
+float Fp16BitsToFloat(uint16_t h) {
+    uint32_t sign = (h >> 15) & 0x1u;
+    uint32_t exp  = (h >> 10) & 0x1Fu;
+    uint32_t mant = h & 0x3FFu;
+    uint32_t f;
+    if (exp == 0) {
+        if (mant == 0) {
+            f = sign << 31;
+        } else {
+            // subnormal: normalize
+            int e = -1;
+            do {
+                e++;
+                mant <<= 1;
+            } while ((mant & 0x400u) == 0);
+            mant &= 0x3FFu;
+            uint32_t exp_f = 127 - 15 - e;
+            f = (sign << 31) | (exp_f << 23) | (mant << 13);
+        }
+    } else if (exp == 31) {
+        // inf / NaN
+        f = (sign << 31) | (0xFFu << 23) | (mant << 13);
+    } else {
+        uint32_t exp_f = exp - 15 + 127;
+        f = (sign << 31) | (exp_f << 23) | (mant << 13);
+    }
+    float out;
+    std::memcpy(&out, &f, sizeof(out));
+    return out;
+}
+
+float CosineSim(const float* a, const float* b, int64_t n) {
+    double dot = 0, na = 0, nb = 0;
+    for (int64_t i = 0; i < n; i++) {
+        dot += static_cast<double>(a[i]) * b[i];
+        na  += static_cast<double>(a[i]) * a[i];
+        nb  += static_cast<double>(b[i]) * b[i];
+    }
+    return static_cast<float>(dot / (std::sqrt(na) * std::sqrt(nb) + 1e-12));
+}
+
+float MaxAbsDiff(const float* a, const float* b, int64_t n) {
+    float max_d = 0;
+    for (int64_t i = 0; i < n; i++) {
+        float d = std::fabs(a[i] - b[i]);
+        if (d > max_d) max_d = d;
+    }
+    return max_d;
+}
 
 }  // namespace
 
@@ -126,42 +264,283 @@ static bool TestSmartResizeBankers() {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// Test 3: SmartResize — boundary conditions
+// Test 3: SmartResize — boundary conditions [H1 hardening]
+//
+// Previously every case here LOG_INFO'd a [PASS] tag and the test
+// returned `true` unconditionally — a classic fake-PASS. This version
+// aggregates each case's pass/fail into `all_ok` and returns it so a
+// regression actually trips the suite.
 // ═══════════════════════════════════════════════════════════════
 static bool TestSmartResizeBoundary() {
     LOG_INFO("\n=== Test 3: SmartResize — boundary conditions ===");
 
     int32_t factor = 32, min_px = 4096, max_px = 1310720;
     int32_t nh = 0, nw = 0;
+    bool all_ok = true;
 
-    // Case A: very small image (below min_pixels)
+    // Case A: very small image (1, 1) — must be upscaled to satisfy min_pixels,
+    //         dimensions divisible by factor, both non-zero.
     {
-        atb_llm::adapters::SmartResize(4, 4, factor, min_px, max_px, nh, nw);
-        LOG_INFO("  [INFO] (4,4) → (%d,%d) — upscaled to meet min_pixels=%d",
-                 nh, nw, min_px);
+        atb_llm::adapters::SmartResize(1, 1, factor, min_px, max_px, nh, nw);
         int64_t area = static_cast<int64_t>(nh) * nw;
-        bool ok = (area >= min_px);
-        LOG_INFO("  [%s] Pixel area %ld ≥ min %d", ok ? "PASS" : "FAIL", area, min_px);
+        bool ok = (area >= min_px) &&
+                  (nh % factor == 0) && (nw % factor == 0) &&
+                  (nh > 0) && (nw > 0);
+        all_ok &= ok;
+        LOG_INFO("  [%s] (1,1) → (%d,%d) area=%ld (>= %d, divisible by %d)",
+                 ok ? "PASS" : "FAIL", nh, nw, area, min_px, factor);
     }
 
-    // Case B: very large image (above max_pixels)
+    // Case B: extreme aspect ratio (8, 1024) — dimensions divisible by factor,
+    //         area within [min_pixels, max_pixels].
     {
-        atb_llm::adapters::SmartResize(3000, 4000, factor, min_px, max_px, nh, nw);
-        LOG_INFO("  [INFO] (3000,4000) → (%d,%d) — downscaled to meet max_pixels=%d",
-                 nh, nw, max_px);
+        atb_llm::adapters::SmartResize(8, 1024, factor, min_px, max_px, nh, nw);
         int64_t area = static_cast<int64_t>(nh) * nw;
-        bool ok = (area <= max_px);
-        LOG_INFO("  [%s] Pixel area %ld ≤ max %d", ok ? "PASS" : "FAIL", area, max_px);
+        bool ok = (nh % factor == 0) && (nw % factor == 0) &&
+                  (area >= min_px) && (area <= max_px);
+        all_ok &= ok;
+        LOG_INFO("  [%s] (8,1024) → (%d,%d) area=%ld (factor=%d, in [%d,%d])",
+                 ok ? "PASS" : "FAIL", nh, nw, area, factor, min_px, max_px);
     }
 
-    // Case C: already divisible by factor
+    // Case C: very large image (4000, 4000) — must be downscaled to satisfy
+    //         max_pixels, dimensions divisible by factor.
     {
-        atb_llm::adapters::SmartResize(128, 256, factor, min_px, max_px, nh, nw);
-        bool ok = (nh == 128 && nw == 256);
-        LOG_INFO("  [%s] (128,256) → (%d,%d)", ok ? "PASS" : "FAIL", nh, nw);
+        atb_llm::adapters::SmartResize(4000, 4000, factor, min_px, max_px, nh, nw);
+        int64_t area = static_cast<int64_t>(nh) * nw;
+        bool ok = (area <= max_px) &&
+                  (nh % factor == 0) && (nw % factor == 0);
+        all_ok &= ok;
+        LOG_INFO("  [%s] (4000,4000) → (%d,%d) area=%ld (<= %d, divisible by %d)",
+                 ok ? "PASS" : "FAIL", nh, nw, area, max_px, factor);
     }
 
-    return true;
+    // Case D: exactly factor×factor with min_pixels set to factor² so input
+    //         already satisfies the lower bound — output must equal input.
+    {
+        int32_t local_min = factor * factor;  // 1024
+        atb_llm::adapters::SmartResize(32, 32, factor, local_min, max_px, nh, nw);
+        bool ok = (nh == factor) && (nw == factor);
+        all_ok &= ok;
+        LOG_INFO("  [%s] (32,32, min=%d) → (%d,%d) (expect %dx%d, unchanged)",
+                 ok ? "PASS" : "FAIL", local_min, nh, nw, factor, factor);
+    }
+
+    return all_ok;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Test 4: BicubicResize against Python C++-equivalent reference [H4]
+//
+// Python `_cpp_bicubic_resize` reproduces the C++ Catmull-Rom + edge-clamp
+// algorithm. With identical uint8 inputs both sides must agree to fp32
+// precision (~1e-3). The gen script quantizes its source to uint8 before
+// computing the reference, so we can feed the dumped float32 values
+// directly to BicubicResize after casting to uint8.
+// ═══════════════════════════════════════════════════════════════
+static bool TestBicubicVsPython() {
+    LOG_INFO("\n=== Test 4: BicubicResize vs Python C++-equivalent reference ===");
+
+    struct Case {
+        const char* name;
+        int32_t channels;
+        int32_t in_h, in_w;
+        int32_t out_h, out_w;
+    };
+    Case cases[] = {
+        {"2x2_to_4x4",              1, 2, 2,  4,  4},
+        {"4x4_to_2x2",              1, 4, 4,  2,  2},
+        {"random_8x8_to_16x16_3ch", 3, 8, 8, 16, 16},
+    };
+
+    bool all_ok = true;
+    for (const auto& c : cases) {
+        std::string in_path  = std::string("/tmp/bicubic_") + c.name + "_input.bin";
+        std::string out_path = std::string("/tmp/bicubic_") + c.name + "_output.bin";
+
+        LoadedArrayF32 in_ref, out_ref;
+        if (!in_ref.Load(in_path) || !out_ref.Load(out_path)) {
+            LOG_ERROR("  [SKIP] %s: bin files missing — run "
+                      "'python tests/gen_cpu_reference.py --stage bicubic_preprocess'", c.name);
+            all_ok = false;
+            continue;
+        }
+
+        int64_t in_elems  = static_cast<int64_t>(c.channels) * c.in_h  * c.in_w;
+        int64_t out_elems = static_cast<int64_t>(c.channels) * c.out_h * c.out_w;
+        if (static_cast<int64_t>(in_ref.data.size())  != in_elems ||
+            static_cast<int64_t>(out_ref.data.size()) != out_elems) {
+            LOG_ERROR("  [FAIL] %s: bin size mismatch (in=%zu expect %ld, out=%zu expect %ld)",
+                     c.name, in_ref.data.size(), in_elems,
+                     out_ref.data.size(), out_elems);
+            all_ok = false;
+            continue;
+        }
+
+        // Cast input float32 (already quantized in the gen script) → uint8.
+        std::vector<uint8_t> in_u8(in_elems);
+        for (int64_t i = 0; i < in_elems; i++) {
+            float v = std::round(in_ref.data[i]);
+            if (v < 0.0f) v = 0.0f;
+            if (v > 255.0f) v = 255.0f;
+            in_u8[i] = static_cast<uint8_t>(v);
+        }
+
+        std::vector<float> cpp_out(out_elems);
+        atb_llm::adapters::BicubicResize(
+            in_u8.data(), c.in_h, c.in_w, c.channels,
+            c.out_h, c.out_w, cpp_out.data());
+
+        float max_d = MaxAbsDiff(cpp_out.data(), out_ref.data.data(), out_elems);
+        float cos_s = CosineSim(cpp_out.data(), out_ref.data.data(), out_elems);
+
+        // Both sides run the SAME algorithm on the SAME uint8 input. Differences
+        // should be limited to float-summation order rounding.
+        bool ok = (max_d < 1e-3f) && (cos_s > 0.99999f);
+        all_ok &= ok;
+        LOG_INFO("  [%s] %s: max_diff=%.6e cosine=%.6f (in=%dx%dx%d → %dx%d)",
+                 ok ? "PASS" : "FAIL", c.name, max_d, cos_s,
+                 c.channels, c.in_h, c.in_w, c.out_h, c.out_w);
+        if (!ok) {
+            // Show first divergent pixel
+            for (int64_t i = 0; i < out_elems; i++) {
+                float d = std::fabs(cpp_out[i] - out_ref.data[i]);
+                if (d > 1e-3f) {
+                    LOG_ERROR("    first divergence at [%ld]: C++=%.6f Python=%.6f diff=%.6e",
+                             i, cpp_out[i], out_ref.data[i], d);
+                    break;
+                }
+            }
+        }
+    }
+
+    return all_ok;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Test 5: PreprocessImage end-to-end vs Python `preprocess_image` [H4]
+//
+// The Python reference uses PyTorch's bicubic (different boundary handling
+// from C++ edge-clamp), so we use cosine similarity ≥ 0.999 instead of
+// bit-exact equality. grid_thw must be exactly equal.
+// ═══════════════════════════════════════════════════════════════
+static bool TestPreprocessImageVsPython() {
+    LOG_INFO("\n=== Test 5: PreprocessImage vs Python reference ===");
+
+    struct Case {
+        const char* name;
+        int32_t channels;
+        int32_t height, width;
+    };
+    Case cases[] = {
+        {"gradient_64x64", 3, 64, 64},
+        {"random_96x96",   3, 96, 96},
+    };
+
+    atb_llm::adapters::Qwen3VLConfig cfg{};
+    // Mirror Python defaults: patch=16, temporal=2, merge=2, min/max_pixels.
+    cfg.pp_patch_size           = 16;
+    cfg.pp_temporal_patch_size  = 2;
+    cfg.pp_merge_size           = 2;
+    cfg.pp_min_pixels           = 4096;
+    cfg.pp_max_pixels           = 1310720;
+
+    bool all_ok = true;
+    for (const auto& c : cases) {
+        std::string in_path   = std::string("/tmp/preprocess_") + c.name + "_input.bin";
+        std::string out_path  = std::string("/tmp/preprocess_") + c.name + "_output.bin";
+        std::string grid_path = std::string("/tmp/preprocess_") + c.name + "_grid.bin";
+
+        LoadedArrayF32  in_ref;       // input stored as float32 view of uint8
+        LoadedArrayFp16 out_ref_fp16;
+        LoadedArrayI64  grid_ref;
+        if (!in_ref.Load(in_path) ||
+            !out_ref_fp16.Load(out_path) ||
+            !grid_ref.Load(grid_path)) {
+            LOG_ERROR("  [SKIP] %s: bin files missing — run "
+                      "'python tests/gen_cpu_reference.py --stage bicubic_preprocess'", c.name);
+            all_ok = false;
+            continue;
+        }
+
+        int64_t in_elems = static_cast<int64_t>(c.channels) * c.height * c.width;
+        if (static_cast<int64_t>(in_ref.data.size()) != in_elems) {
+            LOG_ERROR("  [FAIL] %s: input bin size mismatch %zu vs expect %ld",
+                     c.name, in_ref.data.size(), in_elems);
+            all_ok = false;
+            continue;
+        }
+
+        std::vector<uint8_t> img_u8(in_elems);
+        for (int64_t i = 0; i < in_elems; i++) {
+            float v = std::round(in_ref.data[i]);
+            if (v < 0.0f) v = 0.0f;
+            if (v > 255.0f) v = 255.0f;
+            img_u8[i] = static_cast<uint8_t>(v);
+        }
+
+        // Output buffer: oversize to the reference's flattened size — the
+        // adapter writes exactly num_patches * patch_dim fp16 elements.
+        std::vector<uint16_t> cpp_pixels(out_ref_fp16.data.size());
+        int64_t num_patches = 0;
+        int64_t grid_thw[3] = {0, 0, 0};
+
+        auto status = atb_llm::adapters::PreprocessImage(
+            img_u8.data(), c.channels, c.height, c.width,
+            cfg, cpp_pixels.data(), num_patches, grid_thw);
+
+        if (status != atb_llm::STATUS_OK) {
+            LOG_ERROR("  [FAIL] %s: PreprocessImage returned status=%d",
+                     c.name, static_cast<int>(status));
+            all_ok = false;
+            continue;
+        }
+
+        // ── Check grid_thw equality (must be exact) ──
+        if (grid_ref.data.size() < 3) {
+            LOG_ERROR("  [FAIL] %s: ref grid has < 3 entries", c.name);
+            all_ok = false;
+            continue;
+        }
+        bool grid_ok = (grid_thw[0] == grid_ref.data[0]) &&
+                       (grid_thw[1] == grid_ref.data[1]) &&
+                       (grid_thw[2] == grid_ref.data[2]);
+        if (!grid_ok) {
+            LOG_ERROR("  [FAIL] %s: grid_thw C++=[%ld,%ld,%ld] Python=[%ld,%ld,%ld]",
+                     c.name, grid_thw[0], grid_thw[1], grid_thw[2],
+                     grid_ref.data[0], grid_ref.data[1], grid_ref.data[2]);
+            all_ok = false;
+            continue;
+        }
+
+        int64_t ref_total = static_cast<int64_t>(out_ref_fp16.data.size());
+        int64_t expected_total = num_patches *
+            (static_cast<int64_t>(c.channels) * cfg.pp_temporal_patch_size *
+             cfg.pp_patch_size * cfg.pp_patch_size);
+        if (expected_total != ref_total) {
+            LOG_ERROR("  [FAIL] %s: num_patches=%ld * patch_dim != ref total (%ld vs %ld)",
+                     c.name, num_patches, expected_total, ref_total);
+            all_ok = false;
+            continue;
+        }
+
+        // Decode both sides to fp32 and compare via cosine.
+        std::vector<float> cpp_f32(ref_total), ref_f32(ref_total);
+        for (int64_t i = 0; i < ref_total; i++) {
+            cpp_f32[i] = Fp16BitsToFloat(cpp_pixels[i]);
+            ref_f32[i] = Fp16BitsToFloat(out_ref_fp16.data[i]);
+        }
+        float cos_s = CosineSim(cpp_f32.data(), ref_f32.data(), ref_total);
+        float md    = MaxAbsDiff(cpp_f32.data(), ref_f32.data(), ref_total);
+
+        bool ok = (cos_s >= 0.999f);
+        all_ok &= ok;
+        LOG_INFO("  [%s] %s: grid=[%ld,%ld,%ld] patches=%ld cosine=%.6f max_diff=%.6e",
+                 ok ? "PASS" : "FAIL", c.name,
+                 grid_thw[0], grid_thw[1], grid_thw[2], num_patches, cos_s, md);
+    }
+
+    return all_ok;
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -182,6 +561,14 @@ int main() {
 
     total++;
     if (TestSmartResizeBoundary()) passed++;
+
+    total++;
+    if (TestBicubicVsPython()) passed++;
+    else LOG_ERROR("  Hint: run 'python tests/gen_cpu_reference.py --stage bicubic_preprocess' first");
+
+    total++;
+    if (TestPreprocessImageVsPython()) passed++;
+    else LOG_ERROR("  Hint: run 'python tests/gen_cpu_reference.py --stage bicubic_preprocess' first");
 
     LOG_INFO("\n=== Summary: %d/%d tests passed ===", passed, total);
     return (passed == total) ? 0 : 1;
