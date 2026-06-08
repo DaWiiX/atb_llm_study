@@ -3,12 +3,16 @@
  *
  * Matches the Python benchmark.py 6-stage breakdown for fair comparison.
  *
- * Run: ./benchmark [--mode text|mm|both] [--iter N] [--warmup M]
+ * Run: ./benchmark [--mode text|mm|io|all|bench|compare] [--iter N] [--warmup M]
  *                  [--seq S] [--width W --height H] [--cmp]
  *
- *   --mode text   : text-only benchmark
- *   --mode mm     : multimodal benchmark (image + text)
- *   --mode both   : run both modes (default)
+ *   --mode text    : text-only benchmark
+ *   --mode mm      : multimodal benchmark (image + text)
+ *   --mode io      : image-only benchmark (no text tokens)
+ *   --mode all     : run all three modes (default)
+ *   --mode bench   : run image-only at 4 fixed resolutions (224x224, 416x672, 672x416, 896x896)
+ *   --mode compare : run full test matrix: TEXT_ONLY + IMAGE_ONLY x4 + IMAGE_AND_TEXT x4
+ *                    saves pooler output .bin for each combination
  *   --iter N      : benchmark iterations (default: 5)
  *   --warmup M    : warmup iterations (default: 3)
  *   --seq S       : text-only sequence length (default: 64)
@@ -24,6 +28,7 @@
 #include "adapters/qwen3vl_embedding/qwen3vl_config.h"
 #include "adapters/qwen3vl_embedding/qwen3vl_preprocess.h"
 #include "log/logger.h"
+#include "utils/float_utils.h"
 #include "test_env.h"
 
 #include <cstdio>
@@ -60,6 +65,98 @@ Stats ComputeStats(std::vector<double>& times) {
     return st;
 }
 
+// ── Helper: load token IDs saved by Python benchmark --save-tokens ─
+// Format: [int32_t count] [int64_t * count]
+// Returns empty vector on failure (caller should fallback to hardcoded).
+static std::vector<int64_t> LoadTokenIds(const std::string& path) {
+    std::vector<int64_t> ids;
+    FILE* fp = fopen(path.c_str(), "rb");
+    if (!fp) {
+        return ids;  // file doesn't exist — caller should fallback
+    }
+    int32_t count = 0;
+    if (fread(&count, sizeof(int32_t), 1, fp) != 1) {
+        LOG_ERROR("Failed to read token count from %s", path.c_str());
+        fclose(fp);
+        return {};
+    }
+    if (count <= 0) {
+        LOG_ERROR("Token file %s has invalid count %d", path.c_str(), count);
+        fclose(fp);
+        return {};
+    }
+    ids.resize(static_cast<size_t>(count));
+    size_t read_n = fread(ids.data(), sizeof(int64_t), static_cast<size_t>(count), fp);
+    fclose(fp);
+    if (read_n != static_cast<size_t>(count)) {
+        LOG_ERROR("Failed to read token data from %s (expected %d, got %zu)",
+                  path.c_str(), count, read_n);
+        return {};
+    }
+    LOG_INFO("Loaded %d token IDs from %s", count, path.c_str());
+    return ids;
+}
+
+// ── Helper: create gradient test image (NCHW layout, matches Python benchmark.py) ─
+static std::vector<uint8_t> CreateGradientImage(int32_t channels, int32_t height, int32_t width) {
+    std::vector<uint8_t> image(channels * height * width);
+    for (int32_t c = 0; c < channels; c++) {
+        for (int32_t h = 0; h < height; h++) {
+            for (int32_t w = 0; w < width; w++) {
+                uint8_t value = static_cast<uint8_t>((h * 255 / height + w * 255 / width + c * 85) % 256);
+                image[c * height * width + h * width + w] = value;
+            }
+        }
+    }
+    return image;
+}
+
+// ── Helper: save pixel_values (fp16) to binary file ──────────────
+// Format: [int32_t num_values] [uint16_t * num_values]
+// Used by RunCompareMode so Python benchmark --load-pixel-values can
+// consume the identical preprocessed input.
+static void SavePixelValues(const std::string& path,
+                            const uint16_t* data, int32_t count) {
+    FILE* fp = fopen(path.c_str(), "wb");
+    if (!fp) {
+        LOG_ERROR("Failed to open pixel_values file: %s", path.c_str());
+        return;
+    }
+    fwrite(&count, sizeof(int32_t), 1, fp);
+    fwrite(data, sizeof(uint16_t), count, fp);
+    fclose(fp);
+    LOG_INFO("Saved pixel_values to %s (count=%d)", path.c_str(), count);
+}
+
+// ── Helper: save InferResult (fp16→fp32) to binary file ────────
+// Format: [int64_t dim] [float32 * dim]
+static bool SavePoolerOutput(const char* path, const atb_llm::InferResult& result) {
+    FILE* f = fopen(path, "wb");
+    if (!f) {
+        LOG_ERROR("Failed to open output file: %s", path);
+        return false;
+    }
+    int64_t dim = result.shape[0];
+    fwrite(&dim, sizeof(int64_t), 1, f);
+    if (result.dtype == ACL_FLOAT16) {
+        const uint16_t* fp16_data = result.As<uint16_t>();
+        std::vector<float> fp32_data(dim);
+        for (int64_t i = 0; i < dim; i++) {
+            fp32_data[i] = atb_llm::Fp16ToF32(fp16_data[i]);
+        }
+        fwrite(fp32_data.data(), sizeof(float), dim, f);
+    } else if (result.dtype == ACL_FLOAT) {
+        fwrite(result.As<float>(), sizeof(float), dim, f);
+    } else {
+        LOG_ERROR("Unexpected dtype: %d", static_cast<int>(result.dtype));
+        fclose(f);
+        return false;
+    }
+    fclose(f);
+    LOG_INFO("Saved %s (dim=%ld)", path, static_cast<long>(dim));
+    return true;
+}
+
 // ── Run benchmark iterations ─────────────────────────────────
 // Returns: vector of (StageTimings, e2e_ms) pairs
 struct TimedResult {
@@ -70,7 +167,8 @@ struct TimedResult {
 std::vector<TimedResult> RunBenchmark(
         atb_llm::LLMEngine* engine,
         const atb_llm::InferRequest& request,
-        int num_warmup, int num_iter, bool verbose) {
+        int num_warmup, int num_iter, bool verbose,
+        const char* save_bin_path = nullptr) {
     atb_llm::Status s;
 
     // Warmup
@@ -89,6 +187,7 @@ std::vector<TimedResult> RunBenchmark(
 
     // Benchmark
     std::vector<TimedResult> results(num_iter);
+    atb_llm::InferResult last_result;
     for (int i = 0; i < num_iter; i++) {
         atb_llm::InferResult result;
         atb_llm::StageTimings timings;
@@ -99,8 +198,16 @@ std::vector<TimedResult> RunBenchmark(
         }
         results[i].timings = timings;
         results[i].e2e_ms = timings.e2e_ms;
+        if (save_bin_path && i == num_iter - 1) {
+            last_result = std::move(result);
+        }
         if (verbose) {
             LOG_INFO("  Iter %d: %.2f ms", i, timings.e2e_ms);
+        }
+    }
+    if (save_bin_path) {
+        if (!SavePoolerOutput(save_bin_path, last_result)) {
+            LOG_ERROR("Failed to save pooler output to %s", save_bin_path);
         }
     }
     return results;
@@ -245,6 +352,7 @@ int RunMultimodalBenchmark(atb_llm::LLMEngine* engine,
     // First, compute how many patches we'll get to size the output buffer
     int32_t factor = config.pp_patch_size * config.pp_temporal_patch_size;
     int32_t new_h, new_w;
+    auto pre_start = std::chrono::high_resolution_clock::now();
     atb_llm::adapters::SmartResize(img_h, img_w, factor,
                                     config.pp_min_pixels, config.pp_max_pixels,
                                     new_h, new_w);
@@ -266,6 +374,7 @@ int RunMultimodalBenchmark(atb_llm::LLMEngine* engine,
         LOG_ERROR("PreprocessImage failed");
         return 1;
     }
+    auto pre_end = std::chrono::high_resolution_clock::now();
 
     int64_t vis_tokens = actual_patches / (config.vis_spatial_merge_size * config.vis_spatial_merge_size);
     int64_t image_token_id = config.image_token_id;
@@ -311,6 +420,10 @@ int RunMultimodalBenchmark(atb_llm::LLMEngine* engine,
 
     auto results = RunBenchmark(engine, request, num_warmup, num_iter, !cmp_mode);
     if (results.empty()) return 1;
+    double pre_ms = std::chrono::duration<double, std::milli>(pre_end - pre_start).count();
+    for (auto& r : results) {
+        r.timings.preprocess_ms = pre_ms;
+    }
 
     std::vector<double> e2e_times;
     for (auto& r : results) e2e_times.push_back(r.e2e_ms);
@@ -332,6 +445,408 @@ int RunMultimodalBenchmark(atb_llm::LLMEngine* engine,
 }
 
 // ═══════════════════════════════════════════════════════════════
+// Image-only benchmark
+// ═══════════════════════════════════════════════════════════════
+
+int RunImageOnlyBenchmark(atb_llm::LLMEngine* engine,
+                          int img_w, int img_h,
+                          int num_warmup, int num_iter,
+                          bool cmp_mode) {
+    // Load Qwen3VL config for preprocessing
+    atb_llm::adapters::Qwen3VLConfig config;
+    atb_llm::Status s = atb_llm::adapters::LoadQwen3VLConfig(MODEL_DIR, config);
+    if (s != atb_llm::STATUS_OK) {
+        LOG_ERROR("Failed to load Qwen3VL config from %s", MODEL_DIR.c_str());
+        return 1;
+    }
+
+    // Generate synthetic image: gradient pattern
+    std::vector<uint8_t> image(3 * img_h * img_w);
+    for (int c = 0; c < 3; c++) {
+        for (int h = 0; h < img_h; h++) {
+            for (int w = 0; w < img_w; w++) {
+                image[c * img_h * img_w + h * img_w + w] =
+                    static_cast<uint8_t>((h * 255 / img_h + w * 255 / img_w + c * 85) % 256);
+            }
+        }
+    }
+
+    // Preprocess image
+    int32_t factor = config.pp_patch_size * config.pp_temporal_patch_size;
+    int32_t new_h, new_w;
+    auto pre_start = std::chrono::high_resolution_clock::now();
+    atb_llm::adapters::SmartResize(img_h, img_w, factor,
+                                    config.pp_min_pixels, config.pp_max_pixels,
+                                    new_h, new_w);
+    int64_t grid_h = new_h / config.vis_patch_size;
+    int64_t grid_w = new_w / config.vis_patch_size;
+    int64_t grid_t = 2;
+    int64_t num_patches = grid_t * grid_h * grid_w;
+    int64_t patch_dim = static_cast<int64_t>(config.vis_in_channels) *
+                        config.vis_temporal_patch_size *
+                        config.vis_patch_size * config.vis_patch_size;
+
+    std::vector<uint16_t> pixel_values(num_patches * patch_dim);
+    int64_t actual_patches = 0;
+    int64_t grid_thw[3] = {};
+    s = atb_llm::adapters::PreprocessImage(
+        image.data(), 3, img_h, img_w, config,
+        pixel_values.data(), actual_patches, grid_thw);
+    if (s != atb_llm::STATUS_OK) {
+        LOG_ERROR("PreprocessImage failed");
+        return 1;
+    }
+    auto pre_end = std::chrono::high_resolution_clock::now();
+
+    int64_t vis_tokens = actual_patches / (config.vis_spatial_merge_size * config.vis_spatial_merge_size);
+    int64_t image_token_id = config.image_token_id;
+
+    // Build input_ids: [image_token_id] * vis_tokens (pure image, no text)
+    int64_t seq_len = vis_tokens;
+    std::vector<int64_t> input_ids(seq_len);
+    for (int64_t i = 0; i < vis_tokens; i++) {
+        input_ids[i] = image_token_id;
+    }
+
+    // Setup request
+    atb_llm::InferRequest request;
+    request.mode = atb_llm::InputMode::PREPROCESSED;
+    request.text.input_ids = input_ids.data();
+    request.text.batch_size = 1;
+    request.text.seq_length = seq_len;
+    request.preprocessed.pixel_values = pixel_values.data();
+    request.preprocessed.num_patches = actual_patches;
+    request.preprocessed.patch_dim = patch_dim;
+    request.preprocessed.grid_thw = grid_thw;
+    request.preprocessed.dtype = ACL_FLOAT16;
+
+    char resolution[32];
+    std::snprintf(resolution, sizeof(resolution), "%dx%d", img_w, img_h);
+
+    if (!cmp_mode) {
+        LOG_INFO("=== Image-Only Benchmark ===");
+        LOG_INFO("Image: %dx%d -> %ldx%ld, patches=%ld, vis_tokens=%ld",
+                 img_w, img_h,
+                 static_cast<long>(new_h), static_cast<long>(new_w),
+                 static_cast<long>(actual_patches),
+                 static_cast<long>(vis_tokens));
+        LOG_INFO("Sequence length: %ld (image tokens only)", static_cast<long>(seq_len));
+        LOG_INFO("Iterations: %d (warmup: %d)", num_iter, num_warmup);
+    }
+
+    auto results = RunBenchmark(engine, request, num_warmup, num_iter, !cmp_mode);
+    if (results.empty()) return 1;
+    double pre_ms = std::chrono::duration<double, std::milli>(pre_end - pre_start).count();
+    for (auto& r : results) {
+        r.timings.preprocess_ms = pre_ms;
+    }
+
+    std::vector<double> e2e_times;
+    for (auto& r : results) e2e_times.push_back(r.e2e_ms);
+    Stats e2e_stats = ComputeStats(e2e_times);
+
+    if (cmp_mode) {
+        ReportStagesCompact(results, "io", resolution,
+                            static_cast<int>(seq_len),
+                            static_cast<int>(vis_tokens), e2e_stats);
+    } else {
+        char label[64];
+        std::snprintf(label, sizeof(label), "image-only %dx%d", img_w, img_h);
+        ReportStages(results, label,
+                     static_cast<int>(seq_len),
+                     static_cast<int>(vis_tokens), e2e_stats);
+    }
+
+    return 0;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Compare mode — runs full test matrix and saves .bin outputs
+// ═══════════════════════════════════════════════════════════════
+
+int RunCompareMode(atb_llm::LLMEngine* engine,
+                   int num_warmup, int num_iter) {
+    // Load Qwen3VL config for preprocessing
+    atb_llm::adapters::Qwen3VLConfig config;
+    atb_llm::Status s = atb_llm::adapters::LoadQwen3VLConfig(MODEL_DIR, config);
+    if (s != atb_llm::STATUS_OK) {
+        LOG_ERROR("Failed to load Qwen3VL config from %s", MODEL_DIR.c_str());
+        return 1;
+    }
+
+    // Token constants: "Describe the image." (from Qwen3-VL tokenizer)
+    static constexpr int64_t TOK_DESCRIBE = 74785;
+    static constexpr int64_t TOK_THE      = 279;
+    static constexpr int64_t TOK_IMAGE    = 2168;
+    static constexpr int64_t TOK_DOT      = 13;
+    int64_t image_token_id = config.image_token_id;
+
+    // 4 resolutions (matching Python benchmark.py)
+    struct { int w; int h; } resolutions[] = {
+        {416, 672},
+        {720, 1280},
+        {1080, 1920},
+        {1440, 2560},
+    };
+    int num_res = static_cast<int>(sizeof(resolutions) / sizeof(resolutions[0]));
+
+    LOG_INFO("============================================================");
+    LOG_INFO("  Compare Mode — 13 combinations (5x TEXT + 4x IO + 4x MM)");
+    LOG_INFO("  Warmup: %d, Iterations: %d", num_warmup, num_iter);
+    LOG_INFO("============================================================");
+
+    int ret = 0;
+
+    // ── 1. TEXT_ONLY: multiple sequence lengths ────────────────────
+    {
+        constexpr int64_t text_seq_lengths[] = {100, 512, 1024, 2048, 4096};
+        constexpr int num_text = static_cast<int>(sizeof(text_seq_lengths) / sizeof(text_seq_lengths[0]));
+
+        // Load base tokens from Python-generated file (--save-tokens --mode text)
+        // Fallback to hardcoded tokens if file doesn't exist.
+        std::vector<int64_t> text_base_tokens;
+        {
+            auto loaded = LoadTokenIds("/tmp/tokens_text_only.bin");
+            if (!loaded.empty()) {
+                text_base_tokens = std::move(loaded);
+            } else {
+                LOG_WARN("Token file /tmp/tokens_text_only.bin not found — "
+                            "using hardcoded tokens. Run "
+                            "'python benchmark.py --save-tokens --mode text' "
+                            "for accurate tokenization.");
+                static constexpr int64_t fallback[] = {TOK_DESCRIBE, TOK_THE, TOK_IMAGE, TOK_DOT};
+                text_base_tokens.assign(fallback, fallback + sizeof(fallback) / sizeof(fallback[0]));
+            }
+        }
+
+        auto make_text_input_ids = [&](int64_t target_len) -> std::vector<int64_t> {
+            std::vector<int64_t> ids(target_len);
+            int64_t num_base = static_cast<int64_t>(text_base_tokens.size());
+            for (int64_t i = 0; i < target_len; i++) {
+                ids[i] = text_base_tokens[i % num_base];
+            }
+            return ids;
+        };
+
+        for (int ti = 0; ti < num_text; ti++) {
+            int64_t seq = text_seq_lengths[ti];
+            LOG_INFO("------------------------------------------------------------");
+            LOG_INFO("  [%d/13] TEXT_ONLY  S=%ld", ti + 1, static_cast<long>(seq));
+            LOG_INFO("------------------------------------------------------------");
+
+            std::vector<int64_t> input_ids = make_text_input_ids(seq);
+
+            atb_llm::InferRequest request;
+            request.mode = atb_llm::InputMode::TEXT_ONLY;
+            request.text.input_ids = input_ids.data();
+            request.text.batch_size = 1;
+            request.text.seq_length = seq;
+
+            char save_path[256];
+            std::snprintf(save_path, sizeof(save_path),
+                          "/tmp/cpp_text_only_%ld.bin", static_cast<long>(seq));
+
+            auto results = RunBenchmark(engine, request, num_warmup, num_iter, true,
+                                         save_path);
+            if (results.empty()) return 1;
+
+            std::vector<double> e2e_times;
+            for (auto& r : results) e2e_times.push_back(r.e2e_ms);
+            Stats e2e_stats = ComputeStats(e2e_times);
+            ReportStagesCompact(results, "text", "N/A",
+                                static_cast<int>(seq), 0, e2e_stats);
+        }
+    }
+
+    // ── 2. IMAGE_ONLY and IMAGE_AND_TEXT for each resolution ─────
+    for (int i = 0; i < num_res && ret == 0; i++) {
+        int img_w = resolutions[i].w;
+        int img_h = resolutions[i].h;
+
+        LOG_INFO("============================================================");
+        LOG_INFO("  Resolution %dx%d", img_w, img_h);
+        LOG_INFO("============================================================");
+
+        // Generate gradient test image (matches Python benchmark.py)
+        auto pre_start = std::chrono::high_resolution_clock::now();
+        std::vector<uint8_t> image = CreateGradientImage(3, img_h, img_w);
+
+        // Compute output buffer size
+        int32_t factor = config.pp_patch_size * config.pp_temporal_patch_size;
+        int32_t new_h, new_w;
+        atb_llm::adapters::SmartResize(img_h, img_w, factor,
+                                        config.pp_min_pixels, config.pp_max_pixels,
+                                        new_h, new_w);
+        int64_t grid_h = new_h / config.vis_patch_size;
+        int64_t grid_w = new_w / config.vis_patch_size;
+        int64_t grid_t = 2;  // Qwen3VL: always 2 temporal patches
+        int64_t num_patches = grid_t * grid_h * grid_w;
+        int64_t patch_dim = static_cast<int64_t>(config.vis_in_channels) *
+                            config.vis_temporal_patch_size *
+                            config.vis_patch_size * config.vis_patch_size;
+
+        std::vector<uint16_t> pixel_values(num_patches * patch_dim);
+        int64_t actual_patches = 0;
+        int64_t grid_thw[3] = {};
+        s = atb_llm::adapters::PreprocessImage(
+            image.data(), 3, img_h, img_w, config,
+            pixel_values.data(), actual_patches, grid_thw);
+        auto pre_end = std::chrono::high_resolution_clock::now();
+        if (s != atb_llm::STATUS_OK) {
+            LOG_ERROR("PreprocessImage failed for %dx%d", img_w, img_h);
+            ret = 1;
+            break;
+        }
+        double pre_ms = std::chrono::duration<double, std::milli>(pre_end - pre_start).count();
+
+        // Save preprocessed pixel_values so Python --load-pixel-values
+        // can consume the identical input (fixes input mismatch).
+        {
+            char pv_path[256];
+            std::snprintf(pv_path, sizeof(pv_path),
+                          "/tmp/cpp_pv_%dx%d.bin", img_w, img_h);
+            SavePixelValues(pv_path, pixel_values.data(),
+                            static_cast<int32_t>(actual_patches * patch_dim));
+        }
+
+        int64_t vis_tokens = actual_patches /
+            (config.vis_spatial_merge_size * config.vis_spatial_merge_size);
+
+        char resolution_str[32];
+        std::snprintf(resolution_str, sizeof(resolution_str), "%dx%d", img_w, img_h);
+
+        LOG_INFO("  SmartResize: %dx%d → %dx%d, patches=%ld, vis_tokens=%ld",
+                 img_w, img_h, new_h, new_w,
+                 static_cast<long>(actual_patches),
+                 static_cast<long>(vis_tokens));
+
+        // ── IMAGE_ONLY ────────────────────────────────────────────
+        {
+            int combo_idx = 6 + i * 2;  // 6,8,10,12
+            LOG_INFO("  [%d/13] IMAGE_ONLY  %dx%d", combo_idx, img_w, img_h);
+
+            std::vector<int64_t> input_ids(vis_tokens, image_token_id);
+
+            atb_llm::InferRequest request;
+            request.mode = atb_llm::InputMode::PREPROCESSED;
+            request.text.input_ids = input_ids.data();
+            request.text.batch_size = 1;
+            request.text.seq_length = vis_tokens;
+            request.preprocessed.pixel_values = pixel_values.data();
+            request.preprocessed.num_patches = actual_patches;
+            request.preprocessed.patch_dim = patch_dim;
+            request.preprocessed.grid_thw = grid_thw;
+            request.preprocessed.dtype = ACL_FLOAT16;
+
+            char save_path[256];
+            std::snprintf(save_path, sizeof(save_path),
+                          "/tmp/cpp_io_%dx%d.bin", img_w, img_h);
+
+            auto results = RunBenchmark(engine, request, num_warmup, num_iter, true,
+                                         save_path);
+            if (results.empty()) { ret = 1; break; }
+            for (auto& r : results) {
+                r.timings.preprocess_ms = pre_ms;
+            }
+
+            std::vector<double> e2e_times;
+            for (auto& r : results) e2e_times.push_back(r.e2e_ms);
+            Stats e2e_stats = ComputeStats(e2e_times);
+            ReportStagesCompact(results, "io", resolution_str,
+                                static_cast<int>(vis_tokens),
+                                static_cast<int>(vis_tokens), e2e_stats);
+        }
+
+        // ── IMAGE_AND_TEXT ────────────────────────────────────────
+        if (ret == 0) {
+            int combo_idx = 7 + i * 2;  // 7,9,11,13
+            LOG_INFO("  [%d/13] IMAGE_AND_TEXT  %dx%d", combo_idx, img_w, img_h);
+
+            // Try loading token IDs from Python-generated file first.
+            char token_path[256];
+            std::snprintf(token_path, sizeof(token_path),
+                          "/tmp/tokens_mm_%dx%d.bin", img_w, img_h);
+            std::vector<int64_t> input_ids = LoadTokenIds(token_path);
+
+            if (input_ids.empty()) {
+                // Fallback: hardcoded construction
+                LOG_WARN("Token file %s not found — using hardcoded tokens. "
+                            "Run 'python benchmark.py --save-tokens --mode mm' "
+                            "for accurate tokenization.", token_path);
+                input_ids.push_back(TOK_DESCRIBE);
+                for (int64_t j = 0; j < vis_tokens; j++) {
+                    input_ids.push_back(image_token_id);
+                }
+                input_ids.push_back(TOK_THE);
+                input_ids.push_back(TOK_IMAGE);
+                input_ids.push_back(TOK_DOT);
+            } else {
+                // Verify image token count consistency
+                int64_t loaded_img_tokens = 0;
+                for (auto tid : input_ids) {
+                    if (tid == image_token_id) loaded_img_tokens++;
+                }
+                if (loaded_img_tokens != vis_tokens) {
+                    LOG_WARN("Loaded MM tokens have %ld image tokens but "
+                                "preprocess produced %ld — possible mismatch.",
+                                static_cast<long>(loaded_img_tokens),
+                                static_cast<long>(vis_tokens));
+                }
+            }
+
+            int64_t seq_len = static_cast<int64_t>(input_ids.size());
+
+            atb_llm::InferRequest request;
+            request.mode = atb_llm::InputMode::PREPROCESSED;
+            request.text.input_ids = input_ids.data();
+            request.text.batch_size = 1;
+            request.text.seq_length = seq_len;
+            request.preprocessed.pixel_values = pixel_values.data();
+            request.preprocessed.num_patches = actual_patches;
+            request.preprocessed.patch_dim = patch_dim;
+            request.preprocessed.grid_thw = grid_thw;
+            request.preprocessed.dtype = ACL_FLOAT16;
+
+            char save_path[256];
+            std::snprintf(save_path, sizeof(save_path),
+                          "/tmp/cpp_mm_%dx%d.bin", img_w, img_h);
+
+            auto results = RunBenchmark(engine, request, num_warmup, num_iter, true,
+                                         save_path);
+            if (results.empty()) { ret = 1; break; }
+            for (auto& r : results) {
+                r.timings.preprocess_ms = pre_ms;
+            }
+
+            std::vector<double> e2e_times;
+            for (auto& r : results) e2e_times.push_back(r.e2e_ms);
+            Stats e2e_stats = ComputeStats(e2e_times);
+            ReportStagesCompact(results, "mm", resolution_str,
+                                static_cast<int>(seq_len),
+                                static_cast<int>(vis_tokens), e2e_stats);
+        }
+    }
+
+    if (ret == 0) {
+        LOG_INFO("============================================================");
+        LOG_INFO("  Compare mode complete. Output files:");
+        LOG_INFO("    /tmp/cpp_text_only_100.bin");
+        LOG_INFO("    /tmp/cpp_text_only_512.bin");
+        LOG_INFO("    /tmp/cpp_text_only_1024.bin");
+        LOG_INFO("    /tmp/cpp_text_only_2048.bin");
+        LOG_INFO("    /tmp/cpp_text_only_4096.bin");
+        for (int i = 0; i < num_res; i++) {
+            LOG_INFO("    /tmp/cpp_pv_%dx%d.bin", resolutions[i].w, resolutions[i].h);
+            LOG_INFO("    /tmp/cpp_io_%dx%d.bin", resolutions[i].w, resolutions[i].h);
+            LOG_INFO("    /tmp/cpp_mm_%dx%d.bin", resolutions[i].w, resolutions[i].h);
+        }
+        LOG_INFO("============================================================");
+    }
+
+    return ret;
+}
+
+// ═══════════════════════════════════════════════════════════════
 // Main
 // ═══════════════════════════════════════════════════════════════
 
@@ -342,7 +857,7 @@ int main(int argc, char** argv) {
     int img_w = 416;
     int img_h = 672;
     bool cmp_mode = false;
-    std::string mode = "both";
+    std::string mode = "all";
 
     for (int i = 1; i < argc; i++) {
         if (std::strcmp(argv[i], "--iter") == 0 && i + 1 < argc) {
@@ -391,13 +906,37 @@ int main(int argc, char** argv) {
         ret = RunTextBenchmark(engine.get(), seq_len, num_warmup, num_iter, cmp_mode);
     } else if (mode == "mm") {
         ret = RunMultimodalBenchmark(engine.get(), img_w, img_h, num_warmup, num_iter, cmp_mode);
-    } else if (mode == "both") {
+    } else if (mode == "io") {
+        ret = RunImageOnlyBenchmark(engine.get(), img_w, img_h, num_warmup, num_iter, cmp_mode);
+    } else if (mode == "all") {
         ret = RunTextBenchmark(engine.get(), seq_len, num_warmup, num_iter, cmp_mode);
+        if (ret == 0) {
+            ret = RunImageOnlyBenchmark(engine.get(), img_w, img_h, num_warmup, num_iter, cmp_mode);
+        }
         if (ret == 0) {
             ret = RunMultimodalBenchmark(engine.get(), img_w, img_h, num_warmup, num_iter, cmp_mode);
         }
+    } else if (mode == "bench") {
+        struct { int w, h; } resolutions[] = {
+            {224, 224},
+            {416, 672},
+            {672, 416},
+            {896, 896},
+        };
+        int num_res = static_cast<int>(sizeof(resolutions) / sizeof(resolutions[0]));
+        for (int i = 0; i < num_res; i++) {
+            if (!cmp_mode && i > 0) {
+                LOG_INFO("============================================================");
+            }
+            ret = RunImageOnlyBenchmark(engine.get(),
+                                         resolutions[i].w, resolutions[i].h,
+                                         num_warmup, num_iter, cmp_mode);
+            if (ret != 0) break;
+        }
+    } else if (mode == "compare") {
+        ret = RunCompareMode(engine.get(), num_warmup, num_iter);
     } else {
-        LOG_ERROR("Unknown mode: %s (use text|mm|both)", mode.c_str());
+        LOG_ERROR("Unknown mode: %s (use text|mm|io|all|bench|compare)", mode.c_str());
         return 1;
     }
 
