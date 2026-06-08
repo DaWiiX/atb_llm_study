@@ -38,7 +38,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-PROJ_DIR = Path(__file__).resolve().parent.parent.parent / "atb_python_qwen3vl_embedding"
+PROJ_DIR = Path(__file__).resolve().parent.parent.parent.parent / "atb_python_qwen3vl_embedding"
 sys.path.insert(0, str(PROJ_DIR))
 
 from engine_utils import VisionRotaryEmbedding, compute_rot_pos_emb

@@ -46,7 +46,7 @@ import numpy as np
 import torch
 
 # Path setup so we can reuse Python project helpers
-PROJ_DIR = Path(__file__).resolve().parent.parent.parent / "atb_python_qwen3vl_embedding"
+PROJ_DIR = Path(__file__).resolve().parent.parent.parent.parent / "atb_python_qwen3vl_embedding"
 sys.path.insert(0, str(PROJ_DIR))
 
 from engine_utils import fast_pos_embed_interpolate

@@ -1,12 +1,16 @@
 /**
  * C++ Engine Accuracy Test — covers all input modes.
  *
- * Tests:
- *   1. TEXT_ONLY: pure text inference
- *   2. IMAGE_ONLY: pure image inference (preprocessed)
- *   3. IMAGE_AND_TEXT: image + text inference (preprocessed)
+ * Uses identical inputs as Python test_accuracy.py:
+ *   - Image: 720x1280 gradient pattern (triggers resize path)
+ *   - Text: "Describe the image." → tokens [74785, 279, 2168, 13]
  *
- * Each test saves output to /tmp/cpp_*.bin for comparison with Python.
+ * Tests:
+ *   1. TEXT_ONLY: "Describe the image."
+ *   2. IMAGE_ONLY: 720x1280 image only
+ *   3. IMAGE_AND_TEXT: "Describe" + [image] + " the image."
+ *
+ * All modes must achieve cosine similarity ≥ 0.99 vs Python.
  *
  * Run: ./test_accuracy
  * Then: python tests/test_accuracy.py
@@ -31,20 +35,93 @@
 
 static const std::string MODEL_DIR = GetModelDir();
 
-// ── Helper: create test image ──────────────────────────────────────
-// Creates a simple gradient image for testing
+// ── Shared test constants (must match test_accuracy.py exactly) ────
+static constexpr int32_t IMG_H = 720;       // triggers resize: 720→704 (round 22.5→22, banker's)
+static constexpr int32_t IMG_W = 1280;      // 1280 is already divisible by 32
+static constexpr int32_t IMG_C = 3;
+
+// "Describe the image." token IDs (from Qwen3-VL tokenizer)
+static constexpr int64_t TOK_DESCRIBE  = 74785;
+static constexpr int64_t TOK_THE       = 279;
+static constexpr int64_t TOK_IMAGE     = 2168;
+static constexpr int64_t TOK_DOT       = 13;
+
+static constexpr int64_t IMAGE_TOKEN_ID = 151655;  // from config image_token_id
+
+// ── Helper: create test image (must match Python create_test_image) ──
 static std::vector<uint8_t> CreateTestImage(int32_t channels, int32_t height, int32_t width) {
     std::vector<uint8_t> image(channels * height * width);
     for (int32_t c = 0; c < channels; c++) {
         for (int32_t h = 0; h < height; h++) {
             for (int32_t w = 0; w < width; w++) {
-                // Simple gradient pattern
                 uint8_t value = static_cast<uint8_t>((h * 255 / height + w * 255 / width + c * 85) % 256);
                 image[c * height * width + h * width + w] = value;
             }
         }
     }
     return image;
+}
+
+// ── Helper: preprocess image (shared between IMAGE_ONLY and IMAGE_AND_TEXT) ──
+struct PreprocessedImage {
+    std::vector<uint16_t> pixel_values;
+    int64_t num_patches;
+    int64_t grid_thw[3];
+    int64_t merged_tokens;   // = num_patches / merge_size^2
+};
+
+static bool PreprocessTestImage(const atb_llm::adapters::Qwen3VLConfig& config,
+                                 PreprocessedImage& out) {
+    std::vector<uint8_t> image = CreateTestImage(IMG_C, IMG_H, IMG_W);
+
+    int32_t factor = config.pp_patch_size * config.pp_merge_size;
+    int32_t new_h, new_w;
+    atb_llm::adapters::SmartResize(IMG_H, IMG_W, factor,
+                                   config.pp_min_pixels, config.pp_max_pixels,
+                                   new_h, new_w);
+
+    int32_t grid_h = new_h / config.pp_patch_size;
+    int32_t grid_w = new_w / config.pp_patch_size;
+    int32_t grid_t = 1;
+    int64_t num_patches = static_cast<int64_t>(grid_t) * grid_h * grid_w;
+    int64_t patch_dim = static_cast<int64_t>(IMG_C) * config.pp_temporal_patch_size *
+                        config.pp_patch_size * config.pp_patch_size;
+
+    out.pixel_values.resize(num_patches * patch_dim, 0);
+    out.num_patches = 0;
+    out.grid_thw[0] = out.grid_thw[1] = out.grid_thw[2] = 0;
+
+    atb_llm::Status s = atb_llm::adapters::PreprocessImage(
+        image.data(), IMG_C, IMG_H, IMG_W, config,
+        out.pixel_values.data(), out.num_patches, out.grid_thw);
+
+    if (!IS_OK(s)) {
+        LOG_ERROR("PreprocessImage failed: %d", static_cast<int>(s));
+        return false;
+    }
+
+    int64_t merge_size = config.pp_merge_size;
+    out.merged_tokens = out.num_patches / (merge_size * merge_size);
+
+    LOG_INFO("Preprocessed %dx%d → %dx%d, grid=[%ld,%ld,%ld], patches=%ld, merged=%ld",
+             IMG_H, IMG_W, new_h, new_w,
+             static_cast<long>(out.grid_thw[0]), static_cast<long>(out.grid_thw[1]),
+             static_cast<long>(out.grid_thw[2]),
+             static_cast<long>(out.num_patches), static_cast<long>(out.merged_tokens));
+
+    // Save pixel_values for comparison with Python
+    {
+        int64_t total = out.num_patches * patch_dim;
+        FILE* f = fopen("/tmp/cpp_pixel_values.bin", "wb");
+        if (f) {
+            fwrite(&total, sizeof(int64_t), 1, f);
+            fwrite(out.pixel_values.data(), sizeof(uint16_t), total, f);
+            fclose(f);
+            LOG_INFO("Saved /tmp/cpp_pixel_values.bin (%ld fp16 values)", static_cast<long>(total));
+        }
+    }
+
+    return true;
 }
 
 // ── Helper: save result to binary file ─────────────────────────────
@@ -95,13 +172,14 @@ static void PrintFirstN(const char* label, const atb_llm::InferResult& result, i
 
 int main(int argc, char** argv) {
     LOG_INFO("=== C++ Engine Accuracy Test ===");
+    LOG_INFO("Image: %dx%d, Text: 'Describe the image.'", IMG_H, IMG_W);
 
     // ── 1. Create engine ─────────────────────────────────────
     atb_llm::EngineConfig config;
     config.model_dir = MODEL_DIR;
-    config.buffer_size = 15LL * 1024 * 1024 * 1024;  // 15GB (increased for vision tests)
+    config.buffer_size = 15LL * 1024 * 1024 * 1024;  // 15GB
     config.device_id = 0;
-    config.normalize = true;  // L2-normalize output
+    config.normalize = true;
 
     std::unique_ptr<atb_llm::LLMEngine> engine;
     atb_llm::Status s = atb_llm::LLMEngine::Create(config, engine);
@@ -118,15 +196,14 @@ int main(int argc, char** argv) {
     int tests_total = 0;
 
     // ═══════════════════════════════════════════════════════════════
-    // Test 1: TEXT_ONLY
+    // Test 1: TEXT_ONLY — "Describe the image."
     // ═══════════════════════════════════════════════════════════════
     {
         LOG_INFO("\n=== Test 1: TEXT_ONLY ===");
         tests_total++;
 
-        // Fixed input: token IDs [151643, 15339, 1879] (seq_len=3)
-        int64_t input_ids[] = {151643, 15339, 1879};
-        int64_t seq_len = 3;
+        int64_t input_ids[] = {TOK_DESCRIBE, TOK_THE, TOK_IMAGE, TOK_DOT};
+        int64_t seq_len = 4;
 
         atb_llm::InferRequest request;
         request.mode = atb_llm::InputMode::TEXT_ONLY;
@@ -141,69 +218,33 @@ int main(int argc, char** argv) {
         } else {
             PrintFirstN("First 8 values", result, 8);
             if (SaveResult("/tmp/cpp_text_only.bin", result)) {
-                LOG_INFO("Saved to /tmp/cpp_text_only.bin");
+                LOG_INFO("Saved to /tmp/cpp_text_only.bin (dim=%ld)", static_cast<long>(result.shape[0]));
                 tests_passed++;
             }
         }
     }
 
     // ═══════════════════════════════════════════════════════════════
-    // Test 2: PREPROCESSED (Image-Only)
+    // Test 2: IMAGE_ONLY — 720x1280 image
     // ═══════════════════════════════════════════════════════════════
     {
-        LOG_INFO("\n=== Test 2: PREPROCESSED (Image-Only) ===");
+        LOG_INFO("\n=== Test 2: IMAGE_ONLY ===");
         tests_total++;
 
-        // Create a 64x64 test image
-        int32_t img_h = 64, img_w = 64, img_c = 3;
-        std::vector<uint8_t> image = CreateTestImage(img_c, img_h, img_w);
-
-        // Preprocess image
-        int32_t factor = pp_config.pp_patch_size * pp_config.pp_merge_size;
-        int32_t new_h, new_w;
-        atb_llm::adapters::SmartResize(img_h, img_w, factor,
-                                       pp_config.pp_min_pixels, pp_config.pp_max_pixels,
-                                       new_h, new_w);
-
-        int32_t grid_h = new_h / pp_config.pp_patch_size;
-        int32_t grid_w = new_w / pp_config.pp_patch_size;
-        int32_t grid_t = 1;
-        int64_t num_patches = static_cast<int64_t>(grid_t) * grid_h * grid_w;
-        int64_t patch_dim = static_cast<int64_t>(img_c) * pp_config.pp_temporal_patch_size *
-                            pp_config.pp_patch_size * pp_config.pp_patch_size;
-
-        std::vector<uint16_t> pixel_values(num_patches * patch_dim, 0);
-        int64_t out_num_patches = 0;
-        int64_t grid_thw[3] = {};
-
-        s = atb_llm::adapters::PreprocessImage(
-            image.data(), img_c, img_h, img_w, pp_config,
-            pixel_values.data(), out_num_patches, grid_thw);
-
-        if (!IS_OK(s)) {
-            LOG_ERROR("PreprocessImage failed: %d", static_cast<int>(s));
+        PreprocessedImage img;
+        if (!PreprocessTestImage(pp_config, img)) {
+            LOG_ERROR("Image preprocessing failed");
         } else {
-            LOG_INFO("Preprocessed: num_patches=%ld, grid_thw=[%ld, %ld, %ld]",
-                     static_cast<long>(out_num_patches),
-                     static_cast<long>(grid_thw[0]),
-                     static_cast<long>(grid_thw[1]),
-                     static_cast<long>(grid_thw[2]));
-
-            // For image-only, we need input_ids with image tokens
-            // Vision merger outputs merged_tokens = num_patches / (merge_size^2)
-            int64_t merge_size = pp_config.pp_merge_size;
-            int64_t merged_tokens = out_num_patches / (merge_size * merge_size);
-            int64_t image_token_id = 151655;  // from config
-            std::vector<int64_t> input_ids(merged_tokens, image_token_id);
+            std::vector<int64_t> input_ids(img.merged_tokens, IMAGE_TOKEN_ID);
 
             atb_llm::InferRequest request;
             request.mode = atb_llm::InputMode::PREPROCESSED;
             request.text.input_ids = input_ids.data();
             request.text.batch_size = 1;
-            request.text.seq_length = merged_tokens;
-            request.preprocessed.pixel_values = pixel_values.data();
-            request.preprocessed.num_patches = out_num_patches;
-            request.preprocessed.grid_thw = grid_thw;
+            request.text.seq_length = img.merged_tokens;
+            request.preprocessed.pixel_values = img.pixel_values.data();
+            request.preprocessed.num_patches = img.num_patches;
+            request.preprocessed.grid_thw = img.grid_thw;
             request.preprocessed.dtype = ACL_FLOAT16;
 
             atb_llm::InferResult result;
@@ -213,7 +254,7 @@ int main(int argc, char** argv) {
             } else {
                 PrintFirstN("First 8 values", result, 8);
                 if (SaveResult("/tmp/cpp_image_only.bin", result)) {
-                    LOG_INFO("Saved to /tmp/cpp_image_only.bin");
+                    LOG_INFO("Saved to /tmp/cpp_image_only.bin (dim=%ld)", static_cast<long>(result.shape[0]));
                     tests_passed++;
                 }
             }
@@ -221,74 +262,38 @@ int main(int argc, char** argv) {
     }
 
     // ═══════════════════════════════════════════════════════════════
-    // Test 3: PREPROCESSED (Image + Text)
+    // Test 3: IMAGE_AND_TEXT — "Describe" + [image] + " the image."
     // ═══════════════════════════════════════════════════════════════
     {
-        LOG_INFO("\n=== Test 3: PREPROCESSED (Image + Text) ===");
+        LOG_INFO("\n=== Test 3: IMAGE_AND_TEXT ===");
         tests_total++;
 
-        // Create a 32x32 test image
-        int32_t img_h = 32, img_w = 32, img_c = 3;
-        std::vector<uint8_t> image = CreateTestImage(img_c, img_h, img_w);
-
-        // Preprocess image
-        int32_t factor = pp_config.pp_patch_size * pp_config.pp_merge_size;
-        int32_t new_h, new_w;
-        atb_llm::adapters::SmartResize(img_h, img_w, factor,
-                                       pp_config.pp_min_pixels, pp_config.pp_max_pixels,
-                                       new_h, new_w);
-
-        int32_t grid_h = new_h / pp_config.pp_patch_size;
-        int32_t grid_w = new_w / pp_config.pp_patch_size;
-        int32_t grid_t = 1;
-        int64_t num_patches = static_cast<int64_t>(grid_t) * grid_h * grid_w;
-        int64_t patch_dim = static_cast<int64_t>(img_c) * pp_config.pp_temporal_patch_size *
-                            pp_config.pp_patch_size * pp_config.pp_patch_size;
-
-        std::vector<uint16_t> pixel_values(num_patches * patch_dim, 0);
-        int64_t out_num_patches = 0;
-        int64_t grid_thw[3] = {};
-
-        s = atb_llm::adapters::PreprocessImage(
-            image.data(), img_c, img_h, img_w, pp_config,
-            pixel_values.data(), out_num_patches, grid_thw);
-
-        if (!IS_OK(s)) {
-            LOG_ERROR("PreprocessImage failed: %d", static_cast<int>(s));
+        PreprocessedImage img;
+        if (!PreprocessTestImage(pp_config, img)) {
+            LOG_ERROR("Image preprocessing failed");
         } else {
-            LOG_INFO("Preprocessed: num_patches=%ld, grid_thw=[%ld, %ld, %ld]",
-                     static_cast<long>(out_num_patches),
-                     static_cast<long>(grid_thw[0]),
-                     static_cast<long>(grid_thw[1]),
-                     static_cast<long>(grid_thw[2]));
-
-            // Create input_ids: text + image + text
-            // Vision merger outputs merged_tokens = num_patches / (merge_size^2)
-            int64_t merge_size = pp_config.pp_merge_size;
-            int64_t merged_tokens = out_num_patches / (merge_size * merge_size);
-            int64_t image_token_id = 151655;  // from config
-            // Text tokens: [151643, 15339, 1879] (same as text-only test)
+            // input_ids: [Describe] + [img_tok]*merged + [the, image, .]
             std::vector<int64_t> input_ids;
-            // Add some text tokens before image
-            input_ids.push_back(151643);
-            // Add image tokens (merged tokens, not patches)
-            for (int64_t i = 0; i < merged_tokens; i++) {
-                input_ids.push_back(image_token_id);
+            input_ids.push_back(TOK_DESCRIBE);
+            for (int64_t i = 0; i < img.merged_tokens; i++) {
+                input_ids.push_back(IMAGE_TOKEN_ID);
             }
-            // Add more text tokens after image
-            input_ids.push_back(15339);
-            input_ids.push_back(1879);
+            input_ids.push_back(TOK_THE);
+            input_ids.push_back(TOK_IMAGE);
+            input_ids.push_back(TOK_DOT);
 
-            int64_t seq_len = input_ids.size();
+            int64_t seq_len = static_cast<int64_t>(input_ids.size());
+            LOG_INFO("input_ids length: %ld (text=1 + img=%ld + text=3)",
+                     static_cast<long>(seq_len), static_cast<long>(img.merged_tokens));
 
             atb_llm::InferRequest request;
             request.mode = atb_llm::InputMode::PREPROCESSED;
             request.text.input_ids = input_ids.data();
             request.text.batch_size = 1;
             request.text.seq_length = seq_len;
-            request.preprocessed.pixel_values = pixel_values.data();
-            request.preprocessed.num_patches = out_num_patches;
-            request.preprocessed.grid_thw = grid_thw;
+            request.preprocessed.pixel_values = img.pixel_values.data();
+            request.preprocessed.num_patches = img.num_patches;
+            request.preprocessed.grid_thw = img.grid_thw;
             request.preprocessed.dtype = ACL_FLOAT16;
 
             atb_llm::InferResult result;
@@ -298,7 +303,7 @@ int main(int argc, char** argv) {
             } else {
                 PrintFirstN("First 8 values", result, 8);
                 if (SaveResult("/tmp/cpp_image_text.bin", result)) {
-                    LOG_INFO("Saved to /tmp/cpp_image_text.bin");
+                    LOG_INFO("Saved to /tmp/cpp_image_text.bin (dim=%ld)", static_cast<long>(result.shape[0]));
                     tests_passed++;
                 }
             }

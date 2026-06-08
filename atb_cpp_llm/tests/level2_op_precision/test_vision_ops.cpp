@@ -297,12 +297,14 @@ TEST_CASE("MRoPE") {
     {
         atb_llm::components::VisionRotaryEmbedding vre(80);
         auto table = vre.ComputeFreqTable(48);
+        // ComputeFreqTable returns (max_hw, dim/2) columns (matches Python)
+        // dim=80 → half=40 columns per row, 48 rows → 48*40 elements
         CHECK(!table.empty());
-        CHECK(table.size() == static_cast<size_t>(48 * 80));
+        CHECK(table.size() == static_cast<size_t>(48 * 40));
 
-        // freq_table[0] should be all zeros (pos=0)
+        // freq_table[0] (pos=0): first dim/2=40 elements should be 0
         bool all_zero = true;
-        for (int d = 0; d < 80; d++) {
+        for (int d = 0; d < 40; d++) {
             if (table[d] != 0.0f) {
                 all_zero = false;
                 break;
@@ -316,7 +318,7 @@ TEST_CASE("MRoPE") {
         int64_t input_ids[] = {1, 2, 3, 4, 5};
         int64_t pos_ids[3 * 1 * 5];
         atb_llm::components::GetRopeIndex(
-            input_ids, 1, 5, nullptr, 0, 151655, 2, pos_ids);
+            input_ids, 1, 5, nullptr, 0, 151655, 151652, 2, pos_ids);
 
         // Text-only: all 3 dims should be sequential 0,1,2,3,4
         bool correct = true;
