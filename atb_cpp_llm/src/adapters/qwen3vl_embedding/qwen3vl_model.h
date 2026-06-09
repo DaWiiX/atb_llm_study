@@ -1,0 +1,120 @@
+#pragma once
+#include "atb_llm/model.h"
+#include "atb_llm/runtime.h"
+#include "families/base_model.h"
+#include "adapters/qwen3vl_embedding/qwen3vl_config.h"
+#include "adapters/qwen3vl_embedding/qwen3vl_weights.h"
+#include "core/raii.h"
+#include "core/npu_tensor.h"
+#include "components/common/mrope.h"
+#include "components/common/deepstack_fusion.h"
+#include "components/vision/pos_embed_interp.h"
+#include "components/vision/pos_embed_npu_graph.h"
+#include "components/vision/vis_rope_npu_graph.h"
+#include "runners/text_runner.h"
+#include "runners/vision_runner.h"
+#include <cstdint>
+#include <memory>
+#include <vector>
+
+namespace atb_llm {
+namespace adapters {
+
+/// Qwen3VL Embedding Model -- implements IModel interface.
+///
+/// Full inference pipeline:
+///   1. Text embedding (CPU lookup into fp16 table)
+///   2. Vision inference (if image provided): patch_embed -> pos_embed -> 24 blocks -> merger
+///   3. Vision token injection into embedding
+///   4. MRoPE position encoding (CPU)
+///   5. Text decoder 28-layer loop (NPU, split-graph)
+///   6. FinalNorm (NPU)
+///   7. Pooling (last non-padded token) + copy to host
+///
+/// Split-graph strategy (delegated to Runners):
+///   - Vision: VisionRunner owns FirstLayer + Block + Merger + Deepstack graphs
+///   - Text: TextRunner owns DecoderLayer + FinalNorm graphs
+///   - This adapter only orchestrates execution and cross-modal fusion
+class Qwen3VLModel : public families::BaseModel {
+public:
+    Qwen3VLModel();
+    ~Qwen3VLModel() override;
+
+    // IModel interface
+    Status Load(const std::string& model_dir, IRuntime* runtime) override;
+    Status Forward(const InferRequest& request, InferResult& result) override;
+    Status ForwardWithTiming(const InferRequest& request,
+                              InferResult& result,
+                              StageTimings& timings) override;
+    const char* GetName() const override {
+        return "qwen3vl_embedding";
+    }
+    bool HasVision() const override {
+        return true;
+    }
+
+private:
+    // ── Config & weights ──────────────────────────────────
+    Qwen3VLConfig config_;
+    Qwen3VLWeights weights_;
+
+    // ── Runners (own ATB graphs) ──────────────────────────
+    std::unique_ptr<runners::TextRunner> text_runner_;
+    std::unique_ptr<runners::VisionRunner> vision_runner_;
+
+    // ── Cross-modal fusion ────────────────────────────────
+    std::unique_ptr<components::DeepstackFusion> deepstack_fusion_;
+
+    // ── Position encoding helpers ─────────────────────────
+    std::unique_ptr<components::MRoPE> mrope_;
+    std::unique_ptr<components::VisionRotaryEmbedding> vis_rope_;
+
+    // ── Host-side pos_embed cache (for CPU interpolation) ──
+    std::vector<uint16_t> vis_pos_embed_host_;
+
+    // ── NPU-side pos_embed: weight table + interpolation graph ──
+    // The CPU bilinear interp + spatial merge + temporal repeat is
+    // refactored as `BuildPosEmbedIndicesAndWeights` (host, O(N))
+    // followed by a tiny ATB graph (4× Gather + 4× Mul + 3× Add).
+    atb::Tensor vis_pos_embed_npu_;          // (G*G, vis_hs) fp16
+    OperationHandle pos_embed_interp_graph_; // shape-agnostic graph
+
+    // ── NPU-side Vision RoPE: cos/sin generation as a graph ──
+    // Replaces ComputeVisionRotPosEmb CPU loop. Inputs are (freq_table,
+    // row_idx, col_idx), all built on host in O(N).
+    OperationHandle vis_rope_graph_;
+
+    // ── Text model input cache (P0: avoid regenerating mask/cos/sin
+    //     when seq_len hasn't changed across forward calls) ──
+    int32_t cached_text_seq_len_ = -1;
+    NpuTensor cached_mask_npu_;
+    NpuTensor cached_cos_npu_;
+    NpuTensor cached_sin_npu_;
+
+    // ── Vision pipeline ───────────────────────────────────
+    Status RunVision(const uint16_t* pixel_values, int64_t num_patches,
+                     const int64_t* grid_thw, int64_t num_images,
+                     uint16_t* vis_embeds_out, int64_t vis_embed_dim,
+                     std::vector<NpuTensor>& ds_features);
+
+    // Compute Vision PosEmbed on NPU.
+    //   - Builds (idx, wt) on host (cheap, O(N))
+    //   - Uploads + runs the 4-Gather/4-Mul/3-Add graph (NPU)
+    //   - Leaves the result in @p out_npu, shape (N, vis_hs) fp16
+    // Caller must have allocated @p out_npu with the right shape.
+    Status ComputePosEmbedNpu(const int64_t* grid_thw, int64_t num_images,
+                              int64_t expected_n,
+                              atb::Tensor& out_npu);
+
+    // Compute Vision RoPE cos/sin on NPU.
+    //   - Builds (row_idx, col_idx) on host (O(N))
+    //   - Builds freq_table on host (O(max_hw * half))
+    //   - Uploads + runs the 2-Gather/2-Concat/Cos/Sin graph (NPU)
+    //   - Leaves results in @p cos_npu / @p sin_npu, shape (N, vis_hd) fp16
+    // @return  total_tokens on success, -1 on error
+    int64_t ComputeVisionRopeNpu(const int64_t* grid_thw, int64_t num_images,
+                                  atb::Tensor& cos_npu, atb::Tensor& sin_npu);
+};
+
+}  // namespace adapters
+}  // namespace atb_llm

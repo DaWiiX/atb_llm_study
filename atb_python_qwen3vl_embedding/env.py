@@ -95,6 +95,7 @@ def get_env(name: str, default: Optional[str] = None,
 
 #: Local Qwen3-VL-Embedding-2B checkpoint directory.
 QWEN3VL_EMB_MODEL_DIR: str = get_env("QWEN3VL_EMB_MODEL_DIR", required=True)
+QWEN3VL_EMB_SRC: str = get_env("QWEN3VL_EMB_SRC", "/mnt/workspace/gitCode/Qwen3-VL-Embedding/src")
 
 # Example future entries (uncomment when needed):
 # ATB_CPP_BUILD_DIR: str = get_env("ATB_CPP_BUILD_DIR", default="build")

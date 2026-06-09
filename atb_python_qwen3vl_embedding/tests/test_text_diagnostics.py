@@ -280,6 +280,7 @@ def test_text_layer(proc, engine, model_dir):
     ref = load_tf_ref(model_dir)
 
     from atb_python_qwen3vl_embedding.text_model import run_text_layer_npu, make_causal_mask
+    from atb_python_qwen3vl_embedding.utils import make_seqlen_tensor
     from atb_python_qwen3vl_embedding.engine_utils import get_rope_index
 
     # Use simple text-only input to avoid deepstack complications
@@ -315,10 +316,11 @@ def test_text_layer(proc, engine, model_dir):
 
     # Run first text layer only — ATB
     hidden_atb = inputs_embeds.half().npu()
+    seqlen_t = make_seqlen_tensor(S)
     atb_out = run_text_layer_npu(
         engine.g_t_layer, hidden_atb,
         engine.t_layer_weights[0],
-        cos_npu, sin_npu, S,
+        cos_npu, sin_npu, seqlen_t,
         causal_mask=causal_mask).cpu().float()
 
     # Run first text layer only — TF (same inputs_embeds, same position_embeddings)

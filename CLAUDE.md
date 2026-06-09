@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Pure ATB graph implementations for Qwen3VL-Embedding-2B inference on Huawei Ascend NPU. The Python package (`atb_python_qwen3vl_embedding`) provides a **zero-dependency inference engine** — no transformers library in the hot path. It loads weights directly from safetensors and builds ATB computation graphs for every model component.
 
-The `atb_cpp_qwen3vl_embedding` directory contains a C++ multi-model LLM engine built on ATB, supporting Qwen3, Qwen3VL, DeepSeek-V2/V3, Mixtral and other architectures.
+The `atb_cpp_llm` directory contains a C++ multi-model LLM engine built on ATB, supporting Qwen3, Qwen3VL, DeepSeek-V2/V3, Mixtral and other architectures.
 
 ## Hardware requirements
 
@@ -41,6 +41,10 @@ python tests/benchmark.py  # --iter N --warmup M
 Tests require a model checkpoint at `/mnt/workspace/gitCode/models/Qwen3-VL-Embedding-2B/` (containing `config.json`, `preprocessor_config.json`, and `model.safetensors`).
 
 All unit tests validate ATB output against the transformers reference implementation using cosine similarity (threshold typically 0.99).
+
+## 测试精度原则
+
+**绝不通过降低验收标准来"通过"测试。** 如果 C++ 和 Python 在相同输入下余弦相似度低于 0.99，说明存在 bug，必须定位并修复根因，而不是放宽阈值。在有 Python 参考实现的情况下，C++ 应严格对齐 Python 的计算逻辑，逐阶段排查差异直到余弦相似度 ≥ 0.99。
 
 ## Architecture
 

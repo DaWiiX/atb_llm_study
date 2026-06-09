@@ -27,7 +27,7 @@ from atb_python_qwen3vl_embedding.env import QWEN3VL_EMB_MODEL_DIR
 from atb_python_qwen3vl_embedding.engine import Qwen3VLEngine
 from atb_python_qwen3vl_embedding.engine_utils import get_rope_index
 from atb_python_qwen3vl_embedding.text_model import run_text_layer_npu, run_text_norm_npu, make_causal_mask
-from atb_python_qwen3vl_embedding.utils import to_npu_half, to_cpu_float
+from atb_python_qwen3vl_embedding.utils import to_npu_half, to_cpu_float, make_seqlen_tensor
 
 
 def cosine(a, b):
@@ -174,10 +174,11 @@ def main():
 
     for li in range(engine.n_layer):
         # ATB layer
+        seqlen_t = make_seqlen_tensor(S)
         hidden_atb = run_text_layer_npu(
             engine.g_t_layer, hidden_atb,
             engine.t_layer_weights[li],
-            cos_npu, sin_npu, S,
+            cos_npu, sin_npu, seqlen_t,
             causal_mask=causal_mask)
 
         # TF layer

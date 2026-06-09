@@ -1,0 +1,57 @@
+#pragma once
+#include "atb_llm/types.h"
+#include "atb/atb_infer.h"
+#include <memory>
+#include <string>
+#include <utility>
+
+namespace atb_llm {
+
+class TensorAllocator;
+class WeightLoader;
+
+/// GraphOpBuilder RAII deleter
+struct GraphOpBuilderDeleter {
+    void operator()(atb::GraphOpBuilder* p) {
+        if (p) atb::DestroyGraphOpBuilder(p);
+    }
+};
+using GraphOpBuilderPtr = std::unique_ptr<atb::GraphOpBuilder, GraphOpBuilderDeleter>;
+
+/// 运行时服务 -- Engine 提供给 Model 的资源访问接口
+class IRuntime {
+public:
+    virtual ~IRuntime() = default;
+
+    // ── ATB 资源 ─────────────────────────────────────────
+    virtual atb::Context* GetContext() = 0;
+    virtual aclrtStream GetStream() = 0;
+    virtual Status Synchronize() = 0;
+
+    // ── 内存管理 ─────────────────────────────────────────
+    virtual TensorAllocator* GetAllocator() = 0;
+    virtual std::pair<uint8_t*, Status> GetWorkspace(uint64_t required_size) = 0;
+
+    /// 设置 ATB buffer 大小（用于图执行的工作空间）
+    /// 应在模型 Load() 之前调用
+    /// @param size_bytes  buffer 大小（字节），0 = 自动
+    virtual Status SetBufferSize(uint64_t size_bytes) = 0;
+
+    // ── 权重加载 ─────────────────────────────────────────
+    virtual WeightLoader* GetWeightLoader() = 0;
+
+    // ── KV Cache 管理（为生成式模型预留） ─────────────────
+    /// 分配 KV Cache 缓冲区，返回句柄；不支持时返回 nullptr。
+    virtual void* AllocKVCache(int64_t num_layers, int64_t num_heads,
+                               int64_t head_dim, int64_t max_seq_len) {
+        (void)num_layers; (void)num_heads; (void)head_dim; (void)max_seq_len;
+        return nullptr;  // 默认：不支持
+    }
+
+    /// 释放 KV Cache 缓冲区。
+    virtual void FreeKVCache(void* cache) {
+        (void)cache;  // 默认：无操作
+    }
+};
+
+} // namespace atb_llm
