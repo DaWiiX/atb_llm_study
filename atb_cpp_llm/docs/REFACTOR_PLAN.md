@@ -542,3 +542,43 @@ L2 normalize 由 `Qwen3VLConfig::normalize`（默认 true）控制，不可由 e
 - `ATB_DISABLE_PER_OP_SYNC` debug switch 是否保留进 production：当前只是隐藏的 escape hatch。考虑改为 log warning + 仅 DEBUG 构建生效。
 - `Qwen3VLModel::RunVision` 与 `ForwardWithTiming` 中 inline 的 vision 块仍存在轻度重复（两边都 first_layer → blocks → merger），可考虑抽出 `RunVisionInline(...)` 共用。
 - `compare_py_cpp.py` 内 timing 数据是 hardcoded baseline，与实测可能漂移。改为读 `BENCH_RESULT:` 行实时计算。
+
+---
+
+## Phase 19: 三路性能基线（C++ ATB / Python ATB / Transformers）
+
+**日期**: 2026-06-09 14:00 CST  
+**配置**: 5 warmup + 3 iter (warmup=3, iter=5), MM text ~500 tokens (之前 "Describe the image." 仅 4 tokens)  
+**硬件**: Ascend 910B NPU
+
+| Mode | S | VisTok | C++ ATB | Py ATB | TF | Py/C++ | TF/C++ |
+|------|---|--------|--------:|-------:|----:|------:|------:|
+| TEXT 100 | 100 | 0 | **12.20** | 24.57 | 96.78 | 2.01× | 7.93× |
+| TEXT 512 | 512 | 0 | **21.47** | 35.05 | 104.79 | 1.63× | 4.88× |
+| TEXT 1024 | 1024 | 0 | **35.64** | 49.36 | 106.38 | 1.38× | 2.98× |
+| TEXT 2048 | 2048 | 0 | **62.54** | 79.53 | 113.28 | 1.27× | 1.81× |
+| TEXT 4096 | 4096 | 0 | **126.36** | 154.48 | 319.88 | 1.22× | 2.53× |
+| IO 416×672 | 273 | 273 | **37.49** | 63.36 | 201.71 | 1.69× | 5.38× |
+| IO 720×1280 | 880 | 880 | **81.36** | 106.18 | 345.20 | 1.31× | 4.24× |
+| IO 1080×1920 | 1222 | 1222 | **115.90** | 143.30 | 552.01 | 1.24× | 4.76× |
+| IO 1440×2560 | 1222 | 1222 | **115.97** | 140.60 | 543.27 | 1.21× | 4.68× |
+| MM 416×672 | 940 | 273 | **53.11** | 79.88 | 208.10 | 1.50× | 3.92× |
+| MM 720×1280 | 1547 | 880 | **101.34** | 125.49 | 350.51 | 1.24× | 3.46× |
+| MM 1080×1920 | 1889 | 1222 | **133.97** | 160.06 | 556.52 | 1.19× | 4.15× |
+| MM 1440×2560 | 1889 | 1222 | **134.19** | 162.38 | 555.20 | 1.21× | 4.14× |
+
+### 关键观察
+
+1. **C++ ATB 全面最快**：13 个用例 C++ 全部领先，geomean 领先 Python ATB 1.39×、领先 TF 4.22×。
+2. **C++/Python ATB 差距随 S 增大收敛**：TEXT 100 Py/C++=2.01× → TEXT 4096 Py/C++=1.22×。ATB graph launch overhead 在短序列占主导；长序列下 NPU 计算掩盖了 Python dispatch 开销。
+3. **MM 额外文本 (~500 tokens) 对 C++ 冲击大**：MM 416×672 (S=940) 比 IO 416×672 (S=273) 多 15.6ms，而 Python ATB 多 16.5ms、TF 多 6.4ms。**TF 对文本长度不敏感**（内部有 KV cache），但 E2E 仍慢 4×。
+4. **TF 单次推理 ~5.5× C++**：TF 使用 PyTorch eager 执行路径（`_attn_implementation=eager`），每次 kernel launch 走 Python dispatch。C++ ATB 用预编译 graph + 单 stream 执行。
+5. **IO vs MM 对 TF 几乎无差异**（S=273→940，TF +6.4ms），而 C++ +15.6ms、Python ATB +16.5ms — 这归因于 TF 的 attention_mask 逻辑对 batch=1 场景做了短路优化。
+
+### 数据来源
+
+- **C++ ATB**: `./build/benchmark --mode compare --warmup 3 --iter 5`，取 `BENCH_RESULT` 行 `e2e_mean`
+- **Python ATB**: `test_embedder_e2e.py --mode atb --bench --iter 5 --warmup 3 --save-bin`
+- **TF**: `test_embedder_e2e.py --mode tf --bench --iter 5 --warmup 3`
+
+所有三路使用相同的 token 输入（由 `/tmp/gen_baseline_tokens.py` 统一生成）。

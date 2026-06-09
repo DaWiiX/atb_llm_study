@@ -66,7 +66,12 @@ BIN_DIR = "/tmp"
 
 RESOLUTIONS = [(416, 672), (720, 1280), (1080, 1920), (1440, 2560)]
 TEXT_SEQ_LENS = [100, 512, 1024, 2048, 4096]
-BASE_TEXT = "Describe the image."
+BASE_TEXT = (
+    "Please provide a comprehensive analysis of the image. "
+    "Identify all visible objects, people, animals, and their spatial relationships, "
+    "including foreground and background elements, lighting conditions, color palette, "
+    "mood, and any notable artistic style or composition techniques. "
+) * 14  # ~645 raw text tokens; ~506 with chat template wrapping
 
 # Known grid_thw for each resolution (from C++ SmartResize output)
 GRID_MAP = {
@@ -418,8 +423,10 @@ def run_quick_tf(model_dir: str, processor, cases,
 # Full benchmark runner (13-combination)
 # ═══════════════════════════════════════════════════════════════════
 
-def run_bench_atb(cases, n_warmup: int, n_iter: int) -> Dict[str, dict]:
-    """Run full 13-case ATB benchmark."""
+def run_bench_atb(cases, n_warmup: int, n_iter: int,
+                  save_bin: bool = False) -> Dict[str, dict]:
+    """Run full 13-case ATB benchmark.  When save_bin=True, also writes
+    /tmp/py_<label>.bin with the pooled fp32 output for C++ comparison."""
     atb = ATBRunner(QWEN3VL_EMB_MODEL_DIR)
     results = {}
     try:
@@ -430,17 +437,23 @@ def run_bench_atb(cases, n_warmup: int, n_iter: int) -> Dict[str, dict]:
             has_vis = pv is not None and gth is not None
 
             if has_vis:
-                def fn(ids=ids, pv=pv, gth=gth):
-                    return atb.encode_vision_bench(ids, pv, gth)
                 times, emb = atb.benchmark(
-                    lambda: atb.encode_vision(ids, pv, gth),
+                    lambda ids=ids, pv=pv, gth=gth: atb.encode_vision(ids, pv, gth),
                     n_warmup, n_iter)
             else:
                 times, emb = atb.benchmark(
-                    lambda: atb.encode_text(ids), n_warmup, n_iter)
+                    lambda ids=ids: atb.encode_text(ids), n_warmup, n_iter)
 
             results[label] = {"times": times, "emb": emb}
             print(f"[ATB] {label:<18} {times.mean():>8.2f} ± {times.std():.2f} ms")
+
+            if save_bin:
+                bin_name = label.lower().replace(" ", "_").replace("×", "x")
+                path = f"/tmp/py_{bin_name}.bin"
+                arr = emb.numpy().astype("float32")
+                with open(path, "wb") as f:
+                    f.write(struct.pack("<q", arr.size))
+                    f.write(arr.tobytes())
     finally:
         atb.close()
     return results
@@ -556,6 +569,8 @@ def parse_args(argv: Optional[list] = None):
                    help='Benchmark iterations (default: 5)')
     p.add_argument('--warmup', type=int, default=3,
                    help='Warmup iterations (default: 3)')
+    p.add_argument('--save-bin', action='store_true',
+                   help='Save ATB pooler outputs as /tmp/py_*.bin for C++ comparison')
     return p.parse_args(argv)
 
 
@@ -575,7 +590,8 @@ def main(argv: Optional[list] = None) -> int:
         tf_results = {}
 
         if run_atb:
-            atb_results = run_bench_atb(cases, args.warmup, args.iter)
+            atb_results = run_bench_atb(cases, args.warmup, args.iter,
+                                        save_bin=args.save_bin)
         if run_tf:
             tf_results = run_bench_tf(cases, args.warmup, args.iter)
 
