@@ -2,7 +2,7 @@
 
 > 长期追踪文档：让 Qwen3VL Embedding 推理管线尽可能保持「入口一次 H2D，出口一次 D2H，中间全 NPU 异步流水」。
 
-最后更新：2026-06-08（P0: Mask fp16 直出 + NPU 缓存，S=4096 3.13× 加速）
+最后更新：2026-06-09（P4: NPU sync 语义实验结论 + P8 提交 + 13/13 精度基线）
 
 ---
 
@@ -210,7 +210,7 @@
 - 新增 Text 子阶段计时：H2D prep / 28 layers / Norm+D2H
 
 #### P8 (P0): Causal Mask fp16 直出 + NPU 缓存复用
-- **Commit**:（待提交）
+- **Commit**: `9a73444`
 - **CPU 干预点**: `ForwardWithTiming` 中 mask/cos/sin 的 fp32→fp16 转换循环 + 每次推理重新生成
 - **方案**:
   - A: `MakeCausalMaskFp16` 直接输出 fp16 mask（跳过 float32 中间体 + 转换循环）
@@ -228,6 +228,22 @@
 - **测试**: `test_causal_mask_fp16` (24 assertions PASS — byte-exact vs fp32→fp16 转换)
 - **精度**: 零回归（mask 生成逻辑不变，只是跳过中间 float32 分配）
 
+#### ✅ P4: NPU Per-Op Sync 语义实验
+- **Commit**: Phase 17（P0-P3 连续提交链 `65d8acc`~`1e039df`）
+- **实验目标**: 验证每个 ATB ExecuteGraph 后强制 Synchronize 的开销，以及是否可以安全移除
+- **实验方法**:
+  - 在 `base_model.cpp` 中加 `ATB_DISABLE_PER_OP_SYNC` 环境变量控制 per-op sync
+  - 对比 sync=1 和 sync=0 两种模式的 benchmark（13/13 cosine + 性能）
+- **关键发现 — sync 不是"加了更安全"**:
+  1. **H2D/D2H 自带同步**: `aclrtMemcpy`（H2D/D2H）在 Ascend 上是同步的，额外 sync 引入 NPU stream 上隐式 barrier 打断 ATB graph 内部多 stream 调度
+  2. **额外 sync 会破坏精度**: 在 vision pixel `CopyToDevice` 和 FirstLayer `ExecuteGraph` 之间加 `runtime_->Synchronize()`，导致 block 1 之后所有输出 cosine 断崖式下降（block 23 cosine → 0.28）。多次确认该现象稳定复现
+  3. **NPU 上"多加 sync 提高安全性"是反模式**: 单 stream 上已排空时 sync 几乎免费（< 10μs），59 次 × 10μs ≈ 0.6ms 可忽略。但如果在多 stream 调度区域加 sync，会破坏 graph compiler 的异步流水线优化
+- **结论**: 
+  - deepstack_fusion.cpp 中的 per-op sync 必须保留（P5 性能收益依赖正确调度）
+  - 其他位置**不加**额外 sync，除非有明确的同步需求且经过 13/13 精度验证
+- **经验教训**: 见 [refactoring-plan.md §4.10](./refactoring-plan.md#410-npu-sync-语义不是加了更安全)
+- **相关测试**: ✅ G5 `test_sync_safety.{cpp,py}`（2026-06-09）— per-op sync 和 timing sync 均可安全移除（cosine=1.000 bit-exact），deepstack 和 D2H sync 必须保留
+
 ---
 
 ### ⏳ 候选未来项（按优先级排序）
@@ -237,15 +253,6 @@
 - **方案**: NPU graph 生成 mask（用 Arange + 比较 + Cast），完全消除 CPU 参与和 H2D
 - **剩余收益**: 首次生成本身 ~43ms（仅第一帧），后续缓存命中已 0ms
 - **优先级**: 🟢 低（P8-A/B 已解决最痛的点）
-
-#### 🟡 P4: ExecuteGraph 内部 Synchronize 开销
-- **位置**: `src/families/base_model.cpp:57` 每个 ATB op Execute 后都强制 Synchronize
-- **当前影响**: 每次推理 59 个 ExecuteGraph 调用 = 59 次 Synchronize（vision: 30 + text: 29）
-- **理论**: 单一 stream 上 sync 已排空 stream 时几乎免费（< 10μs），59 次 × 10μs ≈ 0.6ms 可忽略。但 P3 经验表明移除不必要的 sync 有意外收益（→ 7× text decoder 加速）
-- **方案**: 加 `ATB_FORCE_SYNC` 环境变量开关，benchmark 对比。如果有显著收益 → 改默认行为
-- **算子需求**: 无
-- **预期收益**: 未知（需实测），可能是 5-20ms
-- **优先级**: 🟡 中（P8 mask 优化后再评估）
 
 #### 🟡 P6: Vision Merger → image token 注入端到端 NPU 化
 - **位置**: `qwen3vl_model.cpp:453-469` (ForwardWithTiming) 和 `qwen3vl_model.cpp:641-647` (PrepareInputs)
@@ -268,10 +275,10 @@
 
 #### P9: Text Embedding H2D 异步化
 - **位置**: `qwen3vl_model.cpp:517-518` inputs_embeds CopyToDevice
-- **当前耗时**: S=4096 下 16.8MB H2D 约 5ms（包含在 H2D prep 中）
-- **方案**: 当前 CopyToDevice 在 ExecuteGraph 的 sync 前被强制等待。如果移除 per-op sync（P4），H2D 可以与 compute 重叠
-- **预期收益**: ~5ms（取决于 P4）
-- **优先级**: 低（依赖 P4）
+- **当前耗时**: S=4096 下 16.8MB H2D 约 5ms（P8 后已缓存，仅首次发生）
+- **方案**: H2D 操作已在 Ascend 上自带同步（P4 实验确认）。当前 CopyToDevice 已异步于后续 NPU 计算
+- **预期收益**: 极小（< 1ms，P8 缓存已解决重度问题）
+- **优先级**: 极低
 
 #### Positions 复用
 - **位置**: `deepstack_fusion.cpp:InjectFeatures` 每次都把 positions 上传一次（28 decoder 层 × 3 deepstack = 84 次小拷贝，每次 ~kb）
@@ -307,11 +314,35 @@
 
 最终加速（vs baseline）: 896×896 约 **7.7×**，S=4096 text 约 **3.1×**
 
+**生产性能**（2026-06-09，chat-templated inputs，C++ ATB vs Python ATB）:
+- C++ ATB geomean 领先 Python ATB **1.39×**、领先 Transformers **4.22×**
+- 详见 [refactoring-plan.md §3 当前性能基线](./refactoring-plan.md#3-当前性能基线phase-192026-06-09)
+
 ---
 
 ## 精度回归基线
 
-`tests/test_accuracy.py` 三模式 cosine（vs Python ATB 参考）:
+### 最新 13/13 全矩阵（2026-06-09，C++ ATB vs Python ATB，chat-templated inputs）
+
+| Mode | S | VisTok | Cosine | Status |
+|------|---|--------|-------:|--------|
+| TEXT 100 | 100 | 0 | 0.999946 | PASS |
+| TEXT 512 | 512 | 0 | 0.999946 | PASS |
+| TEXT 1024 | 1024 | 0 | 0.999980 | PASS |
+| TEXT 2048 | 2048 | 0 | 0.999894 | PASS |
+| TEXT 4096 | 4096 | 0 | 0.999985 | PASS |
+| IO 416×672 | 273 | 273 | 0.999832 | PASS |
+| IO 720×1280 | 880 | 880 | 0.999962 | PASS |
+| IO 1080×1920 | 1222 | 1222 | 0.999770 | PASS |
+| IO 1440×2560 | 1222 | 1222 | 0.999916 | PASS |
+| MM 416×672 | 940 | 273 | 0.999962 | PASS |
+| MM 720×1280 | 1547 | 880 | 0.999943 | PASS |
+| MM 1080×1920 | 1889 | 1222 | 0.999969 | PASS |
+| MM 1440×2560 | 1889 | 1222 | 0.999958 | PASS |
+
+最低 cosine: IO 1080×1920 = 0.999770，远高于 0.99 阈值。**可用于生产环境。**
+
+### 历史三模式 reference 对比（Phase 16-17 期间）
 
 | Mode | Baseline | P1 | P2 | P3 | P5 | 阈值 |
 |------|---------:|---:|---:|---:|---:|-----:|

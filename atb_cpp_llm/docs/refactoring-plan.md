@@ -230,13 +230,13 @@ Phase 16-19 期间遇到的 10 个关键问题，按发现顺序排列。
 | B5 | GetRopeIndex 缺 vision_start_token_id | 天级 | **L1: MRoPE chat 模板输入** — 含 vision_start 标记的多模态 token → 比较 C++ vs Python 位置编码 | ✅ test_mrope_cpu T7-9 | — |
 | B6 | 跨框架 token 输入不同（裸 token vs chat template） | 天级 | **L4: 输入身份校验** — benchmark 前比较 C++/Python 加载的 token hash | ⚠️ 半缓解（gen_baseline_tokens.py 统一入口，但缺 hash 校验） | 🟡 P1 |
 | B7 | .bin 文件命名静默错配 | 天级 | 同 B6 — 输入身份校验 | ⚠️ 半缓解 | 🟡 P1 |
-| B8 | 额外 sync 破坏精度 | 小时级 | **L4: Sync 安全性** — ATB_DISABLE_PER_OP_SYNC=0 vs =1，cosine ≥ 0.99 | ❌ | 🟡 P1 |
-| B9 | 权重加载双截断 (f32→bf16→fp16) | 小时级 | **L0: 权重精度** — C++ vs Python 加载的 fp16 权重逐元素对比 | ❌ | 🟡 P1 |
+| B8 | 额外 sync 破坏精度 | 小时级 | **L4: Sync 安全性** — ATB_DISABLE_PER_OP_SYNC=0 vs =1，cosine ≥ 0.99 | ✅ test_sync_safety | — |
+| B9 | 权重加载双截断 (f32→bf16→fp16) | 小时级 | **L0: 权重精度** — C++ vs Python 加载的 fp16 权重逐元素对比 | ✅ test_weight_precision | — |
 | B10 | SmartResize 银行家舍入 | 小时级 | **L1: SmartResize 舍入** — 边界值 (x.5) 对比 C++ vs Python | ✅ test_preprocess_cpu | — |
 | B11 | Bf16ToFp16 截断偏差 | 小时级 | **L1: 浮点转换精度** — 所有极端值 C++ vs CANN API | ✅ test_float_utils | — |
 | B12 | debug dump 混入 production | — | 代码质量问题，非测试缺口 | ✅ debug_dump 已抽出 | — |
 
-> **统计**（更新于 2026-06-09）: 12 个 bug，其中 **7 个已有测试覆盖**（B1/B2/B3/B4/B5/B10/B11），**3 个半缓解**（B6/B7/B12），**2 个仍无测试**（B8/B9）。
+> **统计**（更新于 2026-06-09）: 12 个 bug，其中 **9 个已有测试覆盖**（B1/B2/B3/B4/B5/B8/B9/B10/B11），**3 个半缓解**（B6/B7/B12），**0 个仍无测试**。
 
 ### 5.2 🔴 高优先级缺口
 
@@ -248,20 +248,19 @@ Phase 16-19 期间遇到的 10 个关键问题，按发现顺序排列。
 
 `tests/level0_framework/test_config_wiring.{cpp,py}` — C++ 加载 Qwen3VLConfig 并 dump 29 字段到 JSON → Python diff。**关键反回归**：`vis_epsilon < 1e-4`（如果读错成 `initializer_range` 会是 0.02）。
 
-#### 🔲 G3: 预变更回归脚本（对应 B8, B3）
+#### ✅ G3: 预变更回归脚本（对应 B8, B3）
 
-```
-脚本内容（benchmark 运行前自动执行）:
-  1. 保存当前 commit hash
-  2. 如果工作区有未提交修改 → git stash
-  3. 跑 benchmark --mode compare 全量 13/13
-  4. 验证 cosine ≥ 0.99
-  5. git stash pop（如果有 stash）
-  6. 只在基线通过后才允许跑新代码的 benchmark
+`scripts/verify_baseline.sh`（601 行，自包含 bash + 嵌入式 Python）:
+1. 保存当前 commit hash
+2. 检测脏工作区 → `git stash`（支持 `--no-stash` 跳过）
+3. 编译 benchmark 目标
+4. `gen_baseline_tokens.py` 生成统一 token 文件
+5. `./benchmark --mode compare` 运行 13 模式 C++ 推理
+6. **嵌入式 Python** 加载 `Qwen3VLEngine`，用完全相同输入跑 13 个 case，逐对计算 cosine
+7. 输出格式化 PASS/FAIL 表格（最低 cosine、首个失败 case）
+8. EXIT trap 自动 `git stash pop` 恢复
 
-新增文件: scripts/verify_baseline.sh
-```
-
+**CI 友好**: 无模型/无 Python3 时优雅跳过。退出码：0=基线通过, 1=基线损坏, 2=脚本错误。
 **能预防的 bug**: B8（sync 破坏精度）、B3（双路径分叉）
 
 ### 5.3 🟡 中优先级缺口
@@ -277,29 +276,29 @@ Python 参考数据生成器新增 `mrope_pid_multi_img` / `mrope_pid_chat_templ
 
 **解决了 H29**（test_mrope_cpu: 缺 multi-batch + multi-image 覆盖）。
 
-#### 🔲 G5: Sync 安全性测试（对应 B8）
+#### ✅ G5: Sync 安全性测试（对应 B8）
 
-```
-测试内容:
-  1. 同一输入，分别以 ATB_DISABLE_PER_OP_SYNC=0 和 =1 运行
-  2. 验证 13/13 cosine ≥ 0.999
-  3. 验证无全零输出 token
+`tests/level4_e2e/test_sync_safety.{cpp,py}` + `src/adapters/qwen3vl_embedding/qwen3vl_model.cpp`（env var 控制）:
 
-新增文件: tests/level4_e2e/test_sync_safety.cpp
-          依赖: 需要环境变量控制 per-op sync
-```
+**C++ 测试**（4 TEST_CASES，16 assertions）:
+- Test 1: Per-op sync on vs off → cosine = 1.000（bit-exact）
+- Test 2: Timing syncs on vs off → cosine = 1.000
+- Test 3: Minimal sync (both off) vs full sync → cosine = 1.000
+- Test 4: ASCEND_LAUNCH_BLOCKING=1 + minimal sync → valid output, no NaN
 
-#### 🔲 G6: 权重加载精度测试（对应 B9）
+**Python 编排器**（5 configs × N trials × 13-mode compare matrix）:
+- Config A: full sync (baseline)、B: no per-op sync、C: no timing syncs、D: minimal sync、E: CANN launch blocking
+- 每个 config 跑 N=5 轮，自动 cosine 验证 + 稳定性追踪
 
-```
-测试内容:
-  1. C++ 加载 Safetensors → dump 每层首个权重的前 100 个 fp16 值
-  2. Python 加载相同 Safetensors → dump 同样位置
-  3. 逐元素对比，允许 ±1 ULP 差异
+**结论**: per-op sync 和 timing sync 是**可移除的**（bit-exact，cosine = 1.000）。deepstack InjectFeatures sync 和 D2H-before-CopyToHost sync **必须保留**（P4 已确认）
 
-新增文件: tests/level0_framework/test_weight_precision.cpp
-          tests/level0_framework/test_weight_precision.py
-```
+#### ✅ G6: 权重加载精度测试（对应 B9）
+
+`tests/level0_framework/test_weight_precision.{cpp,py}`（221+343 行）:
+- C++ 用与 `CopyWeightToFp16Host()` 完全相同的逻辑（Bf16ToFp16Buffer / Fp32ToFp16 / memcpy）将 10 个代表性权重键的前 100 个元素转为 fp16 hex，dump 到 `/tmp/cpp_weight_dump.txt`
+- Python 直接解析 safetensors header + 原始字节，用等价路径转换后逐元素对比
+- **0 ULP 容忍度**（fp16→fp16 路径），**±1 ULP 容忍度**（bf16/fp32→fp16 路径）
+- 实测：10/10 键 bit-exact 通过，1000/1000 元素匹配
 
 ### 5.4 缺口与现有 P2 待办项关联
 
@@ -317,10 +316,10 @@ Python 参考数据生成器新增 `mrope_pid_multi_img` / `mrope_pid_chat_templ
 |--------|------|----------|------|
 | 🔴 P0 | G1: .bin round-trip 测试 | 2h | ✅ `5cd8d4b` |
 | 🔴 P0 | G2: Config 布线测试 | 2h | ✅ `5cd8d4b` |
-| 🔴 P0 | G3: 预变更回归脚本 | 1h | 🔲 待实现 |
+| 🔴 P0 | G3: 预变更回归脚本 | 1h | ✅ `scripts/verify_baseline.sh` |
 | 🟡 P1 | G4: MRoPE chat 模板多图像测试（解决 H29） | 2h | ✅ `b9b60ed` |
-| 🟡 P1 | G6: 权重加载精度测试 | 1h | 🔲 待实现 |
-| 🟡 P1 | G5: Sync 安全性测试 | 2h (需 NPU) | 🔲 待实现 |
+| 🟡 P1 | G6: 权重加载精度测试 | 1h | ✅ `test_weight_precision.{cpp,py}` |
+| 🟡 P1 | G5: Sync 安全性测试 | 2h (需 NPU) | ✅ `test_sync_safety.{cpp,py}` |
 
 ---
 
@@ -352,7 +351,7 @@ export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:~/Ascend/nnal/atb/9.0.0/atb/cxx_abi_1/li
 ### 7.2 验证流程
 
 1. **C++ 编译**: `cmake --build build` — 0 error
-2. **C++ 单元测试**: `cd build && ctest` — 35/35 全部 SUCCESS（含新增 test_bin_format, test_config_wiring）
+2. **C++ 单元测试**: `cd build && ctest` — 37/37 全部 SUCCESS（含新增 test_bin_format, test_config_wiring, test_weight_precision, test_sync_safety）
 3. **C++ vs Python 精度**: `./test_consistency` + `python tests/test_consistency.py` — cosine > 0.99
 4. **C++ vs Python 多模式**: `./test_accuracy` + `python tests/test_accuracy.py`
 5. **全量基准**: `./benchmark --mode compare` + `python tests/test_embedder_e2e.py --mode both --bench`
@@ -361,13 +360,13 @@ export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:~/Ascend/nnal/atb/9.0.0/atb/cxx_abi_1/li
 
 | Level | 测试数 | 覆盖范围 |
 |-------|--------|---------|
-| L0 基础框架 | 3 | test_core, test_io_adapters, test_config_wiring |
+| L0 基础框架 | 4 | test_core, test_io_adapters, test_config_wiring, test_weight_precision |
 | L1 CPU 纯函数 | 10 | test_mrope_cpu (9 cases), test_vision_rope_cpu, test_preprocess_cpu, test_pos_embed_cpu, test_float_utils, test_base_model_utils, test_causal_mask_fp16, test_embedder_utils, test_embedder_invariants, test_bin_format |
 | L2 算子精度 | 20 | 覆盖 RMSNorm/LayerNorm/Linear/Activation/Elewise/SplitConcat/Softmax/GatherReduce/TransposeSetValue/RoPE/SelfAttention/SwiGLU/TextDecoder/VisionAttention/VisionMLP/VisionBlock/PatchEmbed/VisionMerger + text_ops + vision_ops |
 | L3 集成 | 6 | test_text_model, test_deepstack, test_deepstack_npu_tensor, test_vision_runner_full, test_text_runner_full, test_vision_stages |
-| L4 E2E | 5 | test_e2e, test_consistency, test_accuracy, test_stage_precision, test_forward_error_paths |
+| L4 E2E | 6 | test_e2e, test_consistency, test_accuracy, test_stage_precision, test_forward_error_paths, test_sync_safety |
 | Benchmark | 1 | benchmark |
-| **总计** | **45** | 含新增 test_bin_format, test_config_wiring |
+| **总计** | **47** | 含新增 test_bin_format, test_config_wiring, test_weight_precision, test_sync_safety |
 
 ### 7.4 当前目录结构
 
