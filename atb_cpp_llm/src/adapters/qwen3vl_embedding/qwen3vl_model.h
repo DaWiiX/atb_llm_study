@@ -114,24 +114,6 @@ private:
     // @return  total_tokens on success, -1 on error
     int64_t ComputeVisionRopeNpu(const int64_t* grid_thw, int64_t num_images,
                                   atb::Tensor& cos_npu, atb::Tensor& sin_npu);
-
-    // ── Input preparation ────────────────────────────────
-    Status PrepareInputs(const InferRequest& request,
-                         std::vector<uint16_t>& inputs_embeds,
-                         int64_t& seq_len, int64_t& hidden_size,
-                         int32_t& hd, int64_t& vis_embed_dim,
-                         std::vector<float>& cos_f32,
-                         std::vector<float>& sin_f32,
-                         std::vector<float>& mask,
-                         std::vector<NpuTensor>& ds_features,
-                         std::vector<int64_t>& image_token_positions);
-
-    // ── Text pipeline ─────────────────────────────────────
-    Status RunTextDecoder(uint16_t* hidden_states, int32_t seq_len,
-                          const float* cos, const float* sin,
-                          const float* mask,
-                          const std::vector<NpuTensor>& ds_features,
-                          const std::vector<int64_t>& image_token_positions);
 };
 
 }  // namespace adapters

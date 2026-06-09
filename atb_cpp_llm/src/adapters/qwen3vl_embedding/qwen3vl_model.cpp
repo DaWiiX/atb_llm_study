@@ -168,41 +168,16 @@ Status Qwen3VLModel::Load(const std::string& model_dir, IRuntime* runtime) {
 }
 
 // ═════════════════════════════════════════════════════════════════════
-// Forward (orchestrator)
+// Forward — thin wrapper over ForwardWithTiming.
+//
+// Phase17 P1: the legacy fp32-cos/sin/mask path is removed.  All
+// inference flows through the single timing-aware implementation,
+// which uses direct fp16 generation + NPU cache for mask/cos/sin.
 // ═════════════════════════════════════════════════════════════════════
 
 Status Qwen3VLModel::Forward(const InferRequest& request, InferResult& result) {
-    std::vector<uint16_t> inputs_embeds;
-    int64_t seq_len, hidden_size;
-    int32_t hd;
-    int64_t vis_embed_dim;
-    std::vector<float> cos_f32, sin_f32, mask;
-    std::vector<NpuTensor> ds_features;
-    std::vector<int64_t> image_token_positions;
-
-    Status s = PrepareInputs(request, inputs_embeds, seq_len, hidden_size,
-                             hd, vis_embed_dim, cos_f32, sin_f32, mask,
-                             ds_features, image_token_positions);
-    if (s != STATUS_OK) return s;
-
-    s = RunTextDecoder(inputs_embeds.data(), static_cast<int32_t>(seq_len),
-                       cos_f32.data(), sin_f32.data(), mask.data(),
-                       ds_features, image_token_positions);
-    if (s != STATUS_OK) return s;
-
-    s = BaseModel::RunPooling(inputs_embeds.data(), seq_len, hidden_size,
-                              config_.normalize,
-                              request.text.attention_mask
-                                ? families::BaseModel::PoolingStrategy::LAST_TOKEN_BY_MASK
-                                : families::BaseModel::PoolingStrategy::LAST_TOKEN,
-                              result,
-                              request.text.attention_mask);
-    if (s != STATUS_OK) return s;
-
-    runtime_->Synchronize();
-    LOG_INFO("Forward completed: seq_len=%ld, output shape=(%ld)",
-             static_cast<long>(seq_len), static_cast<long>(hidden_size));
-    return STATUS_OK;
+    StageTimings ignored;
+    return ForwardWithTiming(request, result, ignored);
 }
 
 // ═════════════════════════════════════════════════════════════════════
@@ -626,173 +601,6 @@ Status Qwen3VLModel::ForwardWithTiming(const InferRequest& request,
     return STATUS_OK;
 }
 
-// ═════════════════════════════════════════════════════════════════════
-// PrepareInputs
-// ═════════════════════════════════════════════════════════════════════
-
-Status Qwen3VLModel::PrepareInputs(const InferRequest& request,
-                                   std::vector<uint16_t>& inputs_embeds,
-                                   int64_t& seq_len, int64_t& hidden_size, int32_t& hd,
-                                   int64_t& vis_embed_dim,
-                                   std::vector<float>& cos_f32, std::vector<float>& sin_f32,
-                                   std::vector<float>& mask,
-                                   std::vector<NpuTensor>& ds_features,
-                                   std::vector<int64_t>& image_token_positions) {
-    const int64_t* input_ids = request.text.input_ids;
-    seq_len = request.text.seq_length;
-    if (!input_ids || request.text.batch_size != 1) {
-        LOG_ERROR("Only batch_size=1 is supported, got %ld",
-                  static_cast<long>(request.text.batch_size));
-        return ERROR_INVALID_PARAM;
-    }
-    if (seq_len <= 0) {
-        LOG_ERROR("seq_length must be > 0, got %ld", static_cast<long>(seq_len));
-        return ERROR_INVALID_PARAM;
-    }
-    hidden_size = config_.text_hidden_size;
-    hd = config_.text_head_dim;
-    vis_embed_dim = config_.vis_out_hidden_size;
-
-    // Text embedding lookup (CPU, fp16)
-    inputs_embeds.resize(seq_len * hidden_size);
-    BaseModel::EmbeddingLookup(input_ids, seq_len,
-                               weights_.embed_weight_host.data(),
-                               config_.text_hidden_size, config_.text_vocab_size,
-                               inputs_embeds.data());
-
-    // Vision inference (if image provided)
-    std::vector<uint16_t> vis_embeds_host;
-    std::vector<int64_t> grid_thw_host;
-    int64_t num_images = 0;
-    bool has_image = (request.mode == InputMode::IMAGE_AND_TEXT ||
-                      request.mode == InputMode::PREPROCESSED) &&
-                     request.preprocessed.pixel_values != nullptr;
-    if (has_image) {
-        const uint16_t* pv = static_cast<const uint16_t*>(
-            request.preprocessed.pixel_values);
-        int64_t np = request.preprocessed.num_patches;
-        const int64_t* gthw = request.preprocessed.grid_thw;
-        if (!gthw && request.preprocessed.metadata) {
-            gthw = static_cast<const int64_t*>(request.preprocessed.metadata);
-        }
-        grid_thw_host.assign(gthw, gthw + 3);
-        num_images = 1;
-        vis_embeds_host.resize(np * vis_embed_dim);
-        ds_features.resize(config_.vis_deepstack_visual_indexes.size());
-        Status s = RunVision(pv, np, gthw, num_images,
-                             vis_embeds_host.data(), vis_embed_dim, ds_features);
-        if (s != STATUS_OK) return s;
-        image_token_positions = BaseModel::FindImageTokenPositions(input_ids, seq_len, config_.image_token_id);
-        int64_t merged_vis = np / (config_.vis_spatial_merge_size * config_.vis_spatial_merge_size);
-        if (image_token_positions.size() != static_cast<size_t>(merged_vis)) {
-            LOG_ERROR("Image token count mismatch: pos=%zu, merged_vis=%ld (patches=%ld)",
-                      image_token_positions.size(), static_cast<long>(merged_vis),
-                      static_cast<long>(np));
-            return ERROR_INVALID_PARAM;
-        }
-        for (size_t i = 0; i < image_token_positions.size(); i++) {
-            int64_t pos = image_token_positions[i];
-            std::memcpy(inputs_embeds.data() + pos * hidden_size,
-                        vis_embeds_host.data() + i * vis_embed_dim,
-                        vis_embed_dim * sizeof(uint16_t));
-        }
-    }
-
-    // Position encoding (CPU)
-    std::vector<int64_t> position_ids(3 * seq_len);
-    components::GetRopeIndex(input_ids, 1, seq_len,
-                             grid_thw_host.empty() ? nullptr : grid_thw_host.data(),
-                             num_images, config_.image_token_id,
-                             config_.vision_start_token_id,
-                             config_.vis_spatial_merge_size, position_ids.data());
-    cos_f32.resize(seq_len * hd);
-    sin_f32.resize(seq_len * hd);
-    mrope_->Compute(position_ids.data(), 1, seq_len,
-                    cos_f32.data(), sin_f32.data());
-
-    // Causal mask
-    mask.resize(seq_len * seq_len);
-    runners::MakeCausalMask(seq_len, mask.data());
-    return STATUS_OK;
-}
-
-// ═════════════════════════════════════════════════════════════════════
-// RunTextDecoder
-// ═════════════════════════════════════════════════════════════════════
-
-Status Qwen3VLModel::RunTextDecoder(uint16_t* hidden_states, int32_t seq_len,
-                                    const float* cos, const float* sin, const float* mask,
-                                    const std::vector<NpuTensor>& ds_features,
-                                    const std::vector<int64_t>& image_token_positions) {
-    auto* alloc = runtime_->GetAllocator();
-    int64_t hs = config_.text_hidden_size;
-    int32_t hd = config_.text_head_dim;
-    int64_t ved = config_.vis_out_hidden_size;
-    int64_t n = seq_len;
-    NpuTensor h_npu = AllocNpuFloat16({n, hs});
-    alloc->CopyToDevice(*h_npu.Get(), hidden_states,
-                        static_cast<size_t>(n) * hs * sizeof(uint16_t));
-    int64_t rope_n = n * hd;
-    std::vector<uint16_t> cos16(rope_n), sin16(rope_n), m16(n * n);
-    for (int64_t i = 0; i < rope_n; i++) {
-        cos16[i] = atb_llm::Fp32ToFp16(cos[i]);
-        sin16[i] = atb_llm::Fp32ToFp16(sin[i]);
-    }
-    for (int64_t i = 0; i < n * n; i++)
-        m16[i] = atb_llm::Fp32ToFp16(mask[i]);
-    NpuTensor cos_npu = AllocNpuFloat16({n, hd});
-    alloc->CopyToDevice(*cos_npu.Get(), cos16.data(), rope_n * sizeof(uint16_t));
-    NpuTensor sin_npu = AllocNpuFloat16({n, hd});
-    alloc->CopyToDevice(*sin_npu.Get(), sin16.data(), rope_n * sizeof(uint16_t));
-    NpuTensor mask_npu = AllocNpuFloat16({n, n});
-    alloc->CopyToDevice(*mask_npu.Get(), m16.data(), n * n * sizeof(uint16_t));
-    atb::Tensor seqlen;
-    int32_t sl = seq_len;
-    seqlen.desc.dtype = ACL_INT32;
-    seqlen.desc.format = ACL_FORMAT_ND;
-    seqlen.desc.shape.dimNum = 1;
-    seqlen.desc.shape.dims[0] = 1;
-    seqlen.dataSize = sizeof(int32_t);
-    seqlen.hostData = &sl;
-    Status s = text_runner_->EnsureBuilt(seq_len);
-    if (s != STATUS_OK) return s;
-    for (int32_t li = 0; li < config_.text_num_layers; li++) {
-        const auto& lw = weights_.text_layers[li];
-        NpuTensor h_out = AllocNpuFloat16({n, hs});
-        atb::VariantPack vp;
-        vp.inTensors = {*h_npu.Get(),
-                        lw.q_weight, lw.k_weight, lw.v_weight, lw.o_weight,
-                        lw.q_norm_weight, lw.k_norm_weight,
-                        lw.gate_weight, lw.up_weight, lw.down_weight,
-                        lw.input_ln_weight, lw.post_ln_weight,
-                        *cos_npu.Get(), *sin_npu.Get(), *mask_npu.Get(), seqlen};
-        vp.outTensors = {*h_out.Get()};
-        s = ExecuteGraph(text_runner_->GetLayerGraph(), vp);
-        if (s != STATUS_OK) {
-            LOG_ERROR("TextDecoderLayer %d failed", li);
-            return s;
-        }
-        h_npu = std::move(h_out);
-        if (li < static_cast<int32_t>(ds_features.size()) &&
-            ds_features[li] && !image_token_positions.empty()) {
-            deepstack_fusion_->InjectFeatures(h_npu, ds_features[li], image_token_positions, n, hs, ved, runtime_);
-        }
-    }
-    NpuTensor norm_out = AllocNpuFloat16({n, hs});
-    atb::VariantPack nvp;
-    nvp.inTensors = {*h_npu.Get(), weights_.text_norm_weight};
-    nvp.outTensors = {*norm_out.Get()};
-    s = ExecuteGraph(text_runner_->GetNormGraph(), nvp);
-    if (s != STATUS_OK) {
-        LOG_ERROR("TextFinalNorm failed");
-        return s;
-    }
-    s = runtime_->Synchronize();
-    if (s != STATUS_OK) return s;
-    alloc->CopyToHost(hidden_states, *norm_out.Get(),
-                      static_cast<size_t>(n) * hs * sizeof(uint16_t));
-    return STATUS_OK;
-}
 
 // ═════════════════════════════════════════════════════════════════════
 // Vision pipeline
