@@ -582,3 +582,28 @@ L2 normalize 由 `Qwen3VLConfig::normalize`（默认 true）控制，不可由 e
 - **TF**: `test_embedder_e2e.py --mode tf --bench --iter 5 --warmup 3`
 
 所有三路使用相同的 token 输入（由 `/tmp/gen_baseline_tokens.py` 统一生成）。
+
+### 精度验证（C++ ATB vs Python ATB，Cosine ≥ 0.99）
+
+修复 `load_pixel_values` 的 uint16→float16 比特重解释 bug 后（commit `83dd89a`），
+13/13 全部通过：
+
+| Mode | Cosine | |
+|------|-------:|----|
+| TEXT 100 | 0.999946 | PASS |
+| TEXT 512 | 0.999946 | PASS |
+| TEXT 1024 | 0.999980 | PASS |
+| TEXT 2048 | 0.999894 | PASS |
+| TEXT 4096 | 0.999985 | PASS |
+| IO 416×672 | 0.999832 | PASS |
+| IO 720×1280 | 0.999962 | PASS |
+| IO 1080×1920 | 0.999770 | PASS |
+| IO 1440×2560 | 0.999916 | PASS |
+| MM 416×672 | 0.999962 | PASS |
+| MM 720×1280 | 0.999943 | PASS |
+| MM 1080×1920 | 0.999969 | PASS |
+| MM 1440×2560 | 0.999958 | PASS |
+
+最低 cosine 为 IO 1080×1920 (0.999770)，仍远高于 0.99 阈值。
+C++ 与 Python ATB 在完全相同的输入下产生近乎一致的结果，
+精度验证通过，可用于生产环境。
