@@ -164,6 +164,7 @@ endfunction()
 enable_testing()
 
 add_atb_test(test_core                  tests/level0_framework/test_core.cpp)
+add_atb_test(test_config_wiring        tests/level0_framework/test_config_wiring.cpp)
 add_atb_test(test_text_ops             tests/level2_op_precision/test_text_ops.cpp)
 add_atb_test(test_vision_ops           tests/level2_op_precision/test_vision_ops.cpp)
 add_atb_test(test_text_model           tests/level3_integration/test_text_model.cpp)
@@ -188,6 +189,7 @@ add_atb_test(test_base_model_utils  tests/level1_cpu_pure/test_base_model_utils.
 add_atb_test(test_causal_mask_fp16  tests/level1_cpu_pure/test_causal_mask_fp16.cpp)
 add_atb_test(test_embedder_utils    tests/level1_cpu_pure/test_embedder_utils.cpp)
 add_atb_test(test_embedder_invariants tests/level1_cpu_pure/test_embedder_invariants.cpp)
+add_atb_test(test_bin_format       tests/level1_cpu_pure/test_bin_format.cpp)
 
 # Level 2 per-op precision tests (Wave 2)
 add_atb_test(test_rms_norm_precision            tests/level2_op_precision/test_rms_norm_precision.cpp)
