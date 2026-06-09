@@ -607,3 +607,159 @@ L2 normalize 由 `Qwen3VLConfig::normalize`（默认 true）控制，不可由 e
 最低 cosine 为 IO 1080×1920 (0.999770)，仍远高于 0.99 阈值。
 C++ 与 Python ATB 在完全相同的输入下产生近乎一致的结果，
 精度验证通过，可用于生产环境。
+
+---
+
+## 踩坑经验集（Lessons Learned）
+
+记录 Phase 16-19 期间遇到的关键问题、根因和防范措施。
+
+### 1. fp16 二进制的"比特重解释" vs "数值 cast"
+
+**症状**: IO/MM 模式下 Python ATB 输出全为 NaN（norm=nan），cosine 校验失败。
+
+**根因**: C++ 将 fp16 值以 uint16 二进制写入 `.bin`，Python `load_pixel_values` 用
+`np.array(struct.unpack(...), dtype=np.uint16)` 加载后保持 uint16。
+`to_npu_half()` 调用 `.half()` 时做了 **整数值→float16 的数值 cast**
+（如 uint16 值 15360 → float16 15360.0），而非**比特重解释**
+（将 16 个比特当作 IEEE float16 解释）。
+
+正确的做法是 `np.array(..., dtype=np.uint16).view(np.float16)` ——
+numpy `.view()` 重解释比特位而不改变内存内容。
+
+> **教训**: 跨越 C++/Python 边界的二进制 fp16 数据，必须确认两边使用相同的位解释。
+> `np.frombuffer(raw, dtype=np.float16)` 也正确（直接从字节流读取），
+> 但 `struct.unpack` + `dtype=np.uint16` 之后再 `.astype(np.float16)` 就是错的。
+> 写单元测试验证边界数据的 round-trip。
+
+### 2. Config "可配置"字段从未被读取
+
+**症状**: `EngineConfig::normalize` 被 `Qwen3VLEmbedder::Load` 设置为 `true`，
+被 3 个 L4 测试手动设置，但 `LLMEngine::Impl::Init` 从未读取它。
+实际 normalize 由 `Qwen3VLConfig::normalize`（模型配置）控制。
+
+**根因**: 接口设计时预留了一个"可能有用"的字段，但实现路径没走它。
+时间长了，调用方以为可以通过它控制行为，实际不能。
+
+> **教训**: 每个 config 字段必须有对应的消费代码，否则直接删除。
+> 新增字段时问："谁读它？怎么验证它确实被读了？" 
+> 用 `grep -rn "\.field_name"` 验证完整的写→读链路。
+
+### 3. 同一功能的双路径实现必然分叉
+
+**症状**: `Qwen3VLModel` 维护两条推理路径：
+- `Forward` → `PrepareInputs` + `RunTextDecoder`（fp32 cos/sin/mask → 转 fp16）
+- `ForwardWithTiming` → P0 优化路径（直接 fp16 + NPU cache）
+
+两条路径各 ~200 行，以后改 bug 只动一边，另一边默默腐烂。
+
+**根因**: 为性能优化开了第二条路径，但没有删除旧路径。
+
+> **教训**: 性能优化后必须把原路径删掉，让 `Forward` 成为 `ForwardWithTiming`
+> 的薄 wrapper。宁可多一步 `StageTimings ignored` 丢弃，也不能留两条独立实现。
+> 通过单元测试 + benchmark compare 确认精度无损后立即删旧代码。
+
+### 4. debug dump 代码不要混进 production 路径
+
+**症状**: `qwen3vl_model.cpp` 内有 8 处 `if (getenv("ATB_DEBUG_VISION"))`
+块（每处 ~15 行），分布在 ForwardWithTiming 和 RunVision 的关键路径上。
+另外还有 CONTROLLED FEED 路径。
+
+**根因**: 逐层调试时每次加一个 dump 块，调试完没有清理。
+
+> **教训**: debug dump 抽成 `core/debug_dump.{h,cpp}` 中的工具函数，
+> 每个函数头部一行 `if (!VisionDumpEnabled()) return STATUS_OK;`。
+> 调用方只需一行 `debug::DumpNpuFp16(rt, tensor, count, path)`，
+> 不再污染业务逻辑。CONTROLLED FEED 同理。
+
+### 5. `grid_thw` deprecation 标签与实现冲突
+
+**症状**: `PreprocessedImage::grid_thw` 注释标了 `DEPRECATED: 使用 metadata 代替`，
+但 `qwen3vl_model.cpp` 实际优先读 `grid_thw`，只在它为 null 时才 fallback 到 `metadata`。
+
+**根因**: 注释表达了意图，但代码没跟上——可能是计划废弃后改了主意但没有更新注释。
+
+> **教训**: 注释和代码必须一致。DEPRECATED 标签一旦写了就必须配套
+> `LOG_WARN` 或 `[[deprecated]]` 属性，否则就是误导。如果决定不废弃了就删掉标签。
+
+### 6. Wrapper 类必须提供 wrapper 价值
+
+**症状**: `Qwen3VLEmbedder` 最初只是 `LLMEngine` 的 pass-through（三行 `return engine_->XXX()`），
+没有 embedder 特有的输入/输出校验。
+
+**根因**: 创建 wrapper 时只考虑了"未来可能加逻辑"，但没加任何实际逻辑。
+
+> **教训**: Wrapper 类从第一天起就应该有区别于底层接口的 contract：
+> - `Qwen3VLEmbedder::Encode` 校验 `batch_size == 1`
+> - 校验输出 `shape == {hidden_size}` 且 `dtype == fp16`
+> - 头文件注释写明 invariants
+> 
+> 这些校验放在 engine 调用之前，即使 `Load()` 没调也能给出清晰的错误信息。
+
+### 7. 多框架 benchmark 必须使用完全相同的输入
+
+**症状**: 最初 C++ benchmark 用裸 token 序列（`[151655] * N`），
+Python benchmark 走完整的 chat template pipeline（`processor.apply_chat_template`），
+导致 cosine 只有 0.2-0.3。
+
+**根因**: 两边各自独立构造输入，没有人确认它们是否等价。
+
+> **教训**: 
+> 1. 写一个**统一的 token 生成脚本**（`gen_baseline_tokens.py`），
+>    输出所有框架都加载的同一批 `.bin` 文件。
+> 2. 在 benchmark 运行前用 `assert` 或文件 hash 校验 C++ 和 Python 的 token 文件一致。
+> 3. 首次搭建 benchmark 时，先用最小的测试向量（如 `input_ids=[1,2,3]`）
+>    确认 pipeline 能跑通，再扩展到真实输入。
+
+### 8. binary .bin 文件命名混乱导致静默错配
+
+**症状**: C++ 读 `/tmp/tokens_chat_mm_{W}x{H}.bin`，
+Python 读 `/tmp/tokens_mm_{W}x{H}.bin`。
+如果这两组文件不同步（不同文本、不同 chat template），
+cosine 会莫名其妙地低，而且从代码表面看不出任何异常。
+
+**根因**: 多个脚本各自生成 `.bin`，没有统一的命名约定和生成入口。
+
+> **教训**:
+> 1. 所有 benchmark .bin 文件由一个脚本统一生成（`gen_baseline_tokens.py`）。
+> 2. 文件名的 `tokens_mm_` 和 `tokens_chat_mm_` 应该指向同一份内容
+>    （最终我们让它们完全相同）。
+> 3. 在 REFACTOR_PLAN.md 里记录文件格式契约：
+>    `[int32 count][element_type * count]`
+
+### 9. 验证修复时先 git stash 确认基线
+
+**症状**: P4 实验期间加了额外 sync → 精度崩溃（block 23 cosine 0.28），
+一直以为是原有问题，花大量时间排查 deepstack 注入逻辑。
+
+**根因**: 每次新改动都可能引入新问题。不先确认基线是否正常，排查方向全错。
+
+> **教训**: 精度下降时第一步永远是 `git stash` 回到上一个已知正确的 commit，
+> 重新跑 benchmark 确认基线是否通过。基线通过 → 问题在新代码；
+> 基线不过 → 问题在原有代码（或环境变化）。
+
+### 10. NPU sync 语义：不是"加了更安全"
+
+**症状**: 在 vision pixel CopyToDevice 和 FirstLayer ExecuteGraph 之间
+加 `runtime_->Synchronize()`，导致 block 1 之后所有输出 cosine 断崖式下降。
+
+**根因**: `aclrtMemcpy`（H2D/D2H）在 Ascend 上是同步的。
+额外 sync 引入了 NPU stream 上的隐式 barrier，打断了 ATB graph 内部的多 stream 调度。
+
+> **教训**: 
+> - H2D/D2H 操作已自带同步，不要额外加 sync。
+> - 只有在**必须**保证前序操作完成的点才 sync（如 D2H 后要读 host 数据）。
+> - `ASCEND_LAUNCH_BLOCKING=1` 不保证 byte-exact 确定性。
+> - NPU 上"多加 sync 提高安全性"是反模式。
+
+---
+
+### 防范清单（日常开发 Check List）
+
+1. **新增 config 字段** → grep 确认有消费代码
+2. **新增函数** → 写 L1 单元测试（纯 CPU，秒级）
+3. **修改推理路径** → 跑 `compare_py_cpp.py`，13/13 cosine ≥ 0.99
+4. **修改 .bin 格式** → 更新 `gen_baseline_tokens.py`，统一重新生成
+5. **修改后精度异常** → `git stash` 确认基线，二分排查
+6. **加 debug dump** → 只用 `debug::DumpNpuFp16()`，不手写 fopen/fwrite
+7. **新增 DEPRECATED 标签** → 同时加 `[[deprecated]]` 或 `LOG_WARN`，否则不标
