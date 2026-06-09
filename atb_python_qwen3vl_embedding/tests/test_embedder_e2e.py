@@ -112,11 +112,17 @@ def load_token_ids(path: str) -> List[int]:
 
 
 def load_pixel_values(path: str) -> np.ndarray:
-    """Load int32-count-prefixed uint16 pixel_values from binary file."""
+    """Load int32-count-prefixed fp16 pixel_values from binary file.
+
+    C++ saves fp16 values as raw uint16 bytes.  We unpack as uint16 then
+    reinterpret the bits as float16 — a CAST (astype) would divide the
+    integer values, which is wrong.
+    """
     with open(path, "rb") as f:
         (count,) = struct.unpack("<i", f.read(4))
         fmt = f"<{count}H"
-        return np.array(struct.unpack(fmt, f.read(count * 2)), dtype=np.uint16)
+        raw = np.array(struct.unpack(fmt, f.read(count * 2)), dtype=np.uint16)
+    return raw.view(np.float16)
 
 
 def pool_and_normalize(last_hidden: torch.Tensor, attention_mask=None) -> torch.Tensor:
