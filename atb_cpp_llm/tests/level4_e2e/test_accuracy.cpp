@@ -179,7 +179,6 @@ int main(int argc, char** argv) {
     config.model_dir = MODEL_DIR;
     config.buffer_size = 15LL * 1024 * 1024 * 1024;  // 15GB
     config.device_id = 0;
-    config.normalize = true;
 
     std::unique_ptr<atb_llm::LLMEngine> engine;
     atb_llm::Status s = atb_llm::LLMEngine::Create(config, engine);

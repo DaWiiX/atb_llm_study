@@ -8,7 +8,9 @@ Status Qwen3VLEmbedder::Load(const std::string& model_dir) {
     cfg.model_dir = model_dir;
     cfg.device_id = 0;
     cfg.buffer_size = 5ULL * 1024 * 1024 * 1024;
-    cfg.normalize = true;  // L2-normalise output (matches Qwen3VLEmbedder)
+    // NOTE: L2 normalization is fixed-true for Qwen3VL embedding by the
+    // model config (Qwen3VLConfig::normalize defaults to true and is not
+    // exposed through EngineConfig).  An embedder always L2-normalises.
 
     Status s = LLMEngine::Create(cfg, engine_);
     if (s != STATUS_OK) {

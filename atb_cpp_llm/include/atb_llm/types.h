@@ -68,7 +68,6 @@ struct EngineConfig {
     std::string model_dir;   // 包含 config.json + model.safetensors
     int64_t buffer_size = 0;     // ATB buffer size (bytes)，0 = 自动
     int device_id = 0;           // NPU 设备 ID
-    bool normalize = false;      // 输出是否 L2 归一化
 };
 
 // ── 状态码 ───────────────────────────────────────────────

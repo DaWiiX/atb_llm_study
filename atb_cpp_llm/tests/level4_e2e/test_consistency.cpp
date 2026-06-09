@@ -37,7 +37,6 @@ int main(int argc, char** argv) {
     config.model_dir = MODEL_DIR;
     config.buffer_size = 10LL * 1024 * 1024 * 1024;  // 10GB
     config.device_id = 0;
-    config.normalize = true;  // L2-normalize output
 
     std::unique_ptr<atb_llm::LLMEngine> engine;
     atb_llm::Status s = atb_llm::LLMEngine::Create(config, engine);

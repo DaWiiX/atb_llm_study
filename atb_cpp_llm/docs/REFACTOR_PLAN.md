@@ -480,3 +480,110 @@ src/
 ### 核心教训
 
 之前 E2E cosine 不达标（0.009~0.6）的根因是 **C++ benchmark 用裸 token 序列、Python benchmark 走 chat template**——两边输入不同，对比无意义。修复后全部通过。
+
+---
+
+## Phase 17: 框架一致性整改（🔲 待开始）
+
+Phase 16 跑通后审视代码与既定框架原则的差异，按优先级处理。基线 commit: `7d6fee1 feat(embedder): ...`。
+
+### 优先级 P0 — 修复 `EngineConfig.normalize` 透传断裂
+
+**症状**：`EngineConfig.normalize` 字段从未被读取，`Qwen3VLEmbedder::Load` 设置 `cfg.normalize = true` 是无效代码。实际 `Qwen3VLModel::Forward` 使用的是 `Qwen3VLConfig::normalize`（默认 true，从 JSON 解析路径暂未实现）。
+
+**问题影响**：调用方以为可以通过 `EngineConfig` 控制 normalize，实际控制不了 → 文档与行为不符。
+
+**修复方案**：删除 `EngineConfig::normalize` 字段。L2 normalize 由模型自己决定（embedding 模型固定为 true，generative 模型固定为 false），不是 engine 可配置项。
+
+**改动文件**：
+- `include/atb_llm/types.h`：删除 `EngineConfig::normalize`
+- `src/engine/embedder.cpp`：删除 `cfg.normalize = true;` 并在头文件注释里写明"L2 norm 由模型 config 强制 true"
+- `docs/REFACTOR_PLAN.md`：本节标记完成
+
+**验证**：rebuild + benchmark compare 13/13 仍 ≥ 0.9999。
+
+---
+
+### 优先级 P1 — `Forward` / `ForwardWithTiming` 双路径收敛
+
+**症状**：`Qwen3VLModel` 维护两条独立推理路径：
+- `Forward` → `PrepareInputs` + `RunTextDecoder`（CPU fp32 cos/sin/mask 再转 fp16）
+- `ForwardWithTiming` → P0 优化路径（直接 fp16 生成 + NPU cache）
+
+两条路径的位置编码、cache 策略、deepstack 注入逻辑都重复。久了一边改 bug、另一边漏。
+
+**修复方案**：`Forward` 直接调 `ForwardWithTiming` 丢弃 timings：
+
+```cpp
+Status Qwen3VLModel::Forward(const InferRequest& request, InferResult& result) {
+    StageTimings ignored;
+    return ForwardWithTiming(request, result, ignored);
+}
+```
+
+随后删除 `PrepareInputs` / `RunTextDecoder`（包括 .h 中的私有声明）。
+
+**改动文件**：
+- `src/adapters/qwen3vl_embedding/qwen3vl_model.h`：删除 `PrepareInputs` / `RunTextDecoder` 声明
+- `src/adapters/qwen3vl_embedding/qwen3vl_model.cpp`：Forward 改为一行 wrapper；删除 PrepareInputs / RunTextDecoder 定义
+
+**验证**：
+1. `test_embedder_utils` 仍 PASS
+2. benchmark compare 13/13 仍 ≥ 0.9999
+3. 行数应减少约 200 行
+
+---
+
+### 优先级 P2 — `ATB_DEBUG_VISION` dump 代码统一
+
+**症状**：`qwen3vl_model.cpp` 有 7 处 `if (getenv("ATB_DEBUG_VISION"))` 块，每处都是 `vector → CopyToHost → Synchronize → fopen → fwrite → fclose`，复制粘贴 ~80 行。
+
+**修复方案**：抽出 `core/debug_dump.h`：
+
+```cpp
+namespace atb_llm::debug {
+// 仅在 ATB_DEBUG_VISION env var set 时落盘；否则 no-op
+void DumpNpuFp16(IRuntime* rt, const atb::Tensor& t, int64_t count,
+                 const char* path);
+}
+```
+
+把 7 处替换成一行调用。CONTROLLED FEED 也归到 `core/debug_dump`。
+
+**改动文件**：
+- `src/core/debug_dump.{h,cpp}`：**新建**
+- `src/adapters/qwen3vl_embedding/qwen3vl_model.cpp`：替换 7 处 dump
+- `CMakeLists.txt`：加入 `debug_dump.cpp`
+
+**验证**：行数应减少约 100 行；ATB_DEBUG_VISION=1 仍能产出 `/tmp/cpp_*.bin` 文件。
+
+---
+
+### 优先级 P3 — `Qwen3VLEmbedder` 价值评估 + grid_thw deprecation 收尾
+
+**症状 1**：`Qwen3VLEmbedder` 只是 `LLMEngine` 的 thin pass-through，没有 embedder 特有逻辑。
+
+**修复方案**：让 wrapper 真正承担 embedder invariants：
+1. `Encode` 校验 `request.text.batch_size == 1`（embedder 是单条编码语义）
+2. `Encode` 校验返回的 `result.shape == {hidden_size}`
+3. 头文件注释明确写明"L2-normed by construction, attention_mask required for padded inputs"
+
+**症状 2**：`PreprocessedImage::grid_thw` 标 DEPRECATED 但 `qwen3vl_model.cpp` 仍优先用它。
+
+**修复方案**：要么去掉 deprecation 标签（实际还在用），要么调换 fallback 顺序（先 metadata，回退 grid_thw 并 log warning）。倾向**去掉 deprecation 标签**——`grid_thw` 是 Qwen3VL 的明确字段，废弃后只剩 generic metadata 反而失去类型信息。
+
+**改动文件**：
+- `include/atb_llm/embedder.h`：补 invariants 注释
+- `src/engine/embedder.cpp`：Encode 加 batch/shape 校验
+- `include/atb_llm/types.h`：去掉 grid_thw 上 DEPRECATED 注释
+
+**验证**：单元测试加 1 case 检验 batch_size=2 时 Encode 报错。
+
+---
+
+### 完成判据
+
+- 4 项全部 PASS
+- benchmark compare 13/13 仍 ≥ 0.9999
+- 代码行数净减少约 250 行
+- `git diff --stat` 在 ~10 个文件以内
