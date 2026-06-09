@@ -17,6 +17,21 @@
 namespace atb_llm {
 namespace adapters {
 
+namespace {
+// G5 experiment: when ATB_SKIP_TIMING_SYNCS=1, skip the stage-boundary
+// Synchronize calls that exist purely for per-stage timing accuracy.
+// These syncs are NOT needed for correctness — they only ensure the
+// NPU timer captures true GPU execution time rather than launch time.
+//
+// The D2H-before-CopyToHost syncs (vision merger, text FinalNorm) and
+// the deepstack InjectFeatures sync are NEVER skipped — those are
+// correctness-critical.
+bool SkipTimingSyncs() {
+    const char* env = getenv("ATB_SKIP_TIMING_SYNCS");
+    return env != nullptr;
+}
+}  // namespace
+
 Qwen3VLModel::Qwen3VLModel() = default;
 Qwen3VLModel::~Qwen3VLModel() = default;
 
@@ -271,7 +286,10 @@ Status Qwen3VLModel::ForwardWithTiming(const InferRequest& request,
 
         // Synchronize to capture true GPU time for pos_embed + RoPE.
         // Without this, the NPU time leaks into vision_model_ms.
-        runtime_->Synchronize();
+        // G5: skippable — timing-only, not correctness-critical.
+        if (!SkipTimingSyncs()) {
+            runtime_->Synchronize();
+        }
         auto t_vis_pos = std::chrono::high_resolution_clock::now();
         timings.vision_pos_ms = std::chrono::duration<double, std::milli>(
             t_vis_pos - t_prev).count();
@@ -540,7 +558,10 @@ Status Qwen3VLModel::ForwardWithTiming(const InferRequest& request,
                                      result,
                                      request.text.attention_mask);
     if (s != STATUS_OK) return s;
-    runtime_->Synchronize();
+    // G5: timing-only sync for pooling stage — skippable.
+    if (!SkipTimingSyncs()) {
+        runtime_->Synchronize();
+    }
 
     auto t_end = std::chrono::high_resolution_clock::now();
     timings.pooling_ms = std::chrono::duration<double, std::milli>(
