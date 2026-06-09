@@ -27,9 +27,10 @@ struct PreprocessedImage {
     const void* pixel_values = nullptr;    // (N, patch_dim) float16/float32
     int64_t num_patches = 0;               // N
     int64_t patch_dim = 0;                 // 每个 patch 的维度
-    const int64_t* grid_thw = nullptr;     // DEPRECATED: 使用 metadata 代替。Qwen3VL 特有: (3,) [grid_t, grid_h, grid_w]
+    const int64_t* grid_thw = nullptr;     // Qwen3VL: (3,) [grid_t, grid_h, grid_w]
+                                           // 其他模型可能用 metadata 字段
     aclDataType dtype = ACL_DT_UNDEFINED;  // ACL_FLOAT16 或 ACL_FLOAT32
-    const void* metadata = nullptr;        // 模型特定的元数据（如 grid_thw）
+    const void* metadata = nullptr;        // 模型特定的额外元数据（可选 fallback）
     int64_t metadata_size = 0;             // metadata 字节数
 };
 
