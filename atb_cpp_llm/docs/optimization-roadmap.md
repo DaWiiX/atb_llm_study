@@ -329,4 +329,4 @@
 - **Level 2 (NPU op precision)**: 新增的 NPU graph 与 Python reference cosine ≥ 0.999
 - **Level 3 (E2E)**: `test_accuracy.py` 三模式 ≥ 0.99
 
-参考: `docs/TEST_STRATEGY_GUIDE.md`
+参考: `docs/testing-guide.md`

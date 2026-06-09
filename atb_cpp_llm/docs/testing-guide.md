@@ -4,7 +4,7 @@
 
 **永不通过降低阈值来“通过”测试。** 如果 C++ 和 Python 在相同输入下余弦相似度低于 0.99，说明存在 bug，必须定位并修复根因。
 
-参考 [REFACTOR_PLAN.md](./REFACTOR_PLAN.md) 中已修复的 Bug —— 每一个 Bug 都对应着一个本应更早被发现的测试缺口。
+参考 [refactoring-plan.md](./refactoring-plan.md) 中已修复的 Bug —— 每一个 Bug 都对应着一个本应更早被发现的测试缺口。
 
 ---
 
