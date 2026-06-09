@@ -1495,6 +1495,130 @@ def gen_text_decoder_layer():
 
 
 # ═══════════════════════════════════════════════════════════════════
+# Stage: GetRopeIndex — multi-image (two images)
+# ═══════════════════════════════════════════════════════════════════
+
+
+def gen_get_rope_index_multi_image():
+    """Two images in one sequence with independent grid positions.
+
+    This is the KEY regression test for the vision_start_token_id logic
+    that took DAYS to debug. Each image segment must get its own independent
+    2D grid positions, NOT a continuation of the previous image's grid.
+
+    Sequence layout: [VS, IMG, "the", VS, IMG, IMG, IMG, IMG, "image"]
+    First image:  2x2 grid -> 1x1 merged = 1 token
+    Second image: 4x4 grid -> 2x2 merged = 4 tokens
+    """
+    print("[gen] GetRopeIndex — multi-image (two images)")
+
+    VISION_START = 151652
+    IMAGE_TOKEN = 151655
+
+    input_ids = torch.tensor([[
+        VISION_START,                # pos 0: vision_start for image 1
+        IMAGE_TOKEN,                 # pos 1: image_pad (grid 2x2 -> 1 merged token)
+        15339,                       # pos 2: "the" — text between images
+        VISION_START,                # pos 3: vision_start for image 2
+        IMAGE_TOKEN, IMAGE_TOKEN,    # pos 4-7: image_pad x4 (grid 4x4 -> 4 merged)
+        IMAGE_TOKEN, IMAGE_TOKEN,
+        1879,                        # pos 8: "image" — trailing text
+    ]], dtype=torch.long)
+    grid_thw = torch.tensor([[1, 2, 2], [1, 4, 4]], dtype=torch.long)
+
+    position_ids, _ = get_rope_index(
+        input_ids, grid_thw, None, None,
+        image_token_id=IMAGE_TOKEN,
+        vision_start_token_id=VISION_START,
+        spatial_merge_size=2,
+    )
+    write_i64(f"{OUTPUT_DIR}/cpu_mrope_pid_multi_img.bin", position_ids.numpy())
+    print(f"  → {OUTPUT_DIR}/cpu_mrope_pid_multi_img.bin  shape={position_ids.shape}")
+
+
+def gen_get_rope_index_chat_template():
+    """Chat template token sequence with system prompt + user role + image.
+
+    Represents the ACTUAL input the Qwen3VLEmbedder receives in production:
+    [<|im_start|>,    # pos 0: role marker
+     <|im_start|>,    # pos 1: second role marker (system → user transition)
+     <|vision_start|>, # pos 2: marks beginning of image
+     <|image_pad|>×4, # pos 3-6: image grid (4x4 -> 2x2 merged = 4 tokens)
+     "the", "image",  # pos 7-8: user text
+     <|im_end|>]      # pos 9: message boundary
+
+    Grid: [[1, 4, 4]] (one image, 4x4 patches)
+    """
+    print("[gen] GetRopeIndex — chat template tokens")
+
+    VISION_START = 151652
+    IMAGE_TOKEN = 151655
+
+    input_ids = torch.tensor([[
+        151643,                       # <|im_start|>
+        151643,                       # <|im_start|> (system→user transition)
+        VISION_START,                 # <|vision_start|>
+        IMAGE_TOKEN, IMAGE_TOKEN,     # 4 image_pad tokens
+        IMAGE_TOKEN, IMAGE_TOKEN,
+        15339, 1879,                  # "the" "image"
+        151645,                       # <|im_end|>
+    ]], dtype=torch.long)
+    grid_thw = torch.tensor([[1, 4, 4]], dtype=torch.long)
+
+    position_ids, _ = get_rope_index(
+        input_ids, grid_thw, None, None,
+        image_token_id=IMAGE_TOKEN,
+        vision_start_token_id=VISION_START,
+        spatial_merge_size=2,
+    )
+    write_i64(f"{OUTPUT_DIR}/cpu_mrope_pid_chat_template.bin", position_ids.numpy())
+    print(f"  → {OUTPUT_DIR}/cpu_mrope_pid_chat_template.bin  shape={position_ids.shape}")
+
+
+def gen_get_rope_index_boundary():
+    """Boundary cases for vision_start detection logic.
+
+    Generates reference position IDs for 2 boundary scenarios in a single
+    batched tensor (B=2). Each batch is one valid-image boundary test case
+    with S=4. The global image_index counter in get_rope_index advances
+    across batches, so the total image count across all batches must equal
+    len(image_grid_thw).
+
+    Batch 0: vision_start at position 0 (image_nums=1)
+        [VS, IMG, IMG, TXT]  grid [[1,2,2]] -> 1 merged token
+    Batch 1: vision_start + image at tail (image_nums=1)
+        [TXT, TXT, VS, IMG]  grid [[1,2,2]] -> 1 merged token at tail
+
+    The "vision_start followed by non-image" boundary case (image_nums=0) is
+    verified via inline expected values in the C++ test since it cannot be
+    batched with other image-using batches without exceeding grid_thw length.
+    """
+    print("[gen] GetRopeIndex — boundary cases (2 batched scenarios)")
+
+    VISION_START = 151652
+    IMAGE_TOKEN = 151655
+
+    # Two batches, each with exactly 1 valid image segment.
+    # Total image_nums across batches = 2 = len(grid_thw).
+    input_ids = torch.tensor([
+        # Batch 0: vision_start at position 0
+        [VISION_START, IMAGE_TOKEN, IMAGE_TOKEN, 151643],
+        # Batch 1: vision_start + image at tail
+        [151643, 151643, VISION_START, IMAGE_TOKEN],
+    ], dtype=torch.long)
+    grid_thw = torch.tensor([[1, 2, 2], [1, 2, 2]], dtype=torch.long)
+
+    position_ids, _ = get_rope_index(
+        input_ids, grid_thw, None, None,
+        image_token_id=IMAGE_TOKEN,
+        vision_start_token_id=VISION_START,
+        spatial_merge_size=2,
+    )
+    write_i64(f"{OUTPUT_DIR}/cpu_mrope_pid_boundary.bin", position_ids.numpy())
+    print(f"  → {OUTPUT_DIR}/cpu_mrope_pid_boundary.bin  shape={position_ids.shape}")
+
+
+# ═══════════════════════════════════════════════════════════════════
 # Stage: Vision component references (Level 2 — composed graphs)
 #
 # These tests exercise the full vision component pipelines on NPU and
@@ -1955,6 +2079,9 @@ STAGES = {
     "mrope_pid_simple":    gen_get_rope_index_simple,
     "mrope_pid_no_img":    gen_get_rope_index_no_image,
     "mrope_pid_image_text": gen_get_rope_index_image_text,
+    "mrope_pid_multi_img": gen_get_rope_index_multi_image,
+    "mrope_pid_chat_template": gen_get_rope_index_chat_template,
+    "mrope_pid_boundary":  gen_get_rope_index_boundary,
     "mrope_cos_sin":       gen_mrope_cos_sin,
     "vision_rope":         gen_vision_rope,
     "pos_embed":           gen_pos_embed_interp,
