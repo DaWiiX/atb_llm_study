@@ -4,6 +4,7 @@
 #include "safetensors.hh"
 #include "core/tensor_allocator.h"
 #include "core/npu_tensor.h"
+#include "core/debug_dump.h"
 #include "io/weight_helpers.h"
 #include "log/logger.h"
 #include <chrono>
@@ -263,27 +264,10 @@ Status Qwen3VLModel::ForwardWithTiming(const InferRequest& request,
         }
 
         // DEBUG: Save RoPE cos/sin for comparison with Python
-        if (getenv("ATB_DEBUG_VISION")) {
-            int64_t rope_total = total_tokens * vis_hd;
-            std::vector<uint16_t> cos_dbg(rope_total), sin_dbg(rope_total);
-            alloc->CopyToHost(cos_dbg.data(), *cos_npu.Get(),
-                              rope_total * sizeof(uint16_t));
-            alloc->CopyToHost(sin_dbg.data(), *sin_npu.Get(),
-                              rope_total * sizeof(uint16_t));
-            runtime_->Synchronize();
-            FILE* fc = fopen("/tmp/cpp_rope_cos.bin", "wb");
-            if (fc) {
-                fwrite(&rope_total, sizeof(int64_t), 1, fc);
-                fwrite(cos_dbg.data(), sizeof(uint16_t), rope_total, fc);
-                fclose(fc);
-            }
-            FILE* fs = fopen("/tmp/cpp_rope_sin.bin", "wb");
-            if (fs) {
-                fwrite(&rope_total, sizeof(int64_t), 1, fs);
-                fwrite(sin_dbg.data(), sizeof(uint16_t), rope_total, fs);
-                fclose(fs);
-            }
-        }
+        debug::DumpNpuFp16(runtime_, *cos_npu.Get(), total_tokens * vis_hd,
+                           "/tmp/cpp_rope_cos.bin");
+        debug::DumpNpuFp16(runtime_, *sin_npu.Get(), total_tokens * vis_hd,
+                           "/tmp/cpp_rope_sin.bin");
 
         // Synchronize to capture true GPU time for pos_embed + RoPE.
         // Without this, the NPU time leaks into vision_model_ms.
@@ -328,19 +312,8 @@ Status Qwen3VLModel::ForwardWithTiming(const InferRequest& request,
         }
 
         // DEBUG: Save first layer output
-        if (getenv("ATB_DEBUG_VISION")) {
-            int64_t fl_total = total_tokens * vis_hs;
-            std::vector<uint16_t> fl_host(fl_total);
-            alloc->CopyToHost(fl_host.data(), *h_npu.Get(), fl_total * sizeof(uint16_t));
-            runtime_->Synchronize();
-            FILE* f = fopen("/tmp/cpp_first_layer_out.bin", "wb");
-            if (f) {
-                fwrite(&fl_total, sizeof(int64_t), 1, f);
-                fwrite(fl_host.data(), sizeof(uint16_t), fl_total, f);
-                fclose(f);
-                LOG_INFO("Saved /tmp/cpp_first_layer_out.bin (%ld fp16 values)", static_cast<long>(fl_total));
-            }
-        }
+        debug::DumpNpuFp16(runtime_, *h_npu.Get(), total_tokens * vis_hs,
+                           "/tmp/cpp_first_layer_out.bin");
 
         // ── Vision sub-stage: Blocks 1..(depth-1) + Deepstack extraction ──
         auto t_v_blocks = std::chrono::high_resolution_clock::now();
@@ -364,25 +337,16 @@ Status Qwen3VLModel::ForwardWithTiming(const InferRequest& request,
             h_npu = std::move(h_out);
 
             // DEBUG: Save block output at deepstack layers and last block
-            if (getenv("ATB_DEBUG_VISION")) {
+            if (debug::VisionDumpEnabled()) {
                 bool is_ds = false;
                 for (auto di : config_.vis_deepstack_visual_indexes) {
                     if (li == di) { is_ds = true; break; }
                 }
                 if (is_ds || li == config_.vis_depth - 1) {
-                    int64_t blk_total = total_tokens * vis_hs;
-                    std::vector<uint16_t> blk_host(blk_total);
-                    alloc->CopyToHost(blk_host.data(), *h_npu.Get(), blk_total * sizeof(uint16_t));
-                    runtime_->Synchronize();
                     char path[256];
-                    snprintf(path, sizeof(path), "/tmp/cpp_block_%d_out.bin", li);
-                    FILE* f = fopen(path, "wb");
-                    if (f) {
-                        fwrite(&blk_total, sizeof(int64_t), 1, f);
-                        fwrite(blk_host.data(), sizeof(uint16_t), blk_total, f);
-                        fclose(f);
-                        LOG_INFO("Saved %s (%ld fp16 values)", path, static_cast<long>(blk_total));
-                    }
+                    std::snprintf(path, sizeof(path), "/tmp/cpp_block_%d_out.bin", li);
+                    debug::DumpNpuFp16(runtime_, *h_npu.Get(),
+                                       total_tokens * vis_hs, path);
                 }
             }
 
@@ -458,24 +422,10 @@ Status Qwen3VLModel::ForwardWithTiming(const InferRequest& request,
                              config_.vis_spatial_merge_size, position_ids.data());
 
     // DEBUG: Save inputs_embeds and position_ids for comparison with Python
-    if (getenv("ATB_DEBUG_VISION")) {
-        int64_t ie_total = seq_len * hidden_size;
-        FILE* f1 = fopen("/tmp/cpp_inputs_embeds.bin", "wb");
-        if (f1) {
-            fwrite(&ie_total, sizeof(int64_t), 1, f1);
-            fwrite(inputs_embeds.data(), sizeof(uint16_t), ie_total, f1);
-            fclose(f1);
-            LOG_INFO("Saved /tmp/cpp_inputs_embeds.bin (%ld fp16 values)", static_cast<long>(ie_total));
-        }
-        FILE* f2 = fopen("/tmp/cpp_position_ids.bin", "wb");
-        if (f2) {
-            int64_t pid_total = 3 * seq_len;
-            fwrite(&pid_total, sizeof(int64_t), 1, f2);
-            fwrite(position_ids.data(), sizeof(int64_t), pid_total, f2);
-            fclose(f2);
-            LOG_INFO("Saved /tmp/cpp_position_ids.bin (%ld values)", static_cast<long>(pid_total));
-        }
-    }
+    debug::DumpHostFp16(inputs_embeds.data(), seq_len * hidden_size,
+                        "/tmp/cpp_inputs_embeds.bin");
+    debug::DumpHostInt64(position_ids.data(), 3 * seq_len,
+                         "/tmp/cpp_position_ids.bin");
     // ── P0: MRoPE cos/sin + Causal mask — direct fp16 + NPU cache ──
     // When seq_len is unchanged across calls, reuse the cached NPU tensors
     // to avoid regeneration + H2D upload (saves ~212ms at S=4096).
@@ -635,29 +585,10 @@ Status Qwen3VLModel::RunVision(const uint16_t* pixel_values, int64_t num_patches
     }
 
     // DEBUG: Save RoPE cos/sin for comparison with Python
-    if (getenv("ATB_DEBUG_VISION")) {
-        int64_t rope_total = total_tokens * vis_hd;
-        std::vector<uint16_t> cos_dbg(rope_total), sin_dbg(rope_total);
-        alloc->CopyToHost(cos_dbg.data(), *cos_npu.Get(),
-                          rope_total * sizeof(uint16_t));
-        alloc->CopyToHost(sin_dbg.data(), *sin_npu.Get(),
-                          rope_total * sizeof(uint16_t));
-        runtime_->Synchronize();
-        FILE* fc = fopen("/tmp/cpp_rope_cos.bin", "wb");
-        if (fc) {
-            fwrite(&rope_total, sizeof(int64_t), 1, fc);
-            fwrite(cos_dbg.data(), sizeof(uint16_t), rope_total, fc);
-            fclose(fc);
-            LOG_INFO("Saved /tmp/cpp_rope_cos.bin (%ld fp16 values)", static_cast<long>(rope_total));
-        }
-        FILE* fs = fopen("/tmp/cpp_rope_sin.bin", "wb");
-        if (fs) {
-            fwrite(&rope_total, sizeof(int64_t), 1, fs);
-            fwrite(sin_dbg.data(), sizeof(uint16_t), rope_total, fs);
-            fclose(fs);
-            LOG_INFO("Saved /tmp/cpp_rope_sin.bin (%ld fp16 values)", static_cast<long>(rope_total));
-        }
-    }
+    debug::DumpNpuFp16(runtime_, *cos_npu.Get(), total_tokens * vis_hd,
+                       "/tmp/cpp_rope_cos.bin");
+    debug::DumpNpuFp16(runtime_, *sin_npu.Get(), total_tokens * vis_hd,
+                       "/tmp/cpp_rope_sin.bin");
 
     // 3. Copy vision inputs to NPU (pos_npu/cos_npu/sin_npu already done)
     int64_t patch_dim = static_cast<int64_t>(config_.vis_in_channels) *
@@ -704,46 +635,14 @@ Status Qwen3VLModel::RunVision(const uint16_t* pixel_values, int64_t num_patches
     }
 
     // DEBUG: Save first layer output
-    if (getenv("ATB_DEBUG_VISION")) {
-        int64_t fl_total = total_tokens * vis_hs;
-        std::vector<uint16_t> fl_host(fl_total);
-        alloc->CopyToHost(fl_host.data(), *h_npu.Get(), fl_total * sizeof(uint16_t));
-        runtime_->Synchronize();
-        FILE* f = fopen("/tmp/cpp_first_layer_out.bin", "wb");
-        if (f) {
-            fwrite(&fl_total, sizeof(int64_t), 1, f);
-            fwrite(fl_host.data(), sizeof(uint16_t), fl_total, f);
-            fclose(f);
-            LOG_INFO("Saved /tmp/cpp_first_layer_out.bin (%ld fp16 values)", static_cast<long>(fl_total));
-        }
-    }
+    debug::DumpNpuFp16(runtime_, *h_npu.Get(), total_tokens * vis_hs,
+                       "/tmp/cpp_first_layer_out.bin");
 
-    // CONTROLLED FEED: When ATB_DEBUG_VISION=2, overwrite C++ first_layer output
-    // with Python's first_layer output to isolate whether block computation
-    // differs or error is amplified from first_layer input difference.
-    if (getenv("ATB_DEBUG_VISION") && atoi(getenv("ATB_DEBUG_VISION")) == 2) {
-        FILE* f = fopen("/tmp/diag_first_layer_out.bin", "rb");
-        if (f) {
-            int64_t py_dim;
-            fread(&py_dim, sizeof(int64_t), 1, f);
-            std::vector<uint16_t> py_data(py_dim);
-            fread(py_data.data(), sizeof(uint16_t), py_dim, f);
-            fclose(f);
-
-            int64_t expected_dim = total_tokens * vis_hs;
-            if (py_dim != expected_dim) {
-                LOG_WARN("Python first_layer dim=%ld != C++ expected=%ld, skipping override",
-                         static_cast<long>(py_dim), static_cast<long>(expected_dim));
-            } else {
-                alloc->CopyToDevice(*h_npu.Get(), py_data.data(), py_dim * sizeof(uint16_t));
-                runtime_->Synchronize();
-                LOG_INFO("CONTROLLED FEED: Overwrote first_layer output with Python data (%ld values)",
-                         static_cast<long>(py_dim));
-            }
-        } else {
-            LOG_WARN("ATB_DEBUG_VISION=2 but /tmp/diag_first_layer_out.bin not found, skipping override");
-        }
-    }
+    // CONTROLLED FEED: When ATB_DEBUG_VISION=2, overwrite C++ first_layer
+    // output with Python's first_layer output to isolate whether block
+    // computation differs or error is amplified from input difference.
+    debug::MaybeFeedNpuFp16(runtime_, *h_npu.Get(), total_tokens * vis_hs,
+                            "/tmp/diag_first_layer_out.bin");
 
     // 5. Run blocks 1..depth-1, collect deepstack features
     ds_features.resize(config_.vis_deepstack_visual_indexes.size());
@@ -772,40 +671,22 @@ Status Qwen3VLModel::RunVision(const uint16_t* pixel_values, int64_t num_patches
         h_npu = std::move(h_out);
 
         // DEBUG: Save block 1 output for early-divergence diagnosis
-        if (li == 1 && getenv("ATB_DEBUG_VISION")) {
-            int64_t total = total_tokens * vis_hs;
-            std::vector<uint16_t> block1_host(total);
-            alloc->CopyToHost(block1_host.data(), *h_npu.Get(), total * sizeof(uint16_t));
-            runtime_->Synchronize();
-            FILE* f = fopen("/tmp/cpp_block_1_out.bin", "wb");
-            if (f) {
-                fwrite(&total, sizeof(int64_t), 1, f);
-                fwrite(block1_host.data(), sizeof(uint16_t), total, f);
-                fclose(f);
-                LOG_INFO("Saved /tmp/cpp_block_1_out.bin (%ld fp16 values)", static_cast<long>(total));
-            }
+        if (li == 1) {
+            debug::DumpNpuFp16(runtime_, *h_npu.Get(), total_tokens * vis_hs,
+                               "/tmp/cpp_block_1_out.bin");
         }
 
         // DEBUG: Save block output at deepstack layers and last block
-        if (getenv("ATB_DEBUG_VISION")) {
+        if (debug::VisionDumpEnabled()) {
             bool is_ds = false;
             for (auto di : config_.vis_deepstack_visual_indexes) {
                 if (li == di) { is_ds = true; break; }
             }
             if (is_ds || li == config_.vis_depth - 1) {
-                int64_t blk_total = total_tokens * vis_hs;
-                std::vector<uint16_t> blk_host(blk_total);
-                alloc->CopyToHost(blk_host.data(), *h_npu.Get(), blk_total * sizeof(uint16_t));
-                runtime_->Synchronize();
                 char path[256];
-                snprintf(path, sizeof(path), "/tmp/cpp_block_%d_out.bin", li);
-                FILE* f = fopen(path, "wb");
-                if (f) {
-                    fwrite(&blk_total, sizeof(int64_t), 1, f);
-                    fwrite(blk_host.data(), sizeof(uint16_t), blk_total, f);
-                    fclose(f);
-                    LOG_INFO("Saved %s (%ld fp16 values)", path, static_cast<long>(blk_total));
-                }
+                std::snprintf(path, sizeof(path), "/tmp/cpp_block_%d_out.bin", li);
+                debug::DumpNpuFp16(runtime_, *h_npu.Get(),
+                                   total_tokens * vis_hs, path);
             }
         }
 
@@ -847,16 +728,9 @@ Status Qwen3VLModel::RunVision(const uint16_t* pixel_values, int64_t num_patches
         alloc->CopyToHost(vis_embeds_out, *merged_out.Get(), merged_bytes);
 
         // DEBUG: Save merged vision output for comparison with Python
-        if (getenv("ATB_DEBUG_VISION")) {
-            int64_t total = merged_tokens * config_.vis_out_hidden_size;
-            FILE* f = fopen("/tmp/cpp_vision_merged.bin", "wb");
-            if (f) {
-                fwrite(&total, sizeof(int64_t), 1, f);
-                fwrite(vis_embeds_out, sizeof(uint16_t), total, f);
-                fclose(f);
-                LOG_INFO("Saved /tmp/cpp_vision_merged.bin (%ld fp16 values)", static_cast<long>(total));
-            }
-        }
+        debug::DumpHostFp16(vis_embeds_out,
+                            merged_tokens * config_.vis_out_hidden_size,
+                            "/tmp/cpp_vision_merged.bin");
         // merged_out auto-freed at end of block
     }
 

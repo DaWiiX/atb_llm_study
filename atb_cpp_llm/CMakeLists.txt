@@ -50,6 +50,7 @@ set(ENGINE_SRCS
     src/core/context_manager.cpp
     src/core/buffer_pool.cpp
     src/core/graph_builder.cpp
+    src/core/debug_dump.cpp
     # io
     src/io/safetensors_reader.cpp
     src/io/weight_loader.cpp
