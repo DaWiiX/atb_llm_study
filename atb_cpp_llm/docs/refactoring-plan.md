@@ -223,54 +223,32 @@ Phase 16-19 期间遇到的 10 个关键问题，按发现顺序排列。
 
 | # | Bug / 教训 | 调试耗时 | 缺失的测试 | 现在有吗？ | 缺口 |
 |---|-----------|---------|-----------|----------|------|
-| B1 | fp16 .bin 比特重解释错误 | 小时级 | **L1: .bin 格式 round-trip** — C++ 写已知 fp16 → Python 读 → 逐元素对比 | ❌ | 🔴 P0 |
-| B2 | EngineConfig.normalize 死字段 | 天级 | **L0: Config 布线测试** — 每个 public config 字段验证有消费代码 | ❌ | 🔴 P0 |
+| B1 | fp16 .bin 比特重解释错误 | 小时级 | **L1: .bin 格式 round-trip** — C++ 写已知 fp16 → Python 读 → 逐元素对比 | ✅ test_bin_format | — |
+| B2 | EngineConfig.normalize 死字段 | 天级 | **L0: Config 布线测试** — 每个 public config 字段验证有消费代码 | ✅ test_config_wiring | — |
 | B3 | Forward/ForwardWithTiming 双路径分叉 | 天级 | **L3: Wrapper 一致性** — Forward == ForwardWithTiming（同输入、忽略计时） | ✅ 已消除 | — |
-| B4 | Vision LayerNorm epsilon 读错 JSON key | 小时级 | **L0: Config key 校验** — dump C++ 和 Python 加载的所有 config 值 → diff | ❌ | 🔴 P0 |
-| B5 | GetRopeIndex 缺 vision_start_token_id | 天级 | **L1: MRoPE chat 模板输入** — 含 vision_start 标记的多模态 token → 比较 C++ vs Python 位置编码 | ⚠️ H29 pending | 🟡 P1 |
-| B6 | 跨框架 token 输入不同（裸 token vs chat template） | 天级 | **L4: 输入身份校验** — benchmark 前比较 C++/Python 加载的 token hash | ⚠️ 半缓解 | 🔴 P0 |
-| B7 | .bin 文件命名静默错配 | 天级 | 同 B6 — 输入身份校验 | ⚠️ 半缓解 | 🔴 P0 |
+| B4 | Vision LayerNorm epsilon 读错 JSON key | 小时级 | **L0: Config key 校验** — dump C++ 和 Python 加载的所有 config 值 → diff | ✅ test_config_wiring | — |
+| B5 | GetRopeIndex 缺 vision_start_token_id | 天级 | **L1: MRoPE chat 模板输入** — 含 vision_start 标记的多模态 token → 比较 C++ vs Python 位置编码 | ✅ test_mrope_cpu T7-9 | — |
+| B6 | 跨框架 token 输入不同（裸 token vs chat template） | 天级 | **L4: 输入身份校验** — benchmark 前比较 C++/Python 加载的 token hash | ⚠️ 半缓解（gen_baseline_tokens.py 统一入口，但缺 hash 校验） | 🟡 P1 |
+| B7 | .bin 文件命名静默错配 | 天级 | 同 B6 — 输入身份校验 | ⚠️ 半缓解 | 🟡 P1 |
 | B8 | 额外 sync 破坏精度 | 小时级 | **L4: Sync 安全性** — ATB_DISABLE_PER_OP_SYNC=0 vs =1，cosine ≥ 0.99 | ❌ | 🟡 P1 |
 | B9 | 权重加载双截断 (f32→bf16→fp16) | 小时级 | **L0: 权重精度** — C++ vs Python 加载的 fp16 权重逐元素对比 | ❌ | 🟡 P1 |
 | B10 | SmartResize 银行家舍入 | 小时级 | **L1: SmartResize 舍入** — 边界值 (x.5) 对比 C++ vs Python | ✅ test_preprocess_cpu | — |
 | B11 | Bf16ToFp16 截断偏差 | 小时级 | **L1: 浮点转换精度** — 所有极端值 C++ vs CANN API | ✅ test_float_utils | — |
 | B12 | debug dump 混入 production | — | 代码质量问题，非测试缺口 | ✅ debug_dump 已抽出 | — |
 
-> **统计**: 12 个 bug，其中 **5 个至今完全没有测试覆盖**，**3 个只有半缓解**，**4 个已修复或已有测试**。
+> **统计**（更新于 2026-06-09）: 12 个 bug，其中 **7 个已有测试覆盖**（B1/B2/B3/B4/B5/B10/B11），**3 个半缓解**（B6/B7/B12），**2 个仍无测试**（B8/B9）。
 
-### 5.2 🔴 高优先级缺口（P0 — 如果当时有这些测试，每个能省 1 天以上调试）
+### 5.2 🔴 高优先级缺口
 
-#### G1: .bin 文件格式 round-trip 测试（对应 B1, B6, B7）
+#### ✅ G1: .bin 文件格式 round-trip 测试（对应 B1, B6, B7）— `5cd8d4b`
 
-```
-测试内容:
-  1. C++ 生成已知 fp16 值的 .bin（含边界: 0, ±inf, NaN, denorm, min/max）
-  2. Python 读取并逐元素对比
-  3. Python 生成 → C++ 读取 → 对比
-  4. 在 benchmark 启动时自动校验 C++/Python 加载的 token 文件 hash 一致
+`tests/level1_cpu_pure/test_bin_format.{cpp,py}` — C++ 写已知 fp16 bit patterns（0, ±1, ±inf, NaN, denorm, min/max, 3.0, 4.0）→ Python 读并验证。**关键反回归**：证明 `.view(np.float16)` ≠ `.astype(np.float16)`。
 
-新增文件: tests/level1_cpu_pure/test_bin_format.cpp
-          tests/level1_cpu_pure/test_bin_format.py
-```
+#### ✅ G2: Config 布线测试（对应 B2, B4）— `5cd8d4b`
 
-**能预防的 bug**: B1（fp16 NaN）、B6（裸 token vs chat template）、B7（文件命名错配）
+`tests/level0_framework/test_config_wiring.{cpp,py}` — C++ 加载 Qwen3VLConfig 并 dump 29 字段到 JSON → Python diff。**关键反回归**：`vis_epsilon < 1e-4`（如果读错成 `initializer_range` 会是 0.02）。
 
-#### G2: Config 布线测试（对应 B2, B4）
-
-```
-测试内容:
-  1. 加载真实 config.json + preprocessor_config.json
-  2. Dump Qwen3VLConfig 所有字段值 → JSON
-  3. Python 端同样 dump → diff
-  4. 验证每个 EngineConfig 字段在 LLMEngine::Init 中有对应的 read 路径
-
-新增文件: tests/level0_framework/test_config_wiring.cpp
-          tests/level0_framework/test_config_wiring.py
-```
-
-**能预防的 bug**: B2（normalize 死字段）、B4（epsilon 读错 key，20000x 差异）
-
-#### G3: 预变更回归脚本（对应 B8, B3）
+#### 🔲 G3: 预变更回归脚本（对应 B8, B3）
 
 ```
 脚本内容（benchmark 运行前自动执行）:
@@ -286,22 +264,20 @@ Phase 16-19 期间遇到的 10 个关键问题，按发现顺序排列。
 
 **能预防的 bug**: B8（sync 破坏精度）、B3（双路径分叉）
 
-### 5.3 🟡 中优先级缺口（P1 — 能省数小时调试）
+### 5.3 🟡 中优先级缺口
 
-#### G4: MRoPE chat 模板输入测试（对应 B5）
+#### ✅ G4: MRoPE chat 模板多图像测试（对应 B5）— `b9b60ed`
 
-```
-测试内容:
-  1. 加载 chat-templated token_ids（含 vision_start_token_id + image_token_id 段落）
-  2. GetRopeIndex → 对比 C++ vs Python 逐位置编码
-  3. 覆盖: 纯文本 / 单图像 / 多图像 / 无 vision_start 的图像 token
+扩展 `test_mrope_cpu.cpp` 6→9 tests：
+- **Test 7**: 多图像 — 两幅图各自独立 2D 网格（`[[1,2,2], [1,4,4]]`）
+- **Test 8**: Chat 模板 — 真实生产输入 `<|im_start|>` `<|vision_start|>` `<|image_pad|>`×4 文本 `<|im_end|>`
+- **Test 9**: 边界 — 5 个 inline 子 case（vision_start at 0/S-2/S、相邻 vision_start、vision_start+非 image token 回退） + 批量参考对比
 
-修改文件: tests/level1_cpu_pure/test_mrope_cpu.cpp（扩展，对应 H29）
-```
+Python 参考数据生成器新增 `mrope_pid_multi_img` / `mrope_pid_chat_template` / `mrope_pid_boundary` 三个 stage，使用真实的 `engine_utils.get_rope_index`。
 
-**能预防的 bug**: B5（GetRopeIndex 缺少 vision_start_token_id — 这是 IMAGE_ONLY cos=0.844 的根因）
+**解决了 H29**（test_mrope_cpu: 缺 multi-batch + multi-image 覆盖）。
 
-#### G5: Sync 安全性测试（对应 B8）
+#### 🔲 G5: Sync 安全性测试（对应 B8）
 
 ```
 测试内容:
@@ -313,7 +289,7 @@ Phase 16-19 期间遇到的 10 个关键问题，按发现顺序排列。
           依赖: 需要环境变量控制 per-op sync
 ```
 
-#### G6: 权重加载精度测试（对应 B9）
+#### 🔲 G6: 权重加载精度测试（对应 B9）
 
 ```
 测试内容:
@@ -331,21 +307,20 @@ Phase 16-19 期间遇到的 10 个关键问题，按发现顺序排列。
 
 | P2 ID | 描述 | 对应的缺口 |
 |-------|------|-----------|
-| **H29** | test_mrope_cpu: 缺 multi-batch + multi-image + t>1 | **G4** — 如果当时有这个测试，GetRopeIndex 的 vision_start_token_id bug 会在 L1 阶段被发现 |
+| **H29** | test_mrope_cpu: 缺 multi-batch + multi-image + t>1 | ✅ 已通过 G4 解决（Test 7+8+9，`b9b60ed`） |
 | H15 | test_core: TensorAllocator 全 buffer 比对 | 弱关联 G2 |
 | H27 | test_base_model_utils: 缺 RunPooling::LAST_TOKEN CPU 单测 | 弱关联，不影响已有 bug |
 
-H29 是 P2 中最应该被提升到 P1 的一项——它不是"质量改进"，而是"本可以避免天级调试的缺失测试"。
-
 ### 5.5 立即可执行的行动项
 
-| 优先级 | 行动 | 预计工作量 | 能防的 bug 数 |
-|--------|------|----------|-------------|
-| 🔴 P0 | G1: .bin round-trip 测试 + benchmark 输入 hash 校验 | 2h | 3 |
-| 🔴 P0 | G2: Config 布线测试（C++/Python dump → diff） | 2h | 2 |
-| 🔴 P0 | G3: 预变更回归脚本（git stash + benchmark + compare） | 1h | 2 |
-| 🟡 P1 | G4: MRoPE chat 模板多图像测试（扩展 test_mrope_cpu，H29） | 2h | 1（但影响最大——GetRopeIndex 是天级 bug） |
-| 🟡 P1 | G6: 权重加载精度测试 | 1h | 1 |
+| 优先级 | 行动 | 预计工作量 | 状态 |
+|--------|------|----------|------|
+| 🔴 P0 | G1: .bin round-trip 测试 | 2h | ✅ `5cd8d4b` |
+| 🔴 P0 | G2: Config 布线测试 | 2h | ✅ `5cd8d4b` |
+| 🔴 P0 | G3: 预变更回归脚本 | 1h | 🔲 待实现 |
+| 🟡 P1 | G4: MRoPE chat 模板多图像测试（解决 H29） | 2h | ✅ `b9b60ed` |
+| 🟡 P1 | G6: 权重加载精度测试 | 1h | 🔲 待实现 |
+| 🟡 P1 | G5: Sync 安全性测试 | 2h (需 NPU) | 🔲 待实现 |
 
 ---
 
@@ -377,12 +352,24 @@ export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:~/Ascend/nnal/atb/9.0.0/atb/cxx_abi_1/li
 ### 7.2 验证流程
 
 1. **C++ 编译**: `cmake --build build` — 0 error
-2. **C++ 单元测试**: `cd build && ctest` — 33/33 全部 SUCCESS
+2. **C++ 单元测试**: `cd build && ctest` — 35/35 全部 SUCCESS（含新增 test_bin_format, test_config_wiring）
 3. **C++ vs Python 精度**: `./test_consistency` + `python tests/test_consistency.py` — cosine > 0.99
 4. **C++ vs Python 多模式**: `./test_accuracy` + `python tests/test_accuracy.py`
 5. **全量基准**: `./benchmark --mode compare` + `python tests/test_embedder_e2e.py --mode both --bench`
 
-### 7.3 当前目录结构
+### 7.3 测试金字塔
+
+| Level | 测试数 | 覆盖范围 |
+|-------|--------|---------|
+| L0 基础框架 | 3 | test_core, test_io_adapters, test_config_wiring |
+| L1 CPU 纯函数 | 10 | test_mrope_cpu (9 cases), test_vision_rope_cpu, test_preprocess_cpu, test_pos_embed_cpu, test_float_utils, test_base_model_utils, test_causal_mask_fp16, test_embedder_utils, test_embedder_invariants, test_bin_format |
+| L2 算子精度 | 20 | 覆盖 RMSNorm/LayerNorm/Linear/Activation/Elewise/SplitConcat/Softmax/GatherReduce/TransposeSetValue/RoPE/SelfAttention/SwiGLU/TextDecoder/VisionAttention/VisionMLP/VisionBlock/PatchEmbed/VisionMerger + text_ops + vision_ops |
+| L3 集成 | 6 | test_text_model, test_deepstack, test_deepstack_npu_tensor, test_vision_runner_full, test_text_runner_full, test_vision_stages |
+| L4 E2E | 5 | test_e2e, test_consistency, test_accuracy, test_stage_precision, test_forward_error_paths |
+| Benchmark | 1 | benchmark |
+| **总计** | **45** | 含新增 test_bin_format, test_config_wiring |
+
+### 7.4 当前目录结构
 
 ```
 include/atb_llm/     → engine.h, model.h, runtime.h, types.h, layer_desc.h, embedder.h, kv_cache.h
