@@ -61,6 +61,7 @@ set(ENGINE_SRCS
     src/engine/runtime_impl.cpp
     src/engine/model_registry.cpp
     src/engine/llm_engine.cpp
+    src/engine/embedder.cpp
     # ops
     src/ops/split_op.cpp
     src/ops/transpose_op.cpp
@@ -184,6 +185,7 @@ add_atb_test(test_pos_embed_cpu     tests/level1_cpu_pure/test_pos_embed_cpu.cpp
 add_atb_test(test_float_utils       tests/level1_cpu_pure/test_float_utils.cpp)
 add_atb_test(test_base_model_utils  tests/level1_cpu_pure/test_base_model_utils.cpp)
 add_atb_test(test_causal_mask_fp16  tests/level1_cpu_pure/test_causal_mask_fp16.cpp)
+add_atb_test(test_embedder_utils    tests/level1_cpu_pure/test_embedder_utils.cpp)
 
 # Level 2 per-op precision tests (Wave 2)
 add_atb_test(test_rms_norm_precision            tests/level2_op_precision/test_rms_norm_precision.cpp)

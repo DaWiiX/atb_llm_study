@@ -52,18 +52,21 @@ protected:
         const int64_t* input_ids, int64_t seq_len,
         int64_t image_token_id);
 
+public:
     // ── 池化策略 ──────────────────────────────────────────
     enum class PoolingStrategy {
-        LAST_TOKEN,   // 取最后一个 token（Qwen3VL embedding 模式）
-        MEAN,         // 均值池化
-        CLS           // 取 CLS token
+        LAST_TOKEN,         // 取最后一个 token (seq_len-1)
+        LAST_TOKEN_BY_MASK, // 用 attention_mask 找最后一个非 padding token
+        MEAN,               // 均值池化
+        CLS                 // 取 CLS token
     };
 
     /// 从 hidden_states 中提取池化结果
     Status RunPooling(const uint16_t* hidden_states, int64_t seq_len,
                       int64_t hidden_size, bool normalize,
                       PoolingStrategy strategy,
-                      InferResult& result);
+                      InferResult& result,
+                      const int64_t* attention_mask = nullptr);
 };
 
 }  // namespace families

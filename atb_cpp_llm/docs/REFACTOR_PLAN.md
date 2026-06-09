@@ -394,3 +394,89 @@ src/
 | d | InjectDeepstack NPU 优化 | 🔲 | Phase 13 |
 | e | KV Cache 接口预留 | 🔲 | Phase 14 |
 | f | 批处理接口准备 | 🔲 | Phase 15 |
+| g | Qwen3VLEmbedder 生产部署层 | ✅ | Phase 16（2026-06-09 完成）|
+
+---
+
+## P4 踩坑经验记录（2026-06-09）
+
+### 实验结论
+
+1. **Per-op sync (ExecuteGraph 内) 可安全跳过**：`ATB_DISABLE_PER_OP_SYNC=1` 时 12/13 用例 byte-identical。ATB 图执行在单 stream 上的 FIFO 保证已足够。唯一的例外是 MM_416×672（cosine 0.993 → 非 byte-exact 但在 0.99 之上），根因是 deepstack IndexAdd 在异构引擎上的内部竞争。
+
+2. **额外 sync 会破坏精度**：在 vision pixel CopyToDevice 和 FirstLayer ExecuteGraph 之间加 `runtime_->Synchronize()` 导致精度崩溃（block 23 cosine 0.28 → E2E 0.01）。`aclrtMemcpy` 是同步的，加 sync 无意义并引入 NPU stream 上的隐式 barrier 导致图执行的中间流被打断。
+
+3. **`ASCEND_LAUNCH_BLOCKING=1` 不保证 byte-exact**：两个相同输入 + 两个带此环境变量的推理输出在 MM_416×672 上仍不同（cosine 0.993）。
+
+4. **AddSync 会 crash NPU 图执行**：在 RunVision 中额外加 sync 后某些分辨率产出 239/273 个全零 token。
+
+### 调试教训 — "为什么定位了这么久"
+
+按照 TEST_STRATEGY_GUIDE.md 的 Level 0→1→2→3→4 方法论逐层排查后定位顺序：
+
+1. **Level 4 (E2E)**: `compare_py_cpp.py` 报告 cosine 0.298 ← **太高层，只知道有问题不知道在哪**
+2. **Level 0 (框架)** + **Level 2 (算子)**: 全部 PASS ← 不是基础算子问题
+3. **Level 3 (集成)**: 逐 block 保存 C++ vs Python 中间输出对比 → **Block 0-5 全过，Block 11 突然 divergence，找到 deepstack 层相关性**
+4. **引入新变量**：额外 sync + env var toggle → 精度变化 ← `git stash → 基线通过` 证明是我加的 sync 引入的！
+
+**最重要的教训**：
+- **"每次新的改动都可能引入新的问题，必须先 git stash 回基线验证原有代码是否正确"** — 加了 sync 后 block 23 cosine 从 0.9998 跌到 0.28，但一直以为是原有问题直到 stash 验证
+- **"测试不要只看最终输出"** — Python `benchmark.py` 的 `save_pooler_bin` 不 normalize 而 C++ 永远 normalize。但 cosine 是 scale-invariant 的所以不影响对比结果。真正问题是两边用了不同的输入构造方式
+- **"E2E 测试必须对齐真实输入"** — 裸 token vs chat-templated token 得到的 hidden state 完全不同，对比无意义
+
+### 未来改进建议（如果框架有这些功能可以更快出结果）
+
+1. **中间张量 dump hook**：在 ATB graph 的每个 node 输出处能自动 dump shape + 统计信息（norm, min, max, hash）。当前每个 block 都需要手动加 `CopyToHost + fwrite`，重复劳动很多
+2. **Python/C++ 双向参考数据管道**：统一的 `gen_reference.py --stage <name>` 能生成任意 stage 的 reference。当前 Python 侧无法轻松得到 block 级别的中间输出
+3. **确定性模式**：一个环境变量 `ATB_DETERMINISTIC=1` 强制所有 op 走确定性执行路径（类似 CUDA 的 `torch.use_deterministic_algorithms`）
+4. **逐层差异可视化**：自动对比 C++ vs Python 每个层的 cosine 梯度（cosine 变化曲率），快速定位"第一个出现显著分歧"的层
+
+---
+
+## Phase 16: Qwen3VLEmbedder 生产部署层 + Chat Template 对齐（✅ 2026-06-09 完成）
+
+### 改动清单
+
+| 文件 | 动作 | 说明 |
+|------|------|------|
+| `include/atb_llm/embedder.h` | **新建** | Qwen3VLEmbedder 部署层头文件：Load/Encode/EncodeWithTiming |
+| `src/engine/embedder.cpp` | **新建** | 实现：薄包装 LLMEngine，normalize=true |
+| `include/atb_llm/types.h` | **修改** | `TextInput` 新增 `attention_mask` 字段 |
+| `src/families/base_model.h` | **修改** | PoolingStrategy 新增 `LAST_TOKEN_BY_MASK`；`RunPooling` 新增 attention_mask 参数 |
+| `src/families/base_model.cpp` | **修改** | 实现 mask-based last-token pooling |
+| `src/adapters/qwen3vl_embedding/qwen3vl_model.cpp` | **修改** | Forward/ForwardWithTiming 自动检测 attention_mask 并使用正确策略 |
+| `atb_python_qwen3vl_embedding/chat_tokenizer.py` | **新建** | 对标 `Qwen3VLEmbedder.process()` 的 Python tokenize pipeline |
+| `tests/level1_cpu_pure/test_embedder_utils.cpp` | **新建** | 3 test cases, 29 assertions — LAST_TOKEN_BY_MASK + L2 norm |
+| `tests/benchmark.cpp` | **修改** | `--mode compare` 加载 chat-templated token 文件 |
+| `CMakeLists.txt` | **修改** | 新增 embedder.cpp 和 test_embedder_utils 目标 |
+
+### 架构决策
+
+1. **Tokenizer 策略**：Python 做 tokenize → 存 `.bin` → C++ 加载。不上 C++ tokenizer
+2. **Embedder 形态**：`Qwen3VLEmbedder` 是 `LLMEngine` 的薄包装，只在 `Load` 处设 `normalize=true`。`Qwen3VLModel` 作为底层引擎保持不变
+3. **attention_mask**：全程可选。`nullptr` 则 fallback 到 `LAST_TOKEN`（seq_len-1）；非空则 `LAST_TOKEN_BY_MASK`
+4. **Image 像素限制**：从 `preprocessor_config.json` 读取（C++ 已正确实现），不硬编码
+
+### E2E 验证结果（2026-06-09，chat-templated tokens）
+
+| 模式 | S | Cosine |
+|------|---|--------|
+| TEXT 100 | 22 | **1.000000** |
+| TEXT 512 | 58 | **1.000000** |
+| TEXT 1024 | 109 | **0.999997** |
+| TEXT 2048 | 293 | **0.999996** |
+| TEXT 4096 | 757 | **0.999993** |
+| IO 416×672 | 295 | **0.999942** |
+| IO 720×1280 | 902 | **0.999953** |
+| IO 1080×1920 | 1244 | **0.999975** |
+| IO 1440×2560 | 1244 | **0.999946** |
+| MM 416×672 | 299 | **0.999978** |
+| MM 720×1280 | 906 | **0.999975** |
+| MM 1080×1920 | 1248 | **0.999985** |
+| MM 1440×2560 | 1248 | **0.999970** |
+
+**13/13 ≥ 0.9999 — 全部通过。**
+
+### 核心教训
+
+之前 E2E cosine 不达标（0.009~0.6）的根因是 **C++ benchmark 用裸 token 序列、Python benchmark 走 chat template**——两边输入不同，对比无意义。修复后全部通过。

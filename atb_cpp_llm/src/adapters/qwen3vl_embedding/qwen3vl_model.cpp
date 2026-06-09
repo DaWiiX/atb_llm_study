@@ -192,8 +192,11 @@ Status Qwen3VLModel::Forward(const InferRequest& request, InferResult& result) {
 
     s = BaseModel::RunPooling(inputs_embeds.data(), seq_len, hidden_size,
                               config_.normalize,
-                              families::BaseModel::PoolingStrategy::LAST_TOKEN,
-                              result);
+                              request.text.attention_mask
+                                ? families::BaseModel::PoolingStrategy::LAST_TOKEN_BY_MASK
+                                : families::BaseModel::PoolingStrategy::LAST_TOKEN,
+                              result,
+                              request.text.attention_mask);
     if (s != STATUS_OK) return s;
 
     runtime_->Synchronize();
@@ -606,8 +609,11 @@ Status Qwen3VLModel::ForwardWithTiming(const InferRequest& request,
     // ── Stage: Pooling ───────────────────────────────────────
     Status s = BaseModel::RunPooling(inputs_embeds.data(), seq_len, hidden_size,
                                      config_.normalize,
-                                     families::BaseModel::PoolingStrategy::LAST_TOKEN,
-                                     result);
+                                     request.text.attention_mask
+                                        ? families::BaseModel::PoolingStrategy::LAST_TOKEN_BY_MASK
+                                        : families::BaseModel::PoolingStrategy::LAST_TOKEN,
+                                     result,
+                                     request.text.attention_mask);
     if (s != STATUS_OK) return s;
     runtime_->Synchronize();
 

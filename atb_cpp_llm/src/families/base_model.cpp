@@ -6,9 +6,24 @@
 #include <cstring>
 #include <cmath>
 #include <algorithm>
+#include <cstdlib>
 
 namespace atb_llm {
 namespace families {
+
+namespace {
+// P4 experiment: when ATB_DISABLE_PER_OP_SYNC=1, skip the per-op Synchronize
+// in ExecuteGraph.  On a single stream, FIFO ordering guarantees that op N+1
+// does not launch until op N finishes, so the per-op sync is redundant for
+// correctness.  The host still needs to sync before reading device→host copies.
+//
+// ASCEND_LAUNCH_BLOCKING=1 (CANN env) makes every kernel launch synchronous,
+// providing an even stronger guarantee — useful for debugging / validation.
+bool PerOpSyncDisabled() {
+    const char* env = getenv("ATB_DISABLE_PER_OP_SYNC");
+    return env != nullptr;
+}
+}  // namespace
 
 // ═════════════════════════════════════════════════════════════════════
 // ExecuteGraph
@@ -54,10 +69,15 @@ Status BaseModel::ExecuteGraph(OperationHandle& graph,
         return ERROR_INFERENCE;
     }
 
-    Status sync_s = runtime_->Synchronize();
-    if (sync_s != STATUS_OK) {
-        LOG_ERROR("Stream sync failed after Execute: %d", static_cast<int>(sync_s));
-        return sync_s;
+    // P4: Per-op sync is skipped when ATB_DISABLE_PER_OP_SYNC=1.
+    // Stream FIFO ordering guarantees ops are serialised on the same stream;
+    // the host only *must* sync before reading device→host copies.
+    if (!PerOpSyncDisabled()) {
+        Status sync_s = runtime_->Synchronize();
+        if (sync_s != STATUS_OK) {
+            LOG_ERROR("Stream sync failed after Execute: %d", static_cast<int>(sync_s));
+            return sync_s;
+        }
     }
 
     return STATUS_OK;
@@ -153,13 +173,32 @@ std::vector<int64_t> BaseModel::FindImageTokenPositions(
 Status BaseModel::RunPooling(const uint16_t* hidden_states, int64_t seq_len,
                              int64_t hidden_size, bool normalize,
                              PoolingStrategy strategy,
-                             InferResult& result) {
+                             InferResult& result,
+                             const int64_t* attention_mask) {
     const uint16_t* pool_token = nullptr;
 
     switch (strategy) {
     case PoolingStrategy::LAST_TOKEN: {
         int64_t last_pos = seq_len - 1;
         pool_token = hidden_states + last_pos * hidden_size;
+        break;
+    }
+    case PoolingStrategy::LAST_TOKEN_BY_MASK: {
+        // Find the last non-padded token from the attention_mask.
+        // Matches Qwen3VLEmbedder._pooling_last: flip mask, find first
+        // non-zero, convert to seq position.
+        if (!attention_mask) {
+            LOG_ERROR("RunPooling: LAST_TOKEN_BY_MASK requires attention_mask");
+            return ERROR_INVALID_PARAM;
+        }
+        int64_t pool_pos = seq_len - 1;  // default: last token
+        for (int64_t i = seq_len - 1; i >= 0; i--) {
+            if (attention_mask[i] != 0) {
+                pool_pos = i;
+                break;
+            }
+        }
+        pool_token = hidden_states + pool_pos * hidden_size;
         break;
     }
     case PoolingStrategy::MEAN:

@@ -35,9 +35,10 @@ struct PreprocessedImage {
 
 // ── 文本输入 ─────────────────────────────────────────────
 struct TextInput {
-    const int64_t* input_ids = nullptr;    // (B, S) token IDs
-    int64_t batch_size = 0;                // B
-    int64_t seq_length = 0;                // S
+    const int64_t* input_ids = nullptr;        // (B, S) token IDs
+    const int64_t* attention_mask = nullptr;   // (B, S) optional padding mask (1=valid, 0=padding)
+    int64_t batch_size = 0;                    // B
+    int64_t seq_length = 0;                    // S
 };
 
 // ── 推理请求 ─────────────────────────────────────────────

@@ -501,12 +501,18 @@ int RunImageOnlyBenchmark(atb_llm::LLMEngine* engine,
     int64_t vis_tokens = actual_patches / (config.vis_spatial_merge_size * config.vis_spatial_merge_size);
     int64_t image_token_id = config.image_token_id;
 
-    // Build input_ids: [image_token_id] * vis_tokens (pure image, no text)
-    int64_t seq_len = vis_tokens;
-    std::vector<int64_t> input_ids(seq_len);
-    for (int64_t i = 0; i < vis_tokens; i++) {
-        input_ids[i] = image_token_id;
+    // Load chat-templated token IDs for image-only
+    char io_tok_path[256];
+    std::snprintf(io_tok_path, sizeof(io_tok_path),
+                  "/tmp/tokens_chat_io_%dx%d.bin", img_w, img_h);
+    std::vector<int64_t> input_ids = LoadTokenIds(io_tok_path);
+    if (input_ids.empty()) {
+        // Fallback to bare image tokens
+        input_ids.resize(vis_tokens);
+        for (int64_t i = 0; i < vis_tokens; i++)
+            input_ids[i] = image_token_id;
     }
+    int64_t seq_len = static_cast<int64_t>(input_ids.size());
 
     // Setup request
     atb_llm::InferRequest request;
@@ -597,50 +603,35 @@ int RunCompareMode(atb_llm::LLMEngine* engine,
 
     int ret = 0;
 
-    // ── 1. TEXT_ONLY: multiple sequence lengths ────────────────────
+    // ── 1. TEXT_ONLY: multiple sequence lengths (chat-templated) ──
     {
         constexpr int64_t text_seq_lengths[] = {100, 512, 1024, 2048, 4096};
         constexpr int num_text = static_cast<int>(sizeof(text_seq_lengths) / sizeof(text_seq_lengths[0]));
 
-        // Load base tokens from Python-generated file (--save-tokens --mode text)
-        // Fallback to hardcoded tokens if file doesn't exist.
-        std::vector<int64_t> text_base_tokens;
-        {
-            auto loaded = LoadTokenIds("/tmp/tokens_text_only.bin");
-            if (!loaded.empty()) {
-                text_base_tokens = std::move(loaded);
-            } else {
-                LOG_WARN("Token file /tmp/tokens_text_only.bin not found — "
-                            "using hardcoded tokens. Run "
-                            "'python benchmark.py --save-tokens --mode text' "
-                            "for accurate tokenization.");
-                static constexpr int64_t fallback[] = {TOK_DESCRIBE, TOK_THE, TOK_IMAGE, TOK_DOT};
-                text_base_tokens.assign(fallback, fallback + sizeof(fallback) / sizeof(fallback[0]));
-            }
-        }
-
-        auto make_text_input_ids = [&](int64_t target_len) -> std::vector<int64_t> {
-            std::vector<int64_t> ids(target_len);
-            int64_t num_base = static_cast<int64_t>(text_base_tokens.size());
-            for (int64_t i = 0; i < target_len; i++) {
-                ids[i] = text_base_tokens[i % num_base];
-            }
-            return ids;
-        };
-
         for (int ti = 0; ti < num_text; ti++) {
             int64_t seq = text_seq_lengths[ti];
-            LOG_INFO("------------------------------------------------------------");
-            LOG_INFO("  [%d/13] TEXT_ONLY  S=%ld", ti + 1, static_cast<long>(seq));
-            LOG_INFO("------------------------------------------------------------");
 
-            std::vector<int64_t> input_ids = make_text_input_ids(seq);
+            // Load chat-templated token IDs from Python (chat_tokenizer.py)
+            char tok_path[256];
+            std::snprintf(tok_path, sizeof(tok_path),
+                          "/tmp/tokens_chat_text_only_%ld.bin", static_cast<long>(seq));
+            std::vector<int64_t> input_ids = LoadTokenIds(tok_path);
+            if (input_ids.empty()) {
+                LOG_ERROR("Chat-templated token file not found: %s", tok_path);
+                return 1;
+            }
+            int64_t actual_seq = static_cast<int64_t>(input_ids.size());
+
+            LOG_INFO("------------------------------------------------------------");
+            LOG_INFO("  [%d/13] TEXT_ONLY  S=%ld (chat template: %ld tokens)",
+                     ti + 1, static_cast<long>(seq), static_cast<long>(actual_seq));
+            LOG_INFO("------------------------------------------------------------");
 
             atb_llm::InferRequest request;
             request.mode = atb_llm::InputMode::TEXT_ONLY;
             request.text.input_ids = input_ids.data();
             request.text.batch_size = 1;
-            request.text.seq_length = seq;
+            request.text.seq_length = actual_seq;
 
             char save_path[256];
             std::snprintf(save_path, sizeof(save_path),
@@ -654,7 +645,7 @@ int RunCompareMode(atb_llm::LLMEngine* engine,
             for (auto& r : results) e2e_times.push_back(r.e2e_ms);
             Stats e2e_stats = ComputeStats(e2e_times);
             ReportStagesCompact(results, "text", "N/A",
-                                static_cast<int>(seq), 0, e2e_stats);
+                                static_cast<int>(actual_seq), 0, e2e_stats);
         }
     }
 
@@ -725,13 +716,22 @@ int RunCompareMode(atb_llm::LLMEngine* engine,
             int combo_idx = 6 + i * 2;  // 6,8,10,12
             LOG_INFO("  [%d/13] IMAGE_ONLY  %dx%d", combo_idx, img_w, img_h);
 
-            std::vector<int64_t> input_ids(vis_tokens, image_token_id);
+            // Load chat-templated token IDs (matches Python reference)
+            char io_tok_path[256];
+            std::snprintf(io_tok_path, sizeof(io_tok_path),
+                          "/tmp/tokens_chat_io_%dx%d.bin", img_w, img_h);
+            std::vector<int64_t> input_ids = LoadTokenIds(io_tok_path);
+            if (input_ids.empty()) {
+                // Fallback to bare image tokens
+                input_ids.resize(vis_tokens, image_token_id);
+            }
+            int64_t io_seq_len = static_cast<int64_t>(input_ids.size());
 
             atb_llm::InferRequest request;
             request.mode = atb_llm::InputMode::PREPROCESSED;
             request.text.input_ids = input_ids.data();
             request.text.batch_size = 1;
-            request.text.seq_length = vis_tokens;
+            request.text.seq_length = io_seq_len;
             request.preprocessed.pixel_values = pixel_values.data();
             request.preprocessed.num_patches = actual_patches;
             request.preprocessed.patch_dim = patch_dim;
@@ -762,10 +762,10 @@ int RunCompareMode(atb_llm::LLMEngine* engine,
             int combo_idx = 7 + i * 2;  // 7,9,11,13
             LOG_INFO("  [%d/13] IMAGE_AND_TEXT  %dx%d", combo_idx, img_w, img_h);
 
-            // Try loading token IDs from Python-generated file first.
+            // Load chat-templated token IDs from Python (chat_tokenizer.py)
             char token_path[256];
             std::snprintf(token_path, sizeof(token_path),
-                          "/tmp/tokens_mm_%dx%d.bin", img_w, img_h);
+                          "/tmp/tokens_chat_mm_%dx%d.bin", img_w, img_h);
             std::vector<int64_t> input_ids = LoadTokenIds(token_path);
 
             if (input_ids.empty()) {
