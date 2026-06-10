@@ -12,7 +12,7 @@ The `atb_cpp_llm` directory contains a C++ multi-model LLM engine built on ATB, 
 
 - Huawei Ascend NPU (tested on 910B)
 - `torch_npu` (NPU runtime)
-- `torch_atb` (Ascend Tensor Boost graph compiler)
+- `torch_atb` (Ascend Transformer Boost graph compiler)
 
 ## Running tests
 

@@ -7,6 +7,7 @@
 #include "core/debug_dump.h"
 #include "io/weight_helpers.h"
 #include "log/logger.h"
+#include "util/cpp11_compat.h"
 #include <chrono>
 #include <cstring>
 #include <cmath>
@@ -110,10 +111,10 @@ Status Qwen3VLModel::Load(const std::string& model_dir, IRuntime* runtime) {
     }
 
     // 3. Initialize position encoding helpers
-    mrope_ = std::make_unique<components::MRoPE>(
+    mrope_ = atb_llm::make_unique<components::MRoPE>(
         config_.text_head_dim, config_.text_rope_theta, config_.text_mrope_section);
     // Python: VisionRotaryEmbedding(dim=hd_v // 2) — half the head dim
-    vis_rope_ = std::make_unique<components::VisionRotaryEmbedding>(
+    vis_rope_ = atb_llm::make_unique<components::VisionRotaryEmbedding>(
         config_.vis_head_dim() / 2);
 
     // 4. Create VisionRunner and build vision graphs
@@ -129,7 +130,7 @@ Status Qwen3VLModel::Load(const std::string& model_dir, IRuntime* runtime) {
     vis_cfg.num_position_embeddings = config_.vis_num_position_embeddings;
     vis_cfg.deepstack_visual_indexes = config_.vis_deepstack_visual_indexes;
     vis_cfg.epsilon = config_.vis_epsilon;
-    vision_runner_ = std::make_unique<runners::VisionRunner>(vis_cfg);
+    vision_runner_ = atb_llm::make_unique<runners::VisionRunner>(vis_cfg);
 
     s = vision_runner_->Build();
     if (s != STATUS_OK) {
@@ -143,7 +144,7 @@ Status Qwen3VLModel::Load(const std::string& model_dir, IRuntime* runtime) {
     ds_cfg.vis_out_hidden_size = config_.vis_out_hidden_size;
     ds_cfg.spatial_merge_size = config_.vis_spatial_merge_size;
     ds_cfg.deepstack_visual_indexes = config_.vis_deepstack_visual_indexes;
-    deepstack_fusion_ = std::make_unique<components::DeepstackFusion>(
+    deepstack_fusion_ = atb_llm::make_unique<components::DeepstackFusion>(
         ds_cfg, std::move(vision_runner_->GetDeepstackGraph()));
 
     // Set merger weights from loaded weights
@@ -177,7 +178,7 @@ Status Qwen3VLModel::Load(const std::string& model_dir, IRuntime* runtime) {
     text_cfg.use_qk_norm = true;
     text_cfg.rotary_dim = 2;
     text_cfg.use_mask = true;
-    text_runner_ = std::make_unique<runners::TextRunner>(text_cfg);
+    text_runner_ = atb_llm::make_unique<runners::TextRunner>(text_cfg);
 
     LOG_INFO("Qwen3VLModel loaded successfully");
     return STATUS_OK;
@@ -581,6 +582,7 @@ Status Qwen3VLModel::RunVision(const uint16_t* pixel_values, int64_t num_patches
                                const int64_t* grid_thw, int64_t num_images,
                                uint16_t* vis_embeds_out, int64_t vis_embed_dim,
                                std::vector<NpuTensor>& ds_features) {
+    (void)vis_embed_dim;  // caller-side bookkeeping only; output stride is derived from config_
     auto* alloc = runtime_->GetAllocator();
 
     int64_t vis_hs = config_.vis_hidden_size;

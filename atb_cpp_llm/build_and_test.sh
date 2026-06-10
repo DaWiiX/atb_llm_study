@@ -6,7 +6,10 @@
 #   1. Loads `.env` from the repo root (or this project dir).
 #   2. Sources Ascend CANN/ATB env scripts when present.
 #   3. Configures + builds the project via CMake.
-#   4. Runs CTest only when an NPU + npu-smi are present.
+#   4. Generates Python reference data the C++ tests read from /tmp/
+#      (only when missing — see --refresh-refdata to force, --no-refdata
+#      to skip).
+#   5. Runs CTest only when an NPU + npu-smi are present.
 #
 # Behaviour on a host without NPU/ATB runtime (e.g. CI dev box):
 #   - Still loads .env and sources whatever Ascend scripts exist.
@@ -18,7 +21,9 @@
 #   bash atb_cpp_llm/build_and_test.sh
 #   bash atb_cpp_llm/build_and_test.sh --debug
 #   bash atb_cpp_llm/build_and_test.sh --clean
-#   bash atb_cpp_llm/build_and_test.sh --no-test  # build only
+#   bash atb_cpp_llm/build_and_test.sh --no-test         # build only
+#   bash atb_cpp_llm/build_and_test.sh --no-refdata      # skip the reference-data step
+#   bash atb_cpp_llm/build_and_test.sh --refresh-refdata # regenerate every reference bin
 # ─────────────────────────────────────────────────────────────────────
 set -o pipefail
 
@@ -26,14 +31,18 @@ set -o pipefail
 BUILD_TYPE="Release"
 CLEAN=0
 NO_TEST=0
+NO_REFDATA=0
+REFRESH_REFDATA=0
 for arg in "$@"; do
     case "$arg" in
-        --debug)   BUILD_TYPE="Debug" ;;
-        --release) BUILD_TYPE="Release" ;;
-        --clean)   CLEAN=1 ;;
-        --no-test) NO_TEST=1 ;;
+        --debug)            BUILD_TYPE="Debug" ;;
+        --release)          BUILD_TYPE="Release" ;;
+        --clean)            CLEAN=1 ;;
+        --no-test)          NO_TEST=1 ;;
+        --no-refdata)       NO_REFDATA=1 ;;
+        --refresh-refdata)  REFRESH_REFDATA=1 ;;
         -h|--help)
-            sed -n '2,22p' "$0"
+            sed -n '2,28p' "$0"
             exit 0
             ;;
         *)
@@ -69,33 +78,42 @@ else
 fi
 
 # ── 2. Source Ascend env scripts when available ─────────────────────
+# Probe two common install roots in order:
+#   1. ~/Ascend/        — non-root install (recommended)
+#   2. /usr/local/Ascend/ — root install (default CANN installer location)
 ASCEND_OK=1
-for f in \
-    ~/Ascend/ascend-toolkit/set_env.sh \
-    ~/Ascend/cann/set_env.sh \
-    ~/Ascend/nnal/atb/latest/atb/set_env.sh \
-    ~/Ascend/nnal/atb/set_env.sh
-do
-    if [ -f "$f" ]; then
-        # The ATB set_env.sh accepts --cxx_abi=1; tolerate either form.
-        # shellcheck disable=SC1090
-        if [[ "$f" == */atb/set_env.sh* ]]; then
-            source "$f" --cxx_abi=1 2>/dev/null || source "$f"
-        else
-            source "$f"
+ASCEND_ROOTS=("$HOME/Ascend" "/usr/local/Ascend")
+for ROOT in "${ASCEND_ROOTS[@]}"; do
+    for f in \
+        "$ROOT/ascend-toolkit/set_env.sh" \
+        "$ROOT/cann/set_env.sh" \
+        "$ROOT/nnal/atb/latest/atb/set_env.sh" \
+        "$ROOT/nnal/atb/set_env.sh"
+    do
+        if [ -f "$f" ]; then
+            # The ATB set_env.sh accepts --cxx_abi=1; tolerate either form.
+            # shellcheck disable=SC1090
+            if [[ "$f" == */atb/set_env.sh* ]]; then
+                source "$f" --cxx_abi=1 2>/dev/null || source "$f"
+            else
+                source "$f"
+            fi
+            log "Sourced $f"
         fi
-        log "Sourced $f"
-    fi
+    done
 done
 # Resolve actual ATB install dir: prefer ATB_HOME_PATH (set by set_env.sh),
-# then fall back to ~/Ascend/nnal/atb/latest/atb/cxx_abi_1.
-# NOTE: ~ must NOT be inside quotes, or it won't expand.
+# then fall back to the first cxx_abi_1 dir found under the probed roots.
 if [ -n "${ATB_HOME_PATH:-}" ] && [ -d "$ATB_HOME_PATH" ]; then
     ATB_CXX_ABI_DIR="$ATB_HOME_PATH"
-elif [ -d ~/Ascend/nnal/atb/latest/atb/cxx_abi_1 ]; then
-    ATB_CXX_ABI_DIR="$(eval echo ~/Ascend/nnal/atb/latest/atb/cxx_abi_1)"
 else
     ATB_CXX_ABI_DIR=""
+    for ROOT in "${ASCEND_ROOTS[@]}"; do
+        if [ -d "$ROOT/nnal/atb/latest/atb/cxx_abi_1" ]; then
+            ATB_CXX_ABI_DIR="$ROOT/nnal/atb/latest/atb/cxx_abi_1"
+            break
+        fi
+    done
 fi
 
 if [ -n "$ATB_CXX_ABI_DIR" ]; then
@@ -111,12 +129,15 @@ fi
 
 # Resolve Ascend toolkit dir for CMake (needs acl/acl.h and lib64/)
 ASCEND_TOOLKIT_DIR=""
-for candidate in \
-    "${ASCEND_HOME_PATH:-}" \
-    ~/Ascend/cann-9.0.0/aarch64-linux \
-    ~/Ascend/ascend-toolkit/latest \
-    ~/Ascend/cann/latest
-do
+TOOLKIT_CANDIDATES=("${ASCEND_HOME_PATH:-}")
+for ROOT in "${ASCEND_ROOTS[@]}"; do
+    TOOLKIT_CANDIDATES+=(
+        "$ROOT/cann-9.0.0/aarch64-linux"
+        "$ROOT/ascend-toolkit/latest"
+        "$ROOT/cann/latest"
+    )
+done
+for candidate in "${TOOLKIT_CANDIDATES[@]}"; do
     if [ -n "$candidate" ] && [ -d "$candidate" ]; then
         ASCEND_TOOLKIT_DIR="$candidate"
         break
@@ -177,7 +198,33 @@ else
     log "  hard-coded path inside tests/test_env.h."
 fi
 
+# ── 5a. Generate Python reference data the C++ tests consume ────────
+# Many Level-1 / Level-2 precision tests REQUIRE() loading .bin files
+# from /tmp/. Without them, ~20 tests fail with "Cannot open ...".
+# Default: only generate what's missing (cheap on re-runs).
+if [ "$NO_REFDATA" = "1" ]; then
+    log "--no-refdata passed; skipping Python reference-data generation."
+else
+    GEN_FLAGS=(--skip-fresh)
+    if [ "$REFRESH_REFDATA" = "1" ]; then
+        GEN_FLAGS=()
+        log "Regenerating ALL Python reference data (force)..."
+    else
+        log "Ensuring Python reference data exists in /tmp/ (re-uses any cached output)..."
+    fi
+    if ! python3 "$SCRIPT_DIR/tests/python_reference/gen_all.py" "${GEN_FLAGS[@]}"; then
+        log "ERROR: Python reference-data generation failed."
+        log "Hint: ~20 precision tests will fail without it. Re-run with"
+        log "      --no-refdata to skip and run tests anyway."
+        exit 1
+    fi
+fi
+
 log "Detected NPU; running CTest..."
 npu-smi info | head -20 || true
-ctest --test-dir "$BUILD_DIR" --output-on-failure -j4
-log "All tests passed."
+if ctest --test-dir "$BUILD_DIR" --output-on-failure -j4; then
+    log "All tests passed."
+else
+    log "Some tests FAILED — see ctest output above for details."
+    exit 1
+fi

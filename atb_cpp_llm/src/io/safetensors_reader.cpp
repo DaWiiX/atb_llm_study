@@ -1,11 +1,12 @@
 #include "io/safetensors_reader.h"
 #include "log/logger.h"
+#include "util/cpp11_compat.h"
 #define SAFETENSORS_CPP_IMPLEMENTATION
 #include "safetensors.hh"
 
 namespace atb_llm {
 
-SafetensorsReader::SafetensorsReader() : st_(std::make_unique<safetensors::safetensors_t>()) {}
+SafetensorsReader::SafetensorsReader() : st_(atb_llm::make_unique<safetensors::safetensors_t>()) {}
 
 SafetensorsReader::~SafetensorsReader() = default;
 
@@ -20,7 +21,7 @@ SafetensorsReader& SafetensorsReader::operator=(SafetensorsReader&& other) noexc
 
 Status SafetensorsReader::LoadFromFile(const std::string& path) {
     if (!st_) {
-        st_ = std::make_unique<safetensors::safetensors_t>();
+        st_ = atb_llm::make_unique<safetensors::safetensors_t>();
     }
     std::string warn, err;
     bool ok = safetensors::load_from_file(path, st_.get(), &warn, &err);

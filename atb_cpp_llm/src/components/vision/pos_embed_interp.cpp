@@ -2,6 +2,7 @@
 #include "utils/float_utils.h"
 #include <algorithm>
 #include <cstring>
+#include <vector>
 
 namespace atb_llm {
 namespace components {

@@ -1,5 +1,6 @@
 #include "core/graph_builder.h"
 #include "log/logger.h"
+#include "util/cpp11_compat.h"
 
 namespace atb_llm {
 
@@ -11,7 +12,7 @@ Status GraphBuilder::Create(const std::string& name, std::unique_ptr<GraphBuilde
         out.reset();
         return ERROR_GRAPH_BUILD;
     }
-    out = std::make_unique<GraphBuilder>(name, GraphOpBuilderPtr(raw));
+    out = atb_llm::make_unique<GraphBuilder>(name, GraphOpBuilderPtr(raw));
     return STATUS_OK;
 }
 

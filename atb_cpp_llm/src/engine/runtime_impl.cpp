@@ -1,5 +1,6 @@
 #include "engine/runtime_impl.h"
 #include "log/logger.h"
+#include "util/cpp11_compat.h"
 
 namespace atb_llm {
 
@@ -18,10 +19,10 @@ Status RuntimeImpl::Create(int device_id, int64_t buffer_size, std::unique_ptr<I
     }
 
     // Initialize remaining NPU resources
-    impl->allocator_ = std::make_unique<TensorAllocator>(
+    impl->allocator_ = atb_llm::make_unique<TensorAllocator>(
         impl->ctx_mgr_->GetContext(), impl->ctx_mgr_->GetStream());
-    impl->buffer_pool_ = std::make_unique<BufferPool>();
-    impl->weight_loader_ = std::make_unique<WeightLoader>();
+    impl->buffer_pool_ = atb_llm::make_unique<BufferPool>();
+    impl->weight_loader_ = atb_llm::make_unique<WeightLoader>();
 
     if (buffer_size > 0) {
         s = impl->buffer_pool_->SetBufferSize(buffer_size);

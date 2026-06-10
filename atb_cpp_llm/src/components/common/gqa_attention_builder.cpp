@@ -5,6 +5,7 @@
 #include "ops/rope_op.h"
 #include "ops/self_attention_op.h"
 #include "log/logger.h"
+#include "util/cpp11_compat.h"
 
 namespace atb_llm {
 namespace components {
@@ -193,9 +194,9 @@ Status GqaAttentionBuilder::Build(const std::string& name,
 // ── Factory ────────────────────────────────────────────────────
 std::unique_ptr<IAttentionBuilder> CreateAttentionBuilder(AttnType type) {
     switch (type) {
-    case AttnType::GQA: return std::make_unique<GqaAttentionBuilder>();
-    case AttnType::MHA: return std::make_unique<MhaAttentionBuilder>();
-    case AttnType::MLA: return std::make_unique<MlaAttentionBuilder>();
+    case AttnType::GQA: return atb_llm::make_unique<GqaAttentionBuilder>();
+    case AttnType::MHA: return atb_llm::make_unique<MhaAttentionBuilder>();
+    case AttnType::MLA: return atb_llm::make_unique<MlaAttentionBuilder>();
     default:            return nullptr;
     }
 }

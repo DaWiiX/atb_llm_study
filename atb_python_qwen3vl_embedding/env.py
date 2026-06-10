@@ -95,9 +95,17 @@ def get_env(name: str, default: Optional[str] = None,
 
 #: Local Qwen3-VL-Embedding-2B checkpoint directory.
 QWEN3VL_EMB_MODEL_DIR: str = get_env("QWEN3VL_EMB_MODEL_DIR", required=True)
-QWEN3VL_EMB_SRC: str = get_env("QWEN3VL_EMB_SRC", "/mnt/workspace/gitCode/Qwen3-VL-Embedding/src")
 
-# Example future entries (uncomment when needed):
-# ATB_CPP_BUILD_DIR: str = get_env("ATB_CPP_BUILD_DIR", default="build")
-# CANN_HOME: str = get_env("CANN_HOME",
-#                          default="/usr/local/Ascend/ascend-toolkit/latest")
+#: Path to a checked-out copy of the Qwen3-VL-Embedding reference repo
+#: (the `src/` directory). Optional — only diagnostics that compare against
+#: the reference Python impl read it. Returns None when not set.
+QWEN3VL_EMB_SRC: Optional[str] = get_env("QWEN3VL_EMB_SRC")
+
+#: Path to a checked-out huggingface/transformers (the `src/` dir).
+#: Optional — only diagnostics that import via the reference transformers
+#: impl (compare_with_torch.py, compare_multimodal.py) read it.
+QWEN3VL_EMB_TRANSFORMERS_SRC: Optional[str] = get_env("QWEN3VL_EMB_TRANSFORMERS_SRC")
+
+#: Repository root, derived from this file's location. Useful for tests
+#: that need to add the repo to sys.path without hard-coding the path.
+REPO_ROOT: Path = Path(__file__).resolve().parent.parent

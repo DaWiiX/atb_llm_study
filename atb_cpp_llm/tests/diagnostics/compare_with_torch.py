@@ -15,7 +15,12 @@ Outputs:
 import sys, os, time, argparse, struct, subprocess
 import numpy as np
 os.environ['TRANSFORMERS_VERBOSITY'] = 'error'
-sys.path.insert(0, '/mnt/workspace/gitCode/transformers/src')
+from pathlib import Path as _Path
+sys.path.insert(0, str(_Path(__file__).resolve().parent.parent))
+from _tests_env import MODEL_DIR, REPO_ROOT, CPP_BUILD_DIR, TRANSFORMERS_SRC  # noqa: E402
+if TRANSFORMERS_SRC:
+    sys.path.insert(0, TRANSFORMERS_SRC)
+sys.path.insert(0, str(REPO_ROOT))
 
 import torch
 import torch_npu
@@ -32,8 +37,7 @@ parser.add_argument('--iter', type=int, default=10)
 parser.add_argument('--warmup', type=int, default=3)
 args = parser.parse_args()
 
-MODEL_DIR = '/mnt/workspace/gitCode/models/Qwen3-VL-Embedding-2B'
-CPP_BIN = '/mnt/workspace/gitCode/atb_llm/atb_cpp_llm/build/benchmark'
+CPP_BIN = str(__import__('pathlib').Path(CPP_BUILD_DIR) / 'benchmark')
 CPP_SAVE = '/tmp/cpp_embedding.bin'
 TORCH_SAVE = '/tmp/torch_embedding.bin'
 

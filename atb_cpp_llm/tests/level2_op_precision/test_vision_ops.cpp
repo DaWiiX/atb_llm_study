@@ -388,7 +388,7 @@ TEST_CASE("Vision Component Execute") {
             if (atb_s == atb::NO_ERROR) {
                 uint8_t* ws_ptr = nullptr;
                 if (ws_size > 0) {
-                    auto [ws, ws_s] = runtime->GetWorkspace(ws_size);
+                    auto __atb_pair_ws = runtime->GetWorkspace(ws_size); auto& ws = __atb_pair_ws.first; auto& ws_s = __atb_pair_ws.second;
                     ws_ptr = ws;
                 }
                 atb_s = op.get()->Execute(vp, ws_ptr, ws_size, ctx);
@@ -448,7 +448,7 @@ TEST_CASE("Vision Component Execute") {
             if (atb_s == atb::NO_ERROR) {
                 uint8_t* ws_ptr = nullptr;
                 if (ws_size > 0) {
-                    auto [ws, ws_s] = runtime->GetWorkspace(ws_size);
+                    auto __atb_pair_ws = runtime->GetWorkspace(ws_size); auto& ws = __atb_pair_ws.first; auto& ws_s = __atb_pair_ws.second;
                     ws_ptr = ws;
                 }
                 atb_s = op.get()->Execute(vp, ws_ptr, ws_size, ctx);
@@ -515,7 +515,7 @@ TEST_CASE("LayerNorm Execute") {
         if (atb_s == atb::NO_ERROR) {
             uint8_t* ws_ptr = nullptr;
             if (ws_size > 0) {
-                auto [ws, ws_s] = runtime->GetWorkspace(ws_size);
+                auto __atb_pair_ws = runtime->GetWorkspace(ws_size); auto& ws = __atb_pair_ws.first; auto& ws_s = __atb_pair_ws.second;
                 ws_ptr = ws;
             }
             atb_s = op.get()->Execute(vp, ws_ptr, ws_size, ctx);

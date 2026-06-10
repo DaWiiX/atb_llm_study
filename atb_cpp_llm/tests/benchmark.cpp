@@ -225,13 +225,13 @@ double MeanStage(const std::vector<TimedResult>& results,
 void ReportStages(const std::vector<TimedResult>& results,
                   const char* label, int seq_len, int vis_tokens,
                   const Stats& e2e_stats) {
-    double preprocess = MeanStage(results, [](auto& t) { return t.preprocess_ms; });
-    double vision_pos = MeanStage(results, [](auto& t) { return t.vision_pos_ms; });
-    double vision_model = MeanStage(results, [](auto& t) { return t.vision_model_ms; });
-    double text_embed = MeanStage(results, [](auto& t) { return t.text_embed_ms; });
-    double position_ids = MeanStage(results, [](auto& t) { return t.position_ids_ms; });
-    double text_model = MeanStage(results, [](auto& t) { return t.text_model_ms; });
-    double pooling = MeanStage(results, [](auto& t) { return t.pooling_ms; });
+    double preprocess = MeanStage(results, [](const atb_llm::StageTimings& t) { return t.preprocess_ms; });
+    double vision_pos = MeanStage(results, [](const atb_llm::StageTimings& t) { return t.vision_pos_ms; });
+    double vision_model = MeanStage(results, [](const atb_llm::StageTimings& t) { return t.vision_model_ms; });
+    double text_embed = MeanStage(results, [](const atb_llm::StageTimings& t) { return t.text_embed_ms; });
+    double position_ids = MeanStage(results, [](const atb_llm::StageTimings& t) { return t.position_ids_ms; });
+    double text_model = MeanStage(results, [](const atb_llm::StageTimings& t) { return t.text_model_ms; });
+    double pooling = MeanStage(results, [](const atb_llm::StageTimings& t) { return t.pooling_ms; });
 
     double staged_sum = preprocess + vision_pos + vision_model +
                         text_embed + position_ids + text_model + pooling;
@@ -260,13 +260,13 @@ void ReportStagesCompact(const std::vector<TimedResult>& results,
                          const char* mode, const char* resolution,
                          int seq_len, int vis_tokens,
                          const Stats& e2e_stats) {
-    double preprocess = MeanStage(results, [](auto& t) { return t.preprocess_ms; });
-    double vision_pos = MeanStage(results, [](auto& t) { return t.vision_pos_ms; });
-    double vision_model = MeanStage(results, [](auto& t) { return t.vision_model_ms; });
-    double text_embed = MeanStage(results, [](auto& t) { return t.text_embed_ms; });
-    double position_ids = MeanStage(results, [](auto& t) { return t.position_ids_ms; });
-    double text_model = MeanStage(results, [](auto& t) { return t.text_model_ms; });
-    double pooling = MeanStage(results, [](auto& t) { return t.pooling_ms; });
+    double preprocess = MeanStage(results, [](const atb_llm::StageTimings& t) { return t.preprocess_ms; });
+    double vision_pos = MeanStage(results, [](const atb_llm::StageTimings& t) { return t.vision_pos_ms; });
+    double vision_model = MeanStage(results, [](const atb_llm::StageTimings& t) { return t.vision_model_ms; });
+    double text_embed = MeanStage(results, [](const atb_llm::StageTimings& t) { return t.text_embed_ms; });
+    double position_ids = MeanStage(results, [](const atb_llm::StageTimings& t) { return t.position_ids_ms; });
+    double text_model = MeanStage(results, [](const atb_llm::StageTimings& t) { return t.text_model_ms; });
+    double pooling = MeanStage(results, [](const atb_llm::StageTimings& t) { return t.pooling_ms; });
     double staged_sum = preprocess + vision_pos + vision_model +
                         text_embed + position_ids + text_model + pooling;
 

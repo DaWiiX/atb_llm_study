@@ -15,10 +15,10 @@ Binary format: int64 total_elements + raw fp16 bytes (same as diag_vision_stages
 Usage:
     source /usr/local/Ascend/ascend-toolkit/set_env.sh 2>/dev/null
     source /usr/local/Ascend/cann/set_env.sh 2>/dev/null
-    source /home/developer/Ascend/nnal/atb/9.0.0/atb/set_env.sh --cxx_abi=1 2>/dev/null
-    export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/home/developer/Ascend/nnal/atb/9.0.0/atb/cxx_abi_1/lib
+    source ~/Ascend/nnal/atb/latest/atb/set_env.sh --cxx_abi=1 2>/dev/null
+    export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$HOME/Ascend/nnal/atb/latest/atb/cxx_abi_1/lib
 
-    cd /mnt/workspace/gitCode/atb_llm && python3 atb_cpp_llm/tests/test_vision_block_ref.py
+    cd <repo-root> && python3 atb_cpp_llm/tests/test_vision_block_ref.py
 """
 
 import sys
@@ -29,7 +29,10 @@ import torch
 import torch.nn.functional as F
 
 # ── Configuration ────────────────────────────────────────────────
-MODEL_DIR = "/mnt/workspace/gitCode/models/Qwen3-VL-Embedding-2B"
+import sys as _sys
+from pathlib import Path as _Path
+_sys.path.insert(0, str(_Path(__file__).resolve().parent.parent))
+from _tests_env import MODEL_DIR, REPO_ROOT  # noqa: E402
 IMG_H = 720
 IMG_W = 1280
 IMG_C = 3
@@ -102,7 +105,7 @@ def main():
     print("=" * 70)
 
     # ── Setup engine ────────────────────────────────────────────────
-    sys.path.insert(0, "/mnt/workspace/gitCode/atb_llm")
+    sys.path.insert(0, str(REPO_ROOT))
     from atb_python_qwen3vl_embedding.utils import set_atb_buffer_size
     set_atb_buffer_size(10 * 1024 * 1024 * 1024)
 

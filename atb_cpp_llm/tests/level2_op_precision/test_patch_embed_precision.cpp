@@ -140,7 +140,7 @@ TEST_CASE("PatchEmbedGraph precision: N=4 in_ch=3 tp=2 p=14 embed=64") {
     REQUIRE(op.get()->Setup(vp, ws_size, ctx) == atb::NO_ERROR);
     uint8_t* ws_ptr = nullptr;
     if (ws_size > 0) {
-        auto [ws, ws_st] = runtime->GetWorkspace(ws_size);
+        auto __atb_pair_ws = runtime->GetWorkspace(ws_size); auto& ws = __atb_pair_ws.first; auto& ws_st = __atb_pair_ws.second;
         REQUIRE(IS_OK(ws_st));
         ws_ptr = ws;
     }
@@ -211,7 +211,7 @@ TEST_CASE("PatchEmbedGraph precision: in_ch=3 tp=2 p=14 embed=1024 N=256 (Qwen3V
     REQUIRE(op.get()->Setup(vp, ws_size, ctx) == atb::NO_ERROR);
     uint8_t* ws_ptr = nullptr;
     if (ws_size > 0) {
-        auto [ws, ws_st] = runtime->GetWorkspace(ws_size);
+        auto __atb_pair_ws = runtime->GetWorkspace(ws_size); auto& ws = __atb_pair_ws.first; auto& ws_st = __atb_pair_ws.second;
         REQUIRE(IS_OK(ws_st));
         ws_ptr = ws;
     }
@@ -282,7 +282,7 @@ TEST_CASE("PatchEmbedGraph precision: in_ch=1 tp=1 p=2 embed=16 N=1 (minimal)") 
     REQUIRE(op.get()->Setup(vp, ws_size, ctx) == atb::NO_ERROR);
     uint8_t* ws_ptr = nullptr;
     if (ws_size > 0) {
-        auto [ws, ws_st] = runtime->GetWorkspace(ws_size);
+        auto __atb_pair_ws = runtime->GetWorkspace(ws_size); auto& ws = __atb_pair_ws.first; auto& ws_st = __atb_pair_ws.second;
         REQUIRE(IS_OK(ws_st));
         ws_ptr = ws;
     }

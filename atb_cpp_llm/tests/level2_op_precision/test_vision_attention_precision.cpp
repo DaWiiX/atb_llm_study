@@ -160,7 +160,7 @@ TEST_CASE("VisionAttentionGraph precision: N=16 nh=4 hd=32") {
     REQUIRE(op.get()->Setup(vp, ws_size, ctx) == atb::NO_ERROR);
     uint8_t* ws_ptr = nullptr;
     if (ws_size > 0) {
-        auto [ws, ws_st] = runtime->GetWorkspace(ws_size);
+        auto __atb_pair_ws = runtime->GetWorkspace(ws_size); auto& ws = __atb_pair_ws.first; auto& ws_st = __atb_pair_ws.second;
         REQUIRE(IS_OK(ws_st));
         ws_ptr = ws;
     }
@@ -248,7 +248,7 @@ TEST_CASE("VisionAttentionGraph precision: real RoPE N=16 nh=4 hd=32") {
     REQUIRE(op.get()->Setup(vp, ws_size, ctx) == atb::NO_ERROR);
     uint8_t* ws_ptr = nullptr;
     if (ws_size > 0) {
-        auto [ws, ws_st] = runtime->GetWorkspace(ws_size);
+        auto __atb_pair_ws = runtime->GetWorkspace(ws_size); auto& ws = __atb_pair_ws.first; auto& ws_st = __atb_pair_ws.second;
         REQUIRE(IS_OK(ws_st));
         ws_ptr = ws;
     }

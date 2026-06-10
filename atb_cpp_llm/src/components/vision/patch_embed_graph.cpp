@@ -12,6 +12,7 @@ Status PatchEmbedGraph::Build(const std::string& name,
                                int32_t patch_size,
                                int32_t embed_dim,
                                OperationHandle& out) {
+    (void)embed_dim;  // graph derives output dim from the weight tensor shape at Setup time
     std::unique_ptr<GraphBuilder> builder;
     Status s = GraphBuilder::Create(name, builder);
     if (s != STATUS_OK) return s;

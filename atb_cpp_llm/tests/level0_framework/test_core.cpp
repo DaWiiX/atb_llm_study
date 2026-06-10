@@ -114,12 +114,12 @@ TEST_CASE("BufferPool") {
     CHECK(pool.GetSize() >= 1024 * 1024);
 
     // Get workspace within existing buffer
-    auto [ws, ws_s] = pool.GetWorkspace(512);
+    auto __atb_pair_ws = pool.GetWorkspace(512); auto& ws = __atb_pair_ws.first; auto& ws_s = __atb_pair_ws.second;
     CHECK(IS_OK(ws_s));
     CHECK(ws != nullptr);
 
     // Get workspace larger than current (triggers grow)
-    auto [ws2, ws2_s] = pool.GetWorkspace(2 * 1024 * 1024);  // 2MB
+    auto __atb_pair_ws2 = pool.GetWorkspace(2 * 1024 * 1024); auto& ws2 = __atb_pair_ws2.first; auto& ws2_s = __atb_pair_ws2.second;  // 2MB
     CHECK(IS_OK(ws2_s));
     CHECK(ws2 != nullptr);
     CHECK(pool.GetSize() >= 2 * 1024 * 1024);
@@ -208,7 +208,7 @@ TEST_CASE("CreateRuntime") {
     CHECK(gb != nullptr);
 
     // Test GetWorkspace
-    auto [ws, ws_status] = runtime->GetWorkspace(1024);
+    auto __atb_pair_ws = runtime->GetWorkspace(1024); auto& ws = __atb_pair_ws.first; auto& ws_status = __atb_pair_ws.second;
     CHECK(IS_OK(ws_status));
     CHECK(ws != nullptr);
 }

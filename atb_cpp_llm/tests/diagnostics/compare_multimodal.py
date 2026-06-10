@@ -6,7 +6,12 @@ Generates inputs in Python, saves to binary files, runs C++ benchmark.
 import sys, os, time, argparse, struct, subprocess
 import numpy as np
 os.environ['TRANSFORMERS_VERBOSITY'] = 'error'
-sys.path.insert(0, '/mnt/workspace/gitCode/transformers/src')
+from pathlib import Path as _Path
+sys.path.insert(0, str(_Path(__file__).resolve().parent.parent))
+from _tests_env import MODEL_DIR, REPO_ROOT, CPP_BUILD_DIR, TRANSFORMERS_SRC  # noqa: E402
+if TRANSFORMERS_SRC:
+    sys.path.insert(0, TRANSFORMERS_SRC)
+sys.path.insert(0, str(REPO_ROOT))
 
 import torch
 import torch_npu
@@ -18,8 +23,7 @@ from PIL import Image
 def sync(): torch.npu.synchronize()
 def now(): return time.perf_counter()
 
-MODEL_DIR = '/mnt/workspace/gitCode/models/Qwen3-VL-Embedding-2B'
-CPP_BUILD = '/mnt/workspace/gitCode/atb_llm/atb_cpp_llm/build'
+CPP_BUILD = CPP_BUILD_DIR
 INPUT_DIR = '/tmp/mm_inputs'
 OUTPUT_DIR = '/tmp/mm_outputs'
 

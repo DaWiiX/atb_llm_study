@@ -130,7 +130,7 @@ float RunCase(atb_llm::IRuntime* runtime, ActKind kind,
 
     uint8_t* ws_ptr = nullptr;
     if (ws_size > 0) {
-        auto [ws, ws_st] = runtime->GetWorkspace(ws_size);
+        auto __atb_pair_ws = runtime->GetWorkspace(ws_size); auto& ws = __atb_pair_ws.first; auto& ws_st = __atb_pair_ws.second;
         REQUIRE(IS_OK(ws_st));
         ws_ptr = ws;
     }

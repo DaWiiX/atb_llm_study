@@ -98,7 +98,7 @@ std::vector<float> RunTranspose(atb_llm::IRuntime* runtime,
     REQUIRE(op.get()->Setup(vp, ws_size, ctx) == atb::NO_ERROR);
     uint8_t* ws = nullptr;
     if (ws_size > 0) {
-        auto [w, st] = runtime->GetWorkspace(ws_size);
+        auto __atb_pair_w = runtime->GetWorkspace(ws_size); auto& w = __atb_pair_w.first; auto& st = __atb_pair_w.second;
         REQUIRE(IS_OK(st));
         ws = w;
     }
@@ -190,7 +190,7 @@ TEST_CASE("SetValueOp precision: tile [2,3] into [4,6] at [1:3, 2:5]") {
     REQUIRE(op.get()->Setup(vp, ws_size, ctx) == atb::NO_ERROR);
     uint8_t* ws = nullptr;
     if (ws_size > 0) {
-        auto [w, st] = runtime->GetWorkspace(ws_size);
+        auto __atb_pair_w = runtime->GetWorkspace(ws_size); auto& w = __atb_pair_w.first; auto& st = __atb_pair_w.second;
         REQUIRE(IS_OK(st));
         ws = w;
     }

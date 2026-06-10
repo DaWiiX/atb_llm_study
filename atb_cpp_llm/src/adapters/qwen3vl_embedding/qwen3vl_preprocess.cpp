@@ -2,6 +2,7 @@
 #include "adapters/qwen3vl_embedding/qwen3vl_weights.h"
 #include "utils/float_utils.h"
 #include "log/logger.h"
+#include "util/cpp11_compat.h"
 #include <cmath>
 #include <algorithm>
 #include <cstring>
@@ -44,10 +45,10 @@ void BicubicResize(const uint8_t* input, int32_t in_h, int32_t in_w,
                 float sum = 0.0f;
                 for (int32_t m = -1; m <= 2; m++) {
                     float w_h = CubicWeight(dh - m);
-                    int32_t ih = std::clamp(sh + m, 0, in_h - 1);
+                    int32_t ih = atb_llm::clamp(sh + m, 0, in_h - 1);
                     for (int32_t n = -1; n <= 2; n++) {
                         float w_w = CubicWeight(dw - n);
-                        int32_t iw = std::clamp(sw + n, 0, in_w - 1);
+                        int32_t iw = atb_llm::clamp(sw + n, 0, in_w - 1);
                         sum += in_c[ih * in_w + iw] * w_h * w_w;
                     }
                 }

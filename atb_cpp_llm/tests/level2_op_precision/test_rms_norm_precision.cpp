@@ -131,7 +131,7 @@ float RunNormCase(atb_llm::IRuntime* runtime,
 
     uint8_t* ws_ptr = nullptr;
     if (ws_size > 0) {
-        auto [ws, ws_st] = runtime->GetWorkspace(ws_size);
+        auto __atb_pair_ws = runtime->GetWorkspace(ws_size); auto& ws = __atb_pair_ws.first; auto& ws_st = __atb_pair_ws.second;
         REQUIRE(IS_OK(ws_st));
         ws_ptr = ws;
     }
@@ -197,7 +197,7 @@ std::pair<float,float> RunPrenormCase(atb_llm::IRuntime* runtime,
 
     uint8_t* ws_ptr = nullptr;
     if (ws_size > 0) {
-        auto [ws, ws_st] = runtime->GetWorkspace(ws_size);
+        auto __atb_pair_ws = runtime->GetWorkspace(ws_size); auto& ws = __atb_pair_ws.first; auto& ws_st = __atb_pair_ws.second;
         REQUIRE(IS_OK(ws_st));
         ws_ptr = ws;
     }
@@ -268,7 +268,7 @@ float RunPostnormCase(atb_llm::IRuntime* runtime,
 
     uint8_t* ws_ptr = nullptr;
     if (ws_size > 0) {
-        auto [ws, ws_st] = runtime->GetWorkspace(ws_size);
+        auto __atb_pair_ws = runtime->GetWorkspace(ws_size); auto& ws = __atb_pair_ws.first; auto& ws_st = __atb_pair_ws.second;
         REQUIRE(IS_OK(ws_st));
         ws_ptr = ws;
     }
@@ -363,8 +363,10 @@ TEST_CASE("RmsNormOp PRENORM precision: typical (S=16, H=2048)") {
     auto runtime = atb_llm::CreateRuntime(0, 2LL * 1024 * 1024 * 1024);
     REQUIRE(runtime != nullptr);
 
-    auto [cs_out, cs_res] = RunPrenormCase(runtime.get(),
+    auto __atb_pair = RunPrenormCase(runtime.get(),
                             x, residual, w, expected_out, expected_res_out);
+    auto& cs_out = __atb_pair.first;
+    auto& cs_res = __atb_pair.second;
     LOG_INFO("  output cosine = %.6f", cs_out);
     LOG_INFO("  resOut cosine = %.6f", cs_res);
     CHECK(cs_out >= 0.999f);
@@ -387,8 +389,10 @@ TEST_CASE("RmsNormOp PRENORM precision: small (S=4, H=64)") {
     auto runtime = atb_llm::CreateRuntime(0, 2LL * 1024 * 1024 * 1024);
     REQUIRE(runtime != nullptr);
 
-    auto [cs_out, cs_res] = RunPrenormCase(runtime.get(),
+    auto __atb_pair = RunPrenormCase(runtime.get(),
                             x, residual, w, expected_out, expected_res_out);
+    auto& cs_out = __atb_pair.first;
+    auto& cs_res = __atb_pair.second;
     LOG_INFO("  output cosine = %.6f", cs_out);
     LOG_INFO("  resOut cosine = %.6f", cs_res);
     CHECK(cs_out >= 0.999f);

@@ -14,7 +14,7 @@ All modes must achieve cosine similarity ≥ 0.99.
 
 Prerequisites:
     1. Run ./test_accuracy (C++ side) first to generate /tmp/cpp_*.bin
-    2. Model checkpoint at /mnt/workspace/gitCode/models/Qwen3-VL-Embedding-2B/
+    2. Model checkpoint at $QWEN3VL_EMB_MODEL_DIR (set in .env)
 
 Usage:
     python tests/test_accuracy.py
@@ -27,7 +27,10 @@ import torch
 import torch.nn.functional as F
 
 # ── Configuration ────────────────────────────────────────────────
-MODEL_DIR = "/mnt/workspace/gitCode/models/Qwen3-VL-Embedding-2B"
+import sys as _sys
+from pathlib import Path as _Path
+_sys.path.insert(0, str(_Path(__file__).resolve().parent.parent))
+from _tests_env import MODEL_DIR, REPO_ROOT  # noqa: E402
 COSINE_THRESHOLD = 0.99  # Same threshold for ALL modes, no exceptions
 
 # Shared test constants (must match C++ test_accuracy.cpp exactly)
@@ -140,7 +143,7 @@ def main():
     print("=" * 60)
 
     # ── Setup Python engine ────────────────────────────────────────
-    sys.path.insert(0, "/mnt/workspace/gitCode/atb_llm")
+    sys.path.insert(0, str(REPO_ROOT))
     from atb_python_qwen3vl_embedding.utils import set_atb_buffer_size
     set_atb_buffer_size(10 * 1024 * 1024 * 1024)
 

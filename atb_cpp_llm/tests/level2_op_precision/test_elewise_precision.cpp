@@ -118,7 +118,7 @@ std::vector<float> RunBinaryFp16(atb_llm::IRuntime* runtime,
     REQUIRE(op.get()->Setup(vp, ws_size, ctx) == atb::NO_ERROR);
     uint8_t* ws = nullptr;
     if (ws_size > 0) {
-        auto [w, st] = runtime->GetWorkspace(ws_size);
+        auto __atb_pair_w = runtime->GetWorkspace(ws_size); auto& w = __atb_pair_w.first; auto& st = __atb_pair_w.second;
         REQUIRE(IS_OK(st));
         ws = w;
     }
@@ -206,7 +206,7 @@ TEST_CASE("ElewiseOp precision: Muls(scale=2.5) fp16") {
     REQUIRE(op.get()->Setup(vp, ws_size, ctx) == atb::NO_ERROR);
     uint8_t* ws = nullptr;
     if (ws_size > 0) {
-        auto [w, st] = runtime->GetWorkspace(ws_size);
+        auto __atb_pair_w = runtime->GetWorkspace(ws_size); auto& w = __atb_pair_w.first; auto& st = __atb_pair_w.second;
         REQUIRE(IS_OK(st));
         ws = w;
     }
@@ -275,7 +275,7 @@ TEST_CASE("ElewiseOp precision: Cast fp16→fp32") {
     REQUIRE(op.get()->Setup(vp, ws_size, ctx) == atb::NO_ERROR);
     uint8_t* ws = nullptr;
     if (ws_size > 0) {
-        auto [w, st] = runtime->GetWorkspace(ws_size);
+        auto __atb_pair_w = runtime->GetWorkspace(ws_size); auto& w = __atb_pair_w.first; auto& st = __atb_pair_w.second;
         REQUIRE(IS_OK(st));
         ws = w;
     }

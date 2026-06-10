@@ -235,7 +235,7 @@ static CaseResult RunCase(const std::string& tag, atb_llm::IRuntime* runtime) {
         return res;
     }
     uint8_t* ws_ptr = nullptr;
-    auto [ws, ws_st] = runtime->GetWorkspace(ws_size > 0 ? ws_size : 1);
+    auto __atb_pair_ws = runtime->GetWorkspace(ws_size > 0 ? ws_size : 1); auto& ws = __atb_pair_ws.first; auto& ws_st = __atb_pair_ws.second;
     if (ws_st == atb_llm::STATUS_OK) ws_ptr = ws;
     atb_s = graph.get()->Execute(vp, ws_ptr, ws_size, ctx);
     if (atb_s != atb::NO_ERROR) {

@@ -1,5 +1,6 @@
 #pragma once
 #include "atb/atb_infer.h"
+#include "util/cpp11_compat.h"
 #include <utility>
 
 namespace atb_llm {
@@ -12,11 +13,11 @@ public:
     ~OperationHandle() { if (op_) atb::DestroyOperation(op_); }
 
     // Move-only
-    OperationHandle(OperationHandle&& o) noexcept : op_(std::exchange(o.op_, nullptr)) {}
+    OperationHandle(OperationHandle&& o) noexcept : op_(atb_llm::exchange(o.op_, static_cast<atb::Operation*>(nullptr))) {}
     OperationHandle& operator=(OperationHandle&& o) noexcept {
         if (this != &o) {
             if (op_) atb::DestroyOperation(op_);
-            op_ = std::exchange(o.op_, nullptr);
+            op_ = atb_llm::exchange(o.op_, static_cast<atb::Operation*>(nullptr));
         }
         return *this;
     }
@@ -24,7 +25,7 @@ public:
     OperationHandle& operator=(const OperationHandle&) = delete;
 
     atb::Operation* get() const { return op_; }
-    atb::Operation* release() { return std::exchange(op_, nullptr); }
+    atb::Operation* release() { return atb_llm::exchange(op_, static_cast<atb::Operation*>(nullptr)); }
     explicit operator bool() const { return op_ != nullptr; }
 
 private:
@@ -39,11 +40,11 @@ public:
     ~ContextHandle() { if (ctx_) atb::DestroyContext(ctx_); }
 
     // Move-only
-    ContextHandle(ContextHandle&& o) noexcept : ctx_(std::exchange(o.ctx_, nullptr)) {}
+    ContextHandle(ContextHandle&& o) noexcept : ctx_(atb_llm::exchange(o.ctx_, static_cast<atb::Context*>(nullptr))) {}
     ContextHandle& operator=(ContextHandle&& o) noexcept {
         if (this != &o) {
             if (ctx_) atb::DestroyContext(ctx_);
-            ctx_ = std::exchange(o.ctx_, nullptr);
+            ctx_ = atb_llm::exchange(o.ctx_, static_cast<atb::Context*>(nullptr));
         }
         return *this;
     }
@@ -51,7 +52,7 @@ public:
     ContextHandle& operator=(const ContextHandle&) = delete;
 
     atb::Context* get() const { return ctx_; }
-    atb::Context* release() { return std::exchange(ctx_, nullptr); }
+    atb::Context* release() { return atb_llm::exchange(ctx_, static_cast<atb::Context*>(nullptr)); }
     explicit operator bool() const { return ctx_ != nullptr; }
 
 private:

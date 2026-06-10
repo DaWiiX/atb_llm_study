@@ -1,6 +1,7 @@
 #include "atb_llm/model.h"
 #include "adapters/qwen3vl_embedding/qwen3vl_model.h"
 #include "io/json_config.h"
+#include "util/cpp11_compat.h"
 
 namespace atb_llm {
 
@@ -12,10 +13,10 @@ static bool IsQwen3VLCompatible(const std::string& model_type, const JsonConfig&
 
 REGISTER_MODEL_WITH_CHECK(qwen3vl_embedding,
     []() -> std::unique_ptr<IModel> {
-        return std::make_unique<adapters::Qwen3VLModel>();
+        return atb_llm::make_unique<adapters::Qwen3VLModel>();
     },
     IsQwen3VLCompatible,
     10  // priority
-);
+)
 
 } // namespace atb_llm

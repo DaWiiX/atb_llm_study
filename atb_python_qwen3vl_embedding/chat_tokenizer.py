@@ -25,7 +25,10 @@ from transformers import Qwen3VLProcessor
 
 
 # ── Model directory ─────────────────────────────────────────────
-_DEFAULT_MODEL_DIR = "/mnt/workspace/gitCode/models/Qwen3-VL-Embedding-2B"
+# Default to whatever .env / shell sets QWEN3VL_EMB_MODEL_DIR to. Callers
+# can still override via the `model_dir=...` argument on individual entry
+# points; falling through with neither set raises at the env.py import line.
+from .env import QWEN3VL_EMB_MODEL_DIR as _DEFAULT_MODEL_DIR
 
 # ── Cached processor (lazy-init) ─────────────────────────────────
 _processor: Optional[Qwen3VLProcessor] = None

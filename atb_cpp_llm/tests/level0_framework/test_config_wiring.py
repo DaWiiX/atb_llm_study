@@ -98,7 +98,10 @@ def load_python_config(model_dir):
 
 
 def compare_configs():
-    model_dir = "/mnt/workspace/gitCode/models/Qwen3-VL-Embedding-2B"
+    import sys as _sys
+    from pathlib import Path as _Path
+    _sys.path.insert(0, str(_Path(__file__).resolve().parent.parent))
+    from _tests_env import MODEL_DIR as model_dir  # noqa: E402
 
     py_cfg = load_python_config(model_dir)
     if py_cfg is None:
