@@ -364,7 +364,7 @@ def gen_smart_resize():
     print("[gen] SmartResize — dimension computation")
 
     # Import the REAL implementation — no reimplementation risk
-    from preprocess import smart_resize
+    from atb_python_qwen3vl_embedding.preprocess import smart_resize
 
     factor = 32  # patch_size * merge_size = 16 * 2
     min_px = 4096
@@ -520,7 +520,7 @@ def gen_bicubic_preprocess():
 
     # ── PreprocessImage cases ───────────────────────────────────
     # Load the in-repo Python reference (matches engine.preprocess_image).
-    from preprocess import preprocess_image
+    from atb_python_qwen3vl_embedding.preprocess import preprocess_image
 
     def _gen_preprocess_case(name: str, image_u8: np.ndarray):
         """image_u8: (C, H, W) uint8."""
