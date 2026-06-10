@@ -370,6 +370,13 @@ static bool TestL1_PatchEmbed(int& passed, int& failed,
 
     LOG_INFO("  Weights loaded to NPU");
 
+    // patch_embed.proj.weight is stored in safetensors as a 5D Conv3d kernel
+    // (embed_dim, C, tp, p, p). The graph's Linear node expects a 2D weight
+    // (embed_dim, kernel_size). Reshape in place — element count is identical.
+    weight_tensor.desc.shape.dimNum = 2;
+    weight_tensor.desc.shape.dims[0] = embed_dim;
+    weight_tensor.desc.shape.dims[1] = kernel_size;
+
     // Build variant pack
     atb::VariantPack vp;
     vp.inTensors = {pixels_tensor, weight_tensor, bias_tensor};
@@ -538,10 +545,10 @@ static bool TestL2_PositionEmbedding(int& passed, int& failed,
 
     // Step 4b: Compare against Python CPU pos_embed
     LoadedArray ref_cpu;
-    bool has_cpu_ref = ref_cpu.Load("/tmp/stage_L2_pos_embed_cpu.bin", 1 /* fp32 */);
+    bool has_cpu_ref = ref_cpu.Load("/tmp/stage_L2_pos_embed_cpu.bin", 0 /* fp16 */);
 
     if (has_cpu_ref) {
-        LOG_INFO("  Comparing against Python CPU fp32 pos_embed");
+        LOG_INFO("  Comparing against Python CPU pos_embed (computed f32, stored fp16)");
         int64_t cmp_n = std::min(static_cast<int64_t>(cpp_f32.size()),
                                   static_cast<int64_t>(ref_cpu.data_f32.size()));
         std::vector<float> cmp_cpp(cpp_f32.begin(), cpp_f32.begin() + cmp_n);
