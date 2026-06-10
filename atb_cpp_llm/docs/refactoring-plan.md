@@ -387,3 +387,116 @@ src/
 ├── engine/          → llm_engine, embedder, runtime_impl, model_registry
 └── log/             → logger
 ```
+
+---
+
+## Phase 20: Warning 清零 + 一键构建 + 硬编码路径消除（2026-06-10）
+
+### 背景
+
+Phase 19（基础框架与精度测试补齐）之后，集中清理了几个技术债：
+1. **编译 warning ~150 条** — 大部分来自第三方头（CANN SDK `acl_dump.h`、`safetensors.hh`、`cJSON`），少量来自我们自己代码的 unused parameter。
+2. **构建流程需手动生成参考数据** — 首次 `ctest` 跑会 25+ 测试因 `Cannot open /tmp/cpu_*.bin` 直接 FAIL。
+3. **硬编码路径遍布 19+ 个测试/诊断脚本** — 所有 `MODEL_DIR`、`sys.path.insert` 都写死了 `/mnt/workspace/...`。
+4. **C++ 显存 OOM** — 7 个 E2E 测试在 `ctest -j4` 下并发抢显存，导致 4 个测试 `aclrtMalloc error=207001`。
+5. **ATB 全称写错** — README 和 CLAUDE.md 把 "Ascend **Transformer** Boost" 写成了 "Tensor Boost"。
+
+### 改动清单与效果
+
+| # | 改动 | 文件 | 效果 |
+|---|------|------|------|
+| 1 | **ATB 全称改正**（Tensor→Transformer）+ 加 gitcode 源码链接 | `README.md`、`CLAUDE.md` | ✅ |
+| 2 | `pos_embed_interp.cpp` 加 `#include <vector>` | `src/components/vision/pos_embed_interp.cpp` | ✅ 修复脆弱的隐式 include 依赖 |
+| 3 | `cJSON.c` 加 `POSITION_INDEPENDENT_CODE` | `CMakeLists.txt` | ✅ aarch64 上 static→shared 链接不出 `R_AARCH64_ADR_PREL_PG_HI21` 错误 |
+| 4 | `build_and_test.sh` 自动探测 `~/Ascend/` + `/usr/local/Ascend/` 双根目录 | `build_and_test.sh` | ✅ root 用户和普通用户都能直接跑 |
+| 5 | **编译 warning 从 ~150 条降到 0** | `CMakeLists.txt` + 5 个 `.cpp` | ✅ |
+| | — 第三方头（CANN/ATB/Safetensors/cJSON）→ `SYSTEM` include 抑制 | `CMakeLists.txt` | — |
+| | — 测试代码 fread unused-result / unused-param / sign-compare → `-Wno-*` 仅作用于 test target | `CMakeLists.txt` | — |
+| | — `register.cpp` 多余 `;` → 删除 | `register.cpp` | — |
+| | — 4 处 unused parameter → `(void)x;`（C++11 兼容） | `qwen3vl_weights.cpp`×2、`qwen3vl_model.cpp`、`patch_embed_graph.cpp` | — |
+| 6 | `build_and_test.sh` 修虚假 "All tests passed" | `build_and_test.sh` | ✅ ctest 失败时正确 `exit 1` |
+| 7 | **ctest 加 `RESOURCE_LOCK "npu_e2e"`** | `CMakeLists.txt` | ✅ 7 个 E2E 测试互相串行（CPU 测试照常并发），解决 4 个 OOM |
+| 8 | **修 `test_vision_stages` 权重名 bug** | `test_vision_stages.cpp` | ✅ `model.visual.patch_embed.weight` → `.proj.weight` |
+| 9 | **`gen_all.py` 一键参考数据生成器** | `tests/python_reference/gen_all.py` | ✅ 5 个生成器串行调用（独立子进程绕开 `set_atb_buffer_size` 单次约束）+ `--skip-fresh` 跳过已存在 |
+| 10 | `build_and_test.sh` 集成 `gen_all --skip-fresh` | `build_and_test.sh` | ✅ 首次自动生成，后续 0.07s 跳过；新增 `--no-refdata` / `--refresh-refdata` 选项 |
+| 11 | **硬编码路径全部消除 → 单一 `.env` 真相源** | 19 个文件 | ✅ |
+| | — 复用现有 `atb_python_qwen3vl_embedding/env.py`（加 `QWEN3VL_EMB_TRANSFORMERS_SRC`、`REPO_ROOT`） | `env.py` | — |
+| | — 新增 `tests/_tests_env.py`（27 行 shim，仅 `sys.path` 注入 + re-export `env.py`） | `tests/_tests_env.py` | — |
+| | — 19 个 `tests/` 脚本统一改用 `from _tests_env import MODEL_DIR` | python_reference / diagnostics / level0 / level4 | — |
+| | — C++ `test_env.h` 去掉硬编码 fallback，env 缺失时 `abort()` 并提示 `.env` 位置 | `tests/test_env.h` | — |
+| | — `verify_baseline.sh` 主动 source `.env`，硬编码 fallback 改为 `:?` shell 错误 | `scripts/verify_baseline.sh` | — |
+| | — `chat_tokenizer.py` / `gen_baseline_tokens.py` 改用 `from env import QWEN3VL_EMB_MODEL_DIR` | `atb_python_qwen3vl_embedding/` | — |
+| 12 | README 重写 | `README.md` | ✅ 完整 5 步从零跑起来 + 参考数据章节 |
+| 13 | C++17→C++11 降级待办文档 | `docs/cpp11-compat-todo.md` | ✅ 19 处 `make_unique` + 10 处泛型 lambda 改造清单 |
+| 14 | `.env.example` 完善 | `.env.example` | ✅ 含 `QWEN3VL_EMB_MODEL_DIR`、`QWEN3VL_EMB_SRC`、`QWEN3VL_EMB_TRANSFORMERS_SRC` |
+
+### 测试回归结果
+
+```
+Before:  20/50 passed (30 failed: 4 OOM + 25 missing ref-data + 1 test-code bug)
+After:   49/50 passed (1 failed: test_vision_stages L1 ATB Setup errcode 16)
+```
+
+唯一未修：`test_vision_stages` L1 阶段 — PatchEmbedGraph 测试代码与生产代码 `qwen3vl_weights.cpp` 用法不一致（weight tensor shape / VariantPack 对应关系），ATB Setup 时返回 errcode 16。属于测试代码 bug，跟参考数据 / 硬编码 / warning 修复都无关。
+
+### 踩坑经验（Phase 20）
+
+#### 4.11 codemod 改路径时要同时改 import 路径
+
+**症状**：`gen_pos_embed_npu_reference.py` 重构后报 `ModuleNotFoundError: No module named 'engine_utils'`。
+
+**根因**：codemod 把 `sys.path` 从 package 目录（`.../atb_python_qwen3vl_embedding`）改成了 repo root，但 `from engine_utils import ...`（short-form import）没跟着改成 `from atb_python_qwen3vl_embedding.engine_utils import ...`。
+
+> **教训**：批量替换 hard-coded path 时，**依赖这些路径的 short-form import** 也必须同步改成标准包路径。codemod 写完后跑一遍 `python -c "import py_compile"` 还不够，必须真正 import 一次确认。
+
+#### 4.12 `set_atb_buffer_size` 不能跨进程调用——每个 Python 生成器必须独立子进程
+
+**症状**：首次想把 5 个 Python 参考数据生成器串进一个脚本里，第二个生成器开始 ATB 图输出全 0。
+
+**根因**：`set_atb_buffer_size()` 全局状态不能在一个进程里调两次（已在 §4.x 处提及但容易忘）。多生成器编排必须用 `subprocess.call` 调独立子进程。
+
+> **教训**：`gen_all.py` 用 `subprocess.call([sys.executable, script])` 而不是 `import` —— 这是正确做法，不要为了"少 fork"改回 import。
+
+#### 4.13 CMake `set_tests_properties` 顺序敏感
+
+**症状**：`set_tests_properties(... RESOURCE_LOCK "npu_e2e")` 引用 `test_vision_stages` 时 cmake configure 报 `target not found`。
+
+**根因**：被引用的测试必须先通过 `add_test()` / `add_atb_test()` 注册过。
+
+> **教训**：CMake 不是声明式——顺序敏感。串行锁声明放在所有 `add_atb_test` 之后（`benchmark` 注册之后、`install` 之前）。
+
+#### 4.14 真正解决 NPU OOM 靠串行化，不是调小 buffer pool
+
+**症状**：最初尝试把 BufferPool 从 16GB 调到 8GB 来避免 `aclrtMalloc error=207001`，结果部分测试因 workspace 不够 ATB Setup 失败。
+
+**根因**：E2E 测试需要完整 2B 模型的 10-16GB 显存。降低 buffer pool 大小只会让更多测试因 workspace 不够而 fail。
+
+> **教训**：显存不够时先确认是"并发抢"还是"单个不够"。前者用 `RESOURCE_LOCK` 串行化（CPU 测试照常并发，性能损失小）；后者再考虑调 pool 大小。
+
+#### 4.15 警告抑制要分清"我们的代码" vs "第三方头"
+
+**症状**：尝试用 `add_compile_options(-Wno-pedantic -Wno-unused-parameter ...)` 全局静默 warning，结果连带屏蔽了我们自己代码里的真问题。
+
+**根因**：`-Wno-*` 应用范围太广。
+
+> **教训**：`SYSTEM include` 是 GCC 给"我承认这是第三方头，对它的 warning 闭嘴"的官方机制。只有测试代码里那些约定俗成的弱实践（`fread` 不检查返回值等）才用 `target_compile_options(test_target -Wno-*)` 限定到 test target。**生产代码的 warning 必须能看到**。
+
+#### 4.16 verify_baseline.sh: shell `${VAR:?}` 是好东西
+
+**症状**：把硬编码 fallback 改成 `${QWEN3VL_EMB_MODEL_DIR:-/mnt/...}` 时，新人 setup 仍然 silently 用错路径。
+
+**根因**：`:-` 是"未设置时用默认值"，仍然 fallback；`:?` 才是"未设置时报错退出"。
+
+> **教训**：所有应该被 `.env` 配置的变量都用 `${VAR:?message}` 而非 `${VAR:-default}`。`build_and_test.sh` source `.env` 后用 `${QWEN3VL_EMB_MODEL_DIR:?...}` 强制要求设置。
+
+---
+
+## 6'. 缺失测试复盘（续）
+
+### G7: 参考数据完整性检查（来自 Phase 20）
+
+**缺口**：之前 `gen_cpu_reference.py` 等生成器没有 sentinel 检查，每次重跑全部 5 个生成器，无效复用。
+
+**修复**：`gen_all.py` 对每个生成器声明 1-2 个 sentinel 文件，`--skip-fresh` 模式查到即跳。
+
+**状态**：✅ 已实现，`build_and_test.sh` 默认 `--skip-fresh`，5 个生成器 0.07s 跳过。
