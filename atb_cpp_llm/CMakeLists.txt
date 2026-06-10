@@ -39,7 +39,10 @@ else()
 endif()
 
 # ── Third-party (cJSON) ──────────────────────────────────
+# Static lib gets linked into the SHARED atb_llm_engine, so PIC is required;
+# otherwise aarch64 link fails with "R_AARCH64_ADR_PREL_PG_HI21 ... -fPIC".
 add_library(thirdparty STATIC utils/cJSON.c)
+set_target_properties(thirdparty PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(thirdparty PUBLIC utils)
 
 # ── Core library (explicit source list) ──────────────────
@@ -114,11 +117,18 @@ set(ENGINE_SRCS
 
 add_library(atb_llm_engine SHARED ${ENGINE_SRCS})
 
+# `utils/` holds vendored third-party headers (safetensors.hh, cJSON).
+# ATB / CANN SDK headers ship with their own -Wpedantic / -Wunused-parameter
+# noise. Mark all of these as SYSTEM so GCC suppresses warnings from inside
+# them — we only want diagnostics for our own code.
 target_include_directories(atb_llm_engine
     PUBLIC
         include
     PRIVATE
         src
+)
+target_include_directories(atb_llm_engine SYSTEM
+    PRIVATE
         utils
         ${ATB_DIR}/include
         ${ASCEND_TOOLKIT_DIR}/include
@@ -143,10 +153,26 @@ function(add_atb_test name source)
     target_include_directories(${name}
         PRIVATE
             src
-            utils
             tests
+    )
+    target_include_directories(${name} SYSTEM
+        PRIVATE
+            utils
             ${ATB_DIR}/include
             ${ASCEND_TOOLKIT_DIR}/include
+    )
+    # Test fixtures intentionally:
+    #   - ignore fread() results when probing test data files
+    #     (REQUIRE() on the parsed values is what we care about);
+    #   - keep main(argc, argv) signatures even when unused;
+    #   - mix size_t loop counters with signed shape values;
+    #   - leave optional Load* helpers defined for future cases.
+    # Silence these in tests so the build output stays clean.
+    target_compile_options(${name} PRIVATE
+        -Wno-unused-result
+        -Wno-unused-parameter
+        -Wno-sign-compare
+        -Wno-unused-function
     )
     target_link_directories(${name}
         PRIVATE
@@ -226,10 +252,19 @@ add_executable(test_io_adapters tests/level0_framework/test_io_adapters.cpp)
 target_include_directories(test_io_adapters
     PRIVATE
         src
-        utils
         tests
+)
+target_include_directories(test_io_adapters SYSTEM
+    PRIVATE
+        utils
         ${ATB_DIR}/include
         ${ASCEND_TOOLKIT_DIR}/include
+)
+target_compile_options(test_io_adapters PRIVATE
+    -Wno-unused-result
+    -Wno-unused-parameter
+    -Wno-sign-compare
+    -Wno-unused-function
 )
 target_link_directories(test_io_adapters
     PRIVATE
@@ -241,6 +276,26 @@ add_test(NAME test_io_adapters COMMAND test_io_adapters)
 
 # Benchmarks (not registered as CTest tests)
 add_atb_test(benchmark                 tests/benchmark.cpp)  # stays at tests/ root
+
+# ── Test scheduling ───────────────────────────────────────
+# Each E2E (and test_vision_stages) test allocates a 10–16 GB NPU buffer
+# pool and loads the full 2B model. Running two of them concurrently under
+# `ctest -j4` blows past the device HBM budget and trips
+# `aclrtMalloc error=207001`. Share a single "npu_e2e" resource lock so
+# they serialize against each other while unrelated CPU / lightweight
+# tests still run in parallel.
+# Must come AFTER all add_atb_test() calls — set_tests_properties()
+# requires the targets to already exist.
+set_tests_properties(
+    test_e2e
+    test_consistency
+    test_accuracy
+    test_stage_precision
+    test_forward_error_paths
+    test_sync_safety
+    test_vision_stages
+    PROPERTIES RESOURCE_LOCK "npu_e2e"
+)
 
 # ── Install ───────────────────────────────────────────────
 install(TARGETS atb_llm_engine

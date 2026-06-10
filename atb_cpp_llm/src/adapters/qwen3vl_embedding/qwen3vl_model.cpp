@@ -581,6 +581,7 @@ Status Qwen3VLModel::RunVision(const uint16_t* pixel_values, int64_t num_patches
                                const int64_t* grid_thw, int64_t num_images,
                                uint16_t* vis_embeds_out, int64_t vis_embed_dim,
                                std::vector<NpuTensor>& ds_features) {
+    (void)vis_embed_dim;  // caller-side bookkeeping only; output stride is derived from config_
     auto* alloc = runtime_->GetAllocator();
 
     int64_t vis_hs = config_.vis_hidden_size;

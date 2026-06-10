@@ -16,6 +16,6 @@ REGISTER_MODEL_WITH_CHECK(qwen3vl_embedding,
     },
     IsQwen3VLCompatible,
     10  // priority
-);
+)
 
 } // namespace atb_llm

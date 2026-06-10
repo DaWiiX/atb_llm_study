@@ -19,6 +19,7 @@ static Status LoadTextLayerWeights(WeightLoader& loader,
                                    TensorAllocator& alloc,
                                    int32_t layer_idx,
                                    TextLayerWeights& w) {
+    (void)config;  // reserved for future per-layer config lookups (e.g. layer-specific quant scales)
     std::string pfx = "model.language_model.layers." + std::to_string(layer_idx) + ".";
     io::WeightLoadEntry entries[] = {
         {"self_attn.q_proj.weight", &w.q_weight},
@@ -41,6 +42,7 @@ static Status LoadVisionBlockWeights(WeightLoader& loader,
                                      TensorAllocator& alloc,
                                      int32_t block_idx,
                                      VisionBlockWeights& w) {
+    (void)config;  // reserved for future per-block config lookups
     std::string pfx = "model.visual.blocks." + std::to_string(block_idx) + ".";
     io::WeightLoadEntry entries[] = {
         {"attn.qkv.weight", &w.qkv_weight},
