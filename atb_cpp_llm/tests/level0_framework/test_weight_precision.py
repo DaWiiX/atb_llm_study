@@ -30,7 +30,10 @@ import sys
 import numpy as np
 
 # ── Configuration ────────────────────────────────────────────
-MODEL_DIR = "/mnt/workspace/gitCode/models/Qwen3-VL-Embedding-2B"
+import sys as _sys
+from pathlib import Path as _Path
+_sys.path.insert(0, str(_Path(__file__).resolve().parent.parent))
+from _tests_env import MODEL_DIR  # noqa: E402
 ST_PATH = os.path.join(MODEL_DIR, "model.safetensors")
 CPP_DUMP_PATH = "/tmp/cpp_weight_dump.txt"
 

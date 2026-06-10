@@ -44,8 +44,16 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 REPO_ROOT="$(cd "$PROJECT_DIR/.." && pwd)"
 BUILD_DIR="$PROJECT_DIR/build"
 BENCHMARK_BIN="$BUILD_DIR/benchmark"
-MODEL_DIR="${QWEN3VL_EMB_MODEL_DIR:-/mnt/workspace/gitCode/models/Qwen3-VL-Embedding-2B}"
 TOKEN_GEN_SCRIPT="$REPO_ROOT/atb_python_qwen3vl_embedding/tests/gen_baseline_tokens.py"
+
+# Load .env so QWEN3VL_EMB_MODEL_DIR is set just like build_and_test.sh does.
+if [ -f "$REPO_ROOT/.env" ]; then
+    set -a
+    # shellcheck disable=SC1090,SC1091
+    source "$REPO_ROOT/.env"
+    set +a
+fi
+MODEL_DIR="${QWEN3VL_EMB_MODEL_DIR:?QWEN3VL_EMB_MODEL_DIR is not set — add it to $REPO_ROOT/.env (see .env.example)}"
 
 # ── Timing bookkeeping ────────────────────────────────────────────────────
 BUILD_DURATION=0
@@ -250,11 +258,9 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-# ── Paths (passed via env or defaults) ──────────────────────────
-MODEL_DIR = os.environ.get("QWEN3VL_EMB_MODEL_DIR",
-                           "/mnt/workspace/gitCode/models/Qwen3-VL-Embedding-2B")
-REPO_ROOT = os.environ.get("REPO_ROOT",
-                           "/mnt/workspace/gitCode/atb_llm")
+# ── Paths (passed via env from the shell wrapper above) ─────────
+MODEL_DIR = os.environ["QWEN3VL_EMB_MODEL_DIR"]
+REPO_ROOT = os.environ["REPO_ROOT"]
 BIN_DIR = "/tmp"
 
 # ── Add Python package to path ──────────────────────────────────

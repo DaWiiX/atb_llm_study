@@ -8,7 +8,7 @@ Binary format for all tensor files:  int64 dim  +  raw data (fp16 or int32).
 For seqlen: int64(=1) + int32 value.
 
 Usage:
-    cd /mnt/workspace/gitCode/atb_llm
+    cd <repo-root>
     python3 atb_cpp_llm/tests/test_first_layer_ref.py
 """
 import sys, os, struct, pathlib
@@ -16,7 +16,9 @@ import torch
 import torch.nn.functional as F
 
 # ── Add the Python package to sys.path ────────────────────────────────
-sys.path.insert(0, "/mnt/workspace/gitCode/atb_llm")
+sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent.parent))
+from _tests_env import MODEL_DIR, REPO_ROOT  # noqa: E402
+sys.path.insert(0, str(REPO_ROOT))
 
 from atb_python_qwen3vl_embedding.utils import (
     set_atb_buffer_size, to_npu_half, to_cpu_float, make_seqlen_tensor,
@@ -36,7 +38,6 @@ from atb_python_qwen3vl_embedding.vision_pos_embed import (
     build_vision_posemb_graph, run_posemb_npu,
 )
 
-MODEL_DIR = "/mnt/workspace/gitCode/models/Qwen3-VL-Embedding-2B"
 OUT_DIR   = "/tmp"
 
 

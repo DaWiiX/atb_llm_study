@@ -3,9 +3,11 @@
 /**
  * @brief Resolve the model checkpoint directory.
  *
- * Checks the environment variable @c QWEN3VL_EMB_MODEL_DIR first; falls back
- * to the hard-coded default path.  Callers include this header once and use
- * @c GetModelDir() wherever a model directory string is required.
+ * Reads @c QWEN3VL_EMB_MODEL_DIR from the environment. @c build_and_test.sh
+ * loads `.env` at the repo root before invoking CTest, so this env var is
+ * always set in the normal workflow. If a test binary is invoked directly
+ * without that bootstrap, the call aborts with a clear error pointing at
+ * `.env` — better than silently using a stale hard-coded path.
  *
  * Usage:
  * @code
@@ -15,11 +17,18 @@
  */
 
 #include <cstdlib>
+#include <cstdio>
+#include <cstdlib>
 #include <string>
 
 inline std::string GetModelDir() {
     const char* env = std::getenv("QWEN3VL_EMB_MODEL_DIR");
     if (env && env[0] != '\0')
         return env;
-    return "/mnt/workspace/gitCode/models/Qwen3-VL-Embedding-2B";
+    std::fprintf(stderr,
+        "[test_env] QWEN3VL_EMB_MODEL_DIR is not set.\n"
+        "           Add it to <repo>/.env (see .env.example) and re-run via\n"
+        "           build_and_test.sh, or `export` it before invoking the\n"
+        "           test binary directly.\n");
+    std::abort();
 }

@@ -28,11 +28,12 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-# ── Add the Python project to path ────────────────────────────────
-PROJ_DIR = Path(__file__).resolve().parent.parent.parent.parent / "atb_python_qwen3vl_embedding"
-sys.path.insert(0, str(PROJ_DIR))
+# Repo-root + MODEL_DIR resolution lives in _tests_env (reads .env).
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from _tests_env import MODEL_DIR, REPO_ROOT  # noqa: E402
+sys.path.insert(0, str(REPO_ROOT))
 
-from engine_utils import (
+from atb_python_qwen3vl_embedding.engine_utils import (
     get_rope_index,
     TextRotaryEmbedding,
     VisionRotaryEmbedding,
@@ -40,11 +41,6 @@ from engine_utils import (
     fast_pos_embed_interpolate,
 )
 
-# ── Model dir (can be overridden) ─────────────────────────────────
-MODEL_DIR = os.environ.get(
-    "QWEN3VL_EMB_MODEL_DIR",
-    "/mnt/workspace/gitCode/models/Qwen3-VL-Embedding-2B",
-)
 
 OUTPUT_DIR = "/tmp"
 

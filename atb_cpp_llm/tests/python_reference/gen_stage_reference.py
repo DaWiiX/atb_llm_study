@@ -13,14 +13,15 @@ Usage:
     python atb_cpp_llm/tests/gen_stage_reference.py
 """
 
+import os
 import sys
 import struct
+from pathlib import Path
 import torch
 import torch.nn.functional as F
 
 # ── Constants ────────────────────────────────────────────────────────
 
-MODEL_DIR = "/mnt/workspace/gitCode/models/Qwen3-VL-Embedding-2B"
 
 # Unified test inputs
 IMG_H, IMG_W, IMG_C = 720, 1280, 3
@@ -29,7 +30,9 @@ IMAGE_TOKEN_ID = 151655
 MERGE_SIZE = 2
 SPATIAL_MERGE = 2
 
-sys.path.insert(0, "/mnt/workspace/gitCode/atb_llm")
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from _tests_env import MODEL_DIR, REPO_ROOT  # noqa: E402
+sys.path.insert(0, str(REPO_ROOT))
 
 from atb_python_qwen3vl_embedding.utils import set_atb_buffer_size
 

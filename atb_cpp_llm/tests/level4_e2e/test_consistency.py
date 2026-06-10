@@ -6,7 +6,7 @@ it against the Python ATB engine output using cosine similarity.
 
 Prerequisites:
     1. Run ./test_consistency (C++ side) first to generate /tmp/cpp_embedding.bin
-    2. Model checkpoint at /mnt/workspace/gitCode/models/Qwen3-VL-Embedding-2B/
+    2. Model checkpoint at $QWEN3VL_EMB_MODEL_DIR (set in .env)
 
 Usage:
     python tests/test_consistency.py
@@ -20,7 +20,10 @@ import torch.nn.functional as F
 
 # ── Configuration ────────────────────────────────────────────────
 CPP_OUTPUT_PATH = "/tmp/cpp_embedding.bin"
-MODEL_DIR = "/mnt/workspace/gitCode/models/Qwen3-VL-Embedding-2B"
+import sys as _sys
+from pathlib import Path as _Path
+_sys.path.insert(0, str(_Path(__file__).resolve().parent.parent))
+from _tests_env import MODEL_DIR, REPO_ROOT  # noqa: E402
 COSINE_THRESHOLD = 0.99
 
 
@@ -38,7 +41,7 @@ def load_cpp_embedding(path: str) -> tuple:
 def run_python_engine() -> torch.Tensor:
     """Run Python ATB engine with the same input and return embedding."""
     # Set buffer size before importing engine
-    sys.path.insert(0, "/mnt/workspace/gitCode/atb_llm")
+    sys.path.insert(0, str(REPO_ROOT))
     from atb_python_qwen3vl_embedding.utils import set_atb_buffer_size
     set_atb_buffer_size(10 * 1024 * 1024 * 1024)
 

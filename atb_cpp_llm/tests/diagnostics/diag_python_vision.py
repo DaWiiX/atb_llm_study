@@ -7,14 +7,16 @@ import torch
 import numpy as np
 import torch.nn.functional as F
 
-sys.path.insert(0, "/mnt/workspace/gitCode/atb_llm")
+from pathlib import Path as _Path
+sys.path.insert(0, str(_Path(__file__).resolve().parent.parent))
+from _tests_env import MODEL_DIR, REPO_ROOT  # noqa: E402
+sys.path.insert(0, str(REPO_ROOT))
 from atb_python_qwen3vl_embedding.utils import set_atb_buffer_size
 set_atb_buffer_size(10 * 1024 * 1024 * 1024)
 
 from atb_python_qwen3vl_embedding.engine import Qwen3VLEngine
 from atb_python_qwen3vl_embedding.preprocess import preprocess_image
 
-MODEL_DIR = "/mnt/workspace/gitCode/models/Qwen3-VL-Embedding-2B"
 IMG_H, IMG_W, IMG_C = 720, 1280, 3
 
 

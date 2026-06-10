@@ -15,7 +15,10 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-sys.path.insert(0, '/mnt/workspace/gitCode/atb_llm')
+from pathlib import Path as _Path
+sys.path.insert(0, str(_Path(__file__).resolve().parent.parent))
+from _tests_env import MODEL_DIR, REPO_ROOT, CPP_BUILD_DIR  # noqa: E402
+sys.path.insert(0, str(REPO_ROOT))
 os.environ['TRANSFORMERS_VERBOSITY'] = 'error'
 
 # ═══════════════════════════════════════════════════════════
@@ -30,8 +33,6 @@ parser.add_argument('--all-seqs', action='store_true',
                     help='Test multiple sequence lengths: 4, 16, 64, 256, 1024')
 args = parser.parse_args()
 
-MODEL_DIR = "/mnt/workspace/gitCode/models/Qwen3-VL-Embedding-2B"
-CPP_BUILD_DIR = "/mnt/workspace/gitCode/atb_llm/atb_cpp_llm/build"
 CPP_BENCHMARK = os.path.join(CPP_BUILD_DIR, "benchmark")
 
 def stats_ms(arr):

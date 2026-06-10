@@ -36,13 +36,14 @@ import torch
 import torch.nn.functional as F
 
 # ── Paths ────────────────────────────────────────────────────
-PROJECT_DIR = "/mnt/workspace/gitCode/atb_llm/atb_cpp_llm"
+import sys as _sys
+from pathlib import Path as _Path
+_sys.path.insert(0, str(_Path(__file__).resolve().parent.parent))
+from _tests_env import MODEL_DIR as _RESOLVED_MODEL_DIR, REPO_ROOT  # noqa: E402
+PROJECT_DIR = str(REPO_ROOT / "atb_cpp_llm")
 BUILD_DIR = os.path.join(PROJECT_DIR, "build")
 BENCHMARK_BIN = os.path.join(BUILD_DIR, "benchmark")
-MODEL_DIR = os.environ.get(
-    "QWEN3VL_EMB_MODEL_DIR",
-    "/mnt/workspace/gitCode/models/Qwen3-VL-Embedding-2B"
-)
+MODEL_DIR = _RESOLVED_MODEL_DIR
 BIN_DIR = "/tmp"
 
 # ── Sync configurations ──────────────────────────────────────

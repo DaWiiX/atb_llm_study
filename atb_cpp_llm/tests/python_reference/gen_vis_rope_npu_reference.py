@@ -39,9 +39,11 @@ import numpy as np
 import torch
 
 PROJ_DIR = Path(__file__).resolve().parent.parent.parent.parent / "atb_python_qwen3vl_embedding"
-sys.path.insert(0, str(PROJ_DIR))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from _tests_env import MODEL_DIR, REPO_ROOT  # noqa: E402
+sys.path.insert(0, str(REPO_ROOT))
 
-from engine_utils import VisionRotaryEmbedding, compute_rot_pos_emb
+from atb_python_qwen3vl_embedding.engine_utils import VisionRotaryEmbedding, compute_rot_pos_emb
 
 OUTPUT_DIR = "/tmp"
 

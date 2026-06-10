@@ -11,7 +11,8 @@ import struct, os
 from PIL import Image
 from transformers import AutoProcessor
 
-MODEL_DIR = "/mnt/workspace/gitCode/models/Qwen3-VL-Embedding-2B"
+# Single source of truth for MODEL_DIR is .env via env.py.
+from atb_python_qwen3vl_embedding.env import QWEN3VL_EMB_MODEL_DIR as MODEL_DIR
 BIN_DIR = "/tmp"
 
 # ~500 token text
