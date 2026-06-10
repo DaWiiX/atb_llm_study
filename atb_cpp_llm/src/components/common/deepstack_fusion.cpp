@@ -95,7 +95,7 @@ Status DeepstackFusion::ExtractFeatures(
 
     uint8_t* ws_ptr = nullptr;
     if (ws_size > 0) {
-        auto [ws, ws_s] = runtime->GetWorkspace(ws_size);
+        auto __atb_pair_ws = runtime->GetWorkspace(ws_size); auto& ws = __atb_pair_ws.first; auto& ws_s = __atb_pair_ws.second;
         ws_ptr = ws;
         if (ws_s != STATUS_OK || ws_ptr == nullptr) {
             LOG_ERROR("Failed to get workspace for DeepstackMerger: %zu bytes",
@@ -103,7 +103,7 @@ Status DeepstackFusion::ExtractFeatures(
             return ERROR_NPU_MEMORY;
         }
     } else {
-        auto [ws, ws_s] = runtime->GetWorkspace(1);
+        auto __atb_pair_ws = runtime->GetWorkspace(1); auto& ws = __atb_pair_ws.first; auto& ws_s = __atb_pair_ws.second;
         if (ws_s == STATUS_OK && ws != nullptr) {
             ws_ptr = ws;
             ws_size = 1;
@@ -203,7 +203,7 @@ void DeepstackFusion::InjectFeatures(NpuTensor& hidden_npu,
         return;
     }
     uint8_t* ws_ptr = nullptr;
-    auto [ws, ws_st] = runtime->GetWorkspace(ws_size > 0 ? ws_size : 1);
+    auto __atb_pair_ws = runtime->GetWorkspace(ws_size > 0 ? ws_size : 1); auto& ws = __atb_pair_ws.first; auto& ws_st = __atb_pair_ws.second;
     if (ws_st == STATUS_OK) ws_ptr = ws;
     atb_s = inject_op_.get()->Execute(vp, ws_ptr, ws_size, ctx);
     if (atb_s != atb::NO_ERROR) {

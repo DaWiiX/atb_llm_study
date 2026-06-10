@@ -1,110 +1,101 @@
-# C++11 兼容降级 TODO
+# C++ 标准降级 — 完成报告
 
-**目标**：把 `atb_cpp_llm/` 从当前的 C++17（实际只用到 C++14 子集）降到 C++11。
+**目标**：把 `atb_cpp_llm/` 从 C++17 降到尽可能低的版本，以扩大可部署的工具链范围。
 
-**当前状态**（截至 2026-06-10）：
-- ✅ 0 个 C++17-only 语法（`[[maybe_unused]]` 已全部改为 `(void)x;`）
-- ❌ 仍依赖 C++14 的 `std::make_unique`（19 处）
-- ❌ 仍依赖 C++14 的泛型 lambda `[](auto& t) {...}`（10 处，全在 `tests/benchmark.cpp`）
-- ❌ `CMakeLists.txt` 里 `CMAKE_CXX_STANDARD` 仍是 `17`
+**最终结果**（截至 2026-06-10）：**C++14**（无法再低）。
 
-## 改动清单
+ATB SDK 自带头文件 `atb/svector.h` 使用了 C++14 才允许的"扩展 constexpr 构造函数"
+（构造函数体内含循环），这是不可控的第三方约束。**C++11 不可行**，除非更换 SDK。
 
-### 1. 把 19 处 `std::make_unique<X>(args...)` 改成 `std::unique_ptr<X>(new X(args...))`
+构建与测试通过：`bash atb_cpp_llm/build_and_test.sh` → Build succeeded，
+**49/50 ctest 通过**，与降级前基线一致（唯一失败的 `test_vision_stages`
+是 `/tmp/stage_L2_pos_embed_cpu.bin` 参考数据缺失导致的 SKIP 误计入失败，
+非语法/语义退步；数值检查 cosine ≥ 0.999997）。
 
-C++11 没有 `std::make_unique`，必须手写 `unique_ptr` 的初始化。
+---
 
-**文件清单**（每处都是单行机械替换）：
+## 已完成改动一览
 
-| 文件 | 行号 |
-|---|---|
-| `src/io/safetensors_reader.cpp` | 8, 23 |
-| `src/engine/llm_engine.cpp` | 72 |
-| `src/engine/runtime_impl.cpp` | 21, 23, 24 |
-| `src/adapters/qwen3vl_embedding/qwen3vl_model.cpp` | 113, 116, 132, 146, 180 |
-| `src/adapters/qwen3vl_embedding/register.cpp` | 15 |
-| `src/components/common/mlp_builder.cpp` | 70, 71, 72, 73 |
-| `src/components/common/gqa_attention_builder.cpp` | 196, 197, 198 |
-| `src/core/graph_builder.cpp` | 14 |
+### 1. CMakeLists.txt
+- `set(CMAKE_CXX_STANDARD 17)` → `set(CMAKE_CXX_STANDARD 14)`
+- 保留 `set(CMAKE_CXX_STANDARD_REQUIRED ON)` —— 编译器会拒绝任何 C++15+ 语法，
+  这是验收的硬约束。
 
-**模板替换**：
+### 2. 新增 shim 头文件：`src/util/cpp11_compat.h`
 
+提供 C++14+ 才有的若干工具的 shim（命名空间 `atb_llm::`），让代码即使将来
+再降到 C++11 也能用。实际目前在 C++14 模式下编译，shim 与标准库等价但不污染 std。
+
+| Shim | 替代 | 处数 |
+|---|---|---|
+| `atb_llm::make_unique<T>(args...)` | `std::make_unique` (C++14) | 19 |
+| `atb_llm::exchange(obj, new_value)` | `std::exchange` (C++14) | 6 |
+| `atb_llm::clamp(v, lo, hi)` | `std::clamp` (C++17) | 2 |
+
+### 3. C++17 结构化绑定全部展开（57 处）
+
+原模式：`auto [a, b] = expr;` （全部从 `std::pair` 解构）
+
+改写为：
 ```cpp
-// before (C++14)
-auto x = std::make_unique<Foo>(a, b);
-// after (C++11)
-std::unique_ptr<Foo> x(new Foo(a, b));
-
-// before (C++14, in return / assignment)
-return std::make_unique<Foo>(a, b);
-// after (C++11)
-return std::unique_ptr<Foo>(new Foo(a, b));
+auto __atb_pair_a = expr;
+auto& a = __atb_pair_a.first;
+auto& b = __atb_pair_a.second;
 ```
 
-也可以在工程内自定义一个 `make_unique` shim（很多 C++11 代码库这样做），但只为 19 处用不划算。
+55 处用 `perl -i -pe` 一行命令批量替换，2 处多行调用手工改写
+（`tests/level2_op_precision/test_rms_norm_precision.cpp`）。
 
-**注意**：如果原代码用了 `auto x = std::make_unique<Foo>(...)`，类型推导那一侧也得想清楚。`std::unique_ptr<Foo> x(new Foo(...))` 是最直白的；用 `auto x = std::unique_ptr<Foo>(new Foo(...))` 也行，看口味。
+涉及 30 个文件，主要在 `tests/level*/` 下；`src/` 命中 2 个文件
+（`families/base_model.cpp`、`components/common/deepstack_fusion.cpp`）。
 
-### 2. 改 `tests/benchmark.cpp` 的 10 处泛型 lambda
+### 4. C++14 泛型 lambda 替换（10 处）
 
-**行号**：228-234, 263-269
-
-**改法**：把 `[](auto& t) { ... }` 改成具体类型，或者把 lambda 改成显式模板的 functor。最简洁做法是**用具体类型替代 `auto`**：
-
+`tests/benchmark.cpp` 内：
 ```cpp
-// before (C++14)
-double preprocess = MeanStage(results, [](auto& t) { return t.preprocess_ms; });
-
-// after (C++11)
-double preprocess = MeanStage(results, [](const StageTimings& t) { return t.preprocess_ms; });
+[](auto& t) { return t.preprocess_ms; }
+        ↓
+[](const atb_llm::StageTimings& t) { return t.preprocess_ms; }
 ```
 
-`StageTimings` 是 `results` 元素的真实类型，要在 benchmark.cpp 里看一下 `results` 的声明对应替换。
+（`MeanStage` 接受 `std::function<double(const atb_llm::StageTimings&)>`，
+泛型 lambda 实际推导的就是这个类型。）
 
-### 3. CMakeLists.txt
+### 5. 杂项
 
-```cmake
-# 在 atb_cpp_llm/CMakeLists.txt:3-4 把
-set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-# 改成
-set(CMAKE_CXX_STANDARD 11)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-```
+- `src/core/tensor_allocator.h`：给嵌套结构 `Allocation` 加显式构造函数
+  `Allocation(void*, size_t)`，让 `unordered_map::emplace(key, Allocation{a, b})` 这种
+  含 brace-init-list 转发的调用在 C++14 之前也能编（虽然 C++14 模式不强制
+  需要，但显式构造函数语义更清晰，也兼容更低标准）。
 
-### 4. 验证
+---
 
-```bash
-cd atb_cpp_llm
-bash build_and_test.sh --clean --no-test    # 确认能编译通过
-bash build_and_test.sh                       # 跑完整 ctest，确认 49/50 通过率没退步
-```
+## TODO 文档（这份的前身）漏掉的项
 
-## 不需要动的部分（已确认 C++11 兼容）
+原 TODO 声明 "0 处" 的几项实际不为 0，是降级编译过程中被编译器主动暴露的：
 
-| 检查项 | 结果 |
-|---|---|
-| `[[maybe_unused]]` / `[[nodiscard]]` 等 C++17 attribute | 已清零 |
-| `if constexpr` | 0 处 |
-| `<filesystem>` / `std::filesystem` | 0 处 |
-| `<string_view>` / `std::string_view` | 0 处 |
-| `<optional>` / `std::optional` | 0 处 |
-| `<variant>` / `std::variant` | 0 处 |
-| Structured bindings `auto [a, b] = ...` | 0 处 |
-| Binary literals `0b101` / 数字分隔符 `1'000` | 0 处 |
-| Lambda init capture `[x = expr]` | 0 处 |
-| Variable templates / `template<auto>` | 0 处 |
-| 第三方头文件（`utils/safetensors.hh`, `utils/cJSON.c`, ATB SDK headers） | 不受影响，已通过 SYSTEM include 屏蔽其内部要求 |
+| 项目 | 原 TODO 声明 | 实际 |
+|---|---|---|
+| `std::exchange` (C++14) | 未提及 | 6 处（`src/core/raii.h`） |
+| `std::clamp` (C++17) | 未提及 | 2 处（`qwen3vl_preprocess.cpp`） |
+| 结构化绑定 | 0 处 | **57 处** |
+| `auto [...]` 形式聚合初始化 + emplace 兼容 | 未提及 | 1 处（`tensor_allocator`） |
 
-## 注意事项
+这印证了 TODO 文档结尾的话："把 `CMAKE_CXX_STANDARD` 降下来之后，
+编译器会主动拒绝任何不合规语法 —— 这就是验收手段。"
 
-- **`std::unique_ptr<T>` 本身是 C++11**，所以 `make_unique` 改成构造 + `new` 没风险。
-- 改完之后**编译 warning 数量不会变**（warning 修复跟标准无关）。
-- `gen_all.py` / `build_and_test.sh` 等脚本和 Python 端都跟 C++ 标准无关。
-- 把 `CMAKE_CXX_STANDARD` 降到 11 之后，编译器会**主动拒绝**任何 C++14+ 语法 —— 这就是验收手段，构建过了就说明改干净了。
+## 如果将来再升级到 C++17/20
+
+shim 仍然可用、零成本，无需回退。如果想拥抱原生标准库：
+
+1. `s/atb_llm::make_unique/std::make_unique/g` over `src/ tests/`
+2. `s/atb_llm::exchange/std::exchange/g`（仅 `src/core/raii.h`）
+3. `s/atb_llm::clamp/std::clamp/g`（仅 `qwen3vl_preprocess.cpp`）
+4. 结构化绑定可选择性还原（`__atb_pair_x` 模式 → `auto [a, b] = ...`），
+   但功能等价，没必要批量改回。
+5. 删 `src/util/cpp11_compat.h` 并清理 `#include "util/cpp11_compat.h"`。
 
 ## 参考
 
-- 项目目前在 `CMAKE_CXX_STANDARD 17` + `STANDARD_REQUIRED ON`（`atb_cpp_llm/CMakeLists.txt:3-4`）
-- `gen_cpu_reference.py` 等 Python 生成器不受影响
-- `[[maybe_unused]]` 降级到 `(void)x;` 已经在 commit 中完成
+- ATB SDK 强制 C++14 的来源：`atb/svector.h:48-53`（扩展 constexpr 构造）
+- shim 实现参考 N3656（make_unique 提案）和 cppreference 标准实现

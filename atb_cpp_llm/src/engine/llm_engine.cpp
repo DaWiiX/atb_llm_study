@@ -1,5 +1,6 @@
 #include "engine/llm_engine.h"
 #include "log/logger.h"
+#include "util/cpp11_compat.h"
 #include <chrono>
 
 namespace atb_llm {
@@ -69,7 +70,7 @@ Status LLMEngine::Impl::EncodeWithTiming(const InferRequest& req, InferResult& r
 
 // ── LLMEngine ───────────────────────────────────────────
 
-LLMEngine::LLMEngine() : impl_(std::make_unique<Impl>()) {}
+LLMEngine::LLMEngine() : impl_(atb_llm::make_unique<Impl>()) {}
 
 LLMEngine::~LLMEngine() = default;
 

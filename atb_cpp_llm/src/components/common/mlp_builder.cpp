@@ -4,6 +4,7 @@
 #include "ops/activation_op.h"
 #include "ops/elewise_op.h"
 #include "log/logger.h"
+#include "util/cpp11_compat.h"
 
 namespace atb_llm {
 namespace components {
@@ -67,10 +68,10 @@ Status SwiGluBuilder::Build(const std::string& name,
 // ── Factory ────────────────────────────────────────────────────
 std::unique_ptr<IMlpBuilder> CreateMlpBuilder(MlpType type) {
     switch (type) {
-    case MlpType::SwiGLU: return std::make_unique<SwiGluBuilder>();
-    case MlpType::GeGLU:  return std::make_unique<GeGluBuilder>();
-    case MlpType::GELU:   return std::make_unique<GeluBuilder>();
-    case MlpType::MoE:    return std::make_unique<MoeBuilder>();
+    case MlpType::SwiGLU: return atb_llm::make_unique<SwiGluBuilder>();
+    case MlpType::GeGLU:  return atb_llm::make_unique<GeGluBuilder>();
+    case MlpType::GELU:   return atb_llm::make_unique<GeluBuilder>();
+    case MlpType::MoE:    return atb_llm::make_unique<MoeBuilder>();
     default:               return nullptr;
     }
 }

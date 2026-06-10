@@ -187,7 +187,7 @@ void RunBlockTest(const std::string& prefix, const std::string& test_label) {
     REQUIRE(op.get()->Setup(vp, ws_size, ctx) == atb::NO_ERROR);
     uint8_t* ws_ptr = nullptr;
     if (ws_size > 0) {
-        auto [ws, ws_st] = runtime->GetWorkspace(ws_size);
+        auto __atb_pair_ws = runtime->GetWorkspace(ws_size); auto& ws = __atb_pair_ws.first; auto& ws_st = __atb_pair_ws.second;
         REQUIRE(IS_OK(ws_st));
         ws_ptr = ws;
     }

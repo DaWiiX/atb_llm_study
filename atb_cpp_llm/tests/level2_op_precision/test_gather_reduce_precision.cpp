@@ -134,7 +134,7 @@ TEST_CASE("GatherOp precision: axis=0 [8,4] indices=[2,5,0]") {
     REQUIRE(op.get()->Setup(vp, ws_size, ctx) == atb::NO_ERROR);
     uint8_t* ws = nullptr;
     if (ws_size > 0) {
-        auto [w, st] = runtime->GetWorkspace(ws_size);
+        auto __atb_pair_w = runtime->GetWorkspace(ws_size); auto& w = __atb_pair_w.first; auto& st = __atb_pair_w.second;
         REQUIRE(IS_OK(st));
         ws = w;
     }
@@ -177,7 +177,7 @@ std::vector<float> RunReduce(atb_llm::IRuntime* runtime,
     REQUIRE(op.get()->Setup(vp, ws_size, ctx) == atb::NO_ERROR);
     uint8_t* ws = nullptr;
     if (ws_size > 0) {
-        auto [w, st] = runtime->GetWorkspace(ws_size);
+        auto __atb_pair_w = runtime->GetWorkspace(ws_size); auto& w = __atb_pair_w.first; auto& st = __atb_pair_w.second;
         REQUIRE(IS_OK(st));
         ws = w;
     }
@@ -229,7 +229,7 @@ std::vector<float> RunReduceBf16(atb_llm::IRuntime* runtime,
     REQUIRE(op.get()->Setup(vp, ws_size, ctx) == atb::NO_ERROR);
     uint8_t* ws = nullptr;
     if (ws_size > 0) {
-        auto [w, st] = runtime->GetWorkspace(ws_size);
+        auto __atb_pair_w = runtime->GetWorkspace(ws_size); auto& w = __atb_pair_w.first; auto& st = __atb_pair_w.second;
         REQUIRE(IS_OK(st));
         ws = w;
     }

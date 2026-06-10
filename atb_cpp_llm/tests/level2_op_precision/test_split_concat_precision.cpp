@@ -109,7 +109,7 @@ TEST_CASE("SplitOp precision: dim=-1 num=2 [4,8]") {
     REQUIRE(op.get()->Setup(vp, ws_size, ctx) == atb::NO_ERROR);
     uint8_t* ws = nullptr;
     if (ws_size > 0) {
-        auto [w, st] = runtime->GetWorkspace(ws_size);
+        auto __atb_pair_w = runtime->GetWorkspace(ws_size); auto& w = __atb_pair_w.first; auto& st = __atb_pair_w.second;
         REQUIRE(IS_OK(st));
         ws = w;
     }
@@ -166,7 +166,7 @@ TEST_CASE("SplitOp precision: dim=-1 num=3 [2,9]") {
     REQUIRE(op.get()->Setup(vp, ws_size, ctx) == atb::NO_ERROR);
     uint8_t* ws = nullptr;
     if (ws_size > 0) {
-        auto [w, st] = runtime->GetWorkspace(ws_size);
+        auto __atb_pair_w = runtime->GetWorkspace(ws_size); auto& w = __atb_pair_w.first; auto& st = __atb_pair_w.second;
         REQUIRE(IS_OK(st));
         ws = w;
     }
@@ -227,7 +227,7 @@ TEST_CASE("ConcatOp precision: dim=0 [3,4]+[3,4]") {
     REQUIRE(op.get()->Setup(vp, ws_size, ctx) == atb::NO_ERROR);
     uint8_t* ws = nullptr;
     if (ws_size > 0) {
-        auto [w, st] = runtime->GetWorkspace(ws_size);
+        auto __atb_pair_w = runtime->GetWorkspace(ws_size); auto& w = __atb_pair_w.first; auto& st = __atb_pair_w.second;
         REQUIRE(IS_OK(st));
         ws = w;
     }
@@ -276,7 +276,7 @@ TEST_CASE("ConcatOp precision: dim=-1 [4,3]+[4,3]") {
     REQUIRE(op.get()->Setup(vp, ws_size, ctx) == atb::NO_ERROR);
     uint8_t* ws = nullptr;
     if (ws_size > 0) {
-        auto [w, st] = runtime->GetWorkspace(ws_size);
+        auto __atb_pair_w = runtime->GetWorkspace(ws_size); auto& w = __atb_pair_w.first; auto& st = __atb_pair_w.second;
         REQUIRE(IS_OK(st));
         ws = w;
     }

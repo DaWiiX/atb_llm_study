@@ -386,7 +386,7 @@ static bool TestL1_PatchEmbed(int& passed, int& failed,
 
     // Allocate workspace on device
     {
-        auto [ws_ptr, ws_s] = runtime->GetWorkspace(ws_size > 0 ? ws_size : 1);
+        auto __atb_pair_ws_ptr = runtime->GetWorkspace(ws_size > 0 ? ws_size : 1); auto& ws_ptr = __atb_pair_ws_ptr.first; auto& ws_s = __atb_pair_ws_ptr.second;
         if (ws_s != atb_llm::STATUS_OK || !ws_ptr) {
             LOG_ERROR("  Workspace allocation failed: %lu bytes", static_cast<unsigned long>(ws_size));
             failed++;

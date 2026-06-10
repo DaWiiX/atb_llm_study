@@ -66,6 +66,9 @@ private:
     struct Allocation {
         void* device_ptr = nullptr;
         size_t size = 0;
+
+        Allocation() = default;
+        Allocation(void* ptr, size_t sz) : device_ptr(ptr), size(sz) {}
     };
     std::unordered_map<void*, Allocation> allocations_;
 

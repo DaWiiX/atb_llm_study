@@ -178,7 +178,8 @@ void TensorAllocator::Free(atb::Tensor& tensor) {
 }
 
 void TensorAllocator::FreeAll() {
-    for (auto& [ptr, alloc] : allocations_) {
+    for (auto it = allocations_.begin(); it != allocations_.end(); ++it) {
+        Allocation& alloc = it->second;
         if (alloc.device_ptr) {
             aclrtFree(alloc.device_ptr);
             alloc.device_ptr = nullptr;
