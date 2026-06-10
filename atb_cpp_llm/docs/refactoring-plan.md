@@ -489,6 +489,14 @@ After:   49/50 passed (1 failed: test_vision_stages L1 ATB Setup errcode 16)
 
 > **教训**：所有应该被 `.env` 配置的变量都用 `${VAR:?message}` 而非 `${VAR:-default}`。`build_and_test.sh` source `.env` 后用 `${QWEN3VL_EMB_MODEL_DIR:?...}` 强制要求设置。
 
+#### 4.17 参考数据生成器的 import 风格必须统一
+
+**症状**：`gen_all.py` 阶段报 `ModuleNotFoundError: No module named 'preprocess'`，退出了整个测试流程。
+
+**根因**：`gen_cpu_reference.py` 在第 367 和 523 行用了 bare `from preprocess import smart_resize` / `from preprocess import preprocess_image`。但 `preprocess.py` 在 `atb_python_qwen3vl_embedding/` 下，该目录不在 `sys.path` 中——只有 repo root 在。所有其他生成器脚本（`gen_stage_reference.py`、`test_stage_reference.py`、`gen_pos_embed_npu_reference.py` 等）都用的是全限定 `from atb_python_qwen3vl_embedding.preprocess import ...`。历史遗留的裸 import 被 `build_and_test.sh` 默认刷新模式暴露了出来。
+
+> **教训**：同一目录下的跨模块 Python import 必须统一风格。Path-rewrite codemod（如替换 sys.path）写完后必须把**跨模块 import** 也全部改成标准包路径。光 `python -c "import py_compile"` 不够，要真正 import 一次跑通。用 `grep -rn "from preprocess import\|from engine import\|from engine_utils import" tests/python_reference/` 搜一遍确认没有裸 import。
+
 ---
 
 ## 6'. 缺失测试复盘（续）

@@ -128,6 +128,22 @@ source /usr/local/Ascend/nnal/atb/set_env.sh --cxx_abi=1
 export ATB_BUILD_DEPENDENCY_PATH=/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1
 ```
 
+### Python 参考数据生成器 import 规范
+
+`atb_cpp_llm/tests/python_reference/` 下的 Python 脚本通过 `gen_all.py` 编排生成 C++ 测试用的 `.bin` 参考数据。所有引用 `atb_python_qwen3vl_embedding` 包的 import **必须使用全限定路径**：
+
+```python
+# ✅ 正确（所有生成器统一风格）
+from atb_python_qwen3vl_embedding.preprocess import smart_resize
+from atb_python_qwen3vl_embedding.engine_utils import get_rope_index
+
+# ❌ 错误（裸 import 在 gen_all.py 编排下会 ModuleNotFoundError）
+from preprocess import smart_resize
+from engine_utils import get_rope_index
+```
+
+这是因为 `gen_all.py` 从 repo root 调用子进程，`sys.path` 里只有 repo root，没有 `atb_python_qwen3vl_embedding/` 子目录。验收：`python tests/python_reference/gen_all.py` 5/5 生成器全部 OK。
+
 ### 查阅昇腾/CANN/ATB 文档的标准方法
 
 **环境说明**: Linux Arm64 (aarch64)，Chrome 不可用。Playwright 使用 Firefox。需要先 `cd /tmp && npm install playwright`（已有则跳过），然后将脚本写入 `/tmp/playwright_test.js` 用 `node` 执行。
