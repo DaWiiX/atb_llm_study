@@ -122,36 +122,40 @@ python tests/benchmark.py --iter 50 --warmup 10
 
 ```bash
 cd atb_cpp_llm
-bash build_and_test.sh                  # Release + 自动生成参考数据 + 跑所有 CTest
-bash build_and_test.sh --debug          # Debug 构建
-bash build_and_test.sh --clean          # 清掉 build/ 重建
-bash build_and_test.sh --no-test        # 只构建不跑测试
-bash build_and_test.sh --no-refdata     # 跳过参考数据生成（用已有的 /tmp/*.bin）
-bash build_and_test.sh --refresh-refdata # 强制重新生成所有参考数据
+bash build_and_test.sh                      # Release + 默认每次刷新参考数据 + 跑所有 CTest
+bash build_and_test.sh --debug              # Debug 构建
+bash build_and_test.sh --clean              # 清掉 build/ 重建
+bash build_and_test.sh --no-test            # 只构建不跑测试
+bash build_and_test.sh --no-refresh-refdata # 复用 /tmp 已有参考数据（缺则自动 fallback）
+bash build_and_test.sh --no-refdata         # 跳过生成且主动排除 27 个依赖参考数据的测试
+bash build_and_test.sh --refresh-refdata    # 显式刷新（等价于默认）
 ```
 
 **快速迭代（不重 build，只跑你关心的测试）**：
 
 ```bash
-bash build_and_test.sh --test-only                       # 跳过 build，跑全部测试
-bash build_and_test.sh --test-only level1_cpu_pure       # 只跑 Level 1
-bash build_and_test.sh --test-only test_vision_stages    # 只跑 1 个测试
-bash build_and_test.sh --test-only test_bin_format test_text_model  # 跑多个
-bash build_and_test.sh --test-only -v test_vision_stages # 加 -v 看完整输出
-bash build_and_test.sh --list                            # 列出所有测试 + label
+bash build_and_test.sh --test-only --no-refresh-refdata                       # 复用 refdata，跑全部
+bash build_and_test.sh --test-only --no-refresh-refdata level1_cpu_pure       # 只跑 Level 1
+bash build_and_test.sh --test-only --no-refresh-refdata test_vision_stages    # 只跑 1 个测试
+bash build_and_test.sh --test-only --no-refresh-refdata test_bin_format test_text_model  # 跑多个
+bash build_and_test.sh --test-only --no-refresh-refdata -v test_vision_stages # 加 -v 看完整输出
+bash build_and_test.sh --list                                                 # 列出所有测试 + label
 ```
 
-位置参数自动识别：命中 `level0_framework`/`level1_cpu_pure`/`level2_op_precision`/`level3_integration`/`level4_e2e` 当作 level 过滤，否则当作测试名过滤。详细规则和注意事项见 [`atb_cpp_llm/docs/testing-guide.md` § 一·五](atb_cpp_llm/docs/testing-guide.md)。
+- **位置参数自动识别**：命中 `level0_framework` / `level1_cpu_pure` / `level2_op_precision` / `level3_integration` / `level4_e2e` 当作 level 过滤，否则当作测试名过滤。
+- **参考数据三态**：默认每次刷新（~90s），`--no-refresh-refdata` 复用已有（缺失自动 fallback 到 `--no-refdata`），`--no-refdata` 主动排除 27 个依赖参考数据的测试并打印清单。
+
+详细规则、维护契约、边界用例见 [`atb_cpp_llm/docs/testing-guide.md` § 一·五](atb_cpp_llm/docs/testing-guide.md)。
 
 脚本会：
 
 1. 加载仓库根目录的 `.env`；
 2. Source `~/Ascend/` 或 `/usr/local/Ascend/` 下的 CANN/ATB 环境脚本；
 3. 用 CMake 配置 + 并行构建；
-4. **首次运行时**自动调 `tests/python_reference/gen_all.py` 生成 5 类参考数据到 `/tmp/`（约 ~90 秒；后续 `--skip-fresh` 跳过已存在的文件）；
+4. **默认每次运行**都重新生成全部参考数据到 `/tmp/`（约 ~90 秒，详见下文"参考数据三种模式"）；
 5. 检测到 `npu-smi` 才会跑 CTest（避免在无 NPU 主机上失败）。
 
-**为什么需要参考数据？** C++ 端 Level1/Level2/Level3/Level4 的精度测试都是和 Python 参考实现做对比，参考值由 `gen_*_reference.py` 在 NPU 上跑 Python 模型后写到 `/tmp/cpu_*.bin`、`/tmp/stage_*.bin`、`/tmp/posembed_npu_*.bin`、`/tmp/visrope_npu_*.bin`。不生成数据，~20 个测试会因 `Cannot open /tmp/*.bin` 直接 FAIL。
+**为什么需要参考数据？** C++ 端 Level1/Level2/Level3/Level4 的 27 个精度测试都是和 Python 参考实现做对比，参考值由 `gen_*_reference.py` 在 NPU 上跑 Python 模型后写到 `/tmp/cpu_*.bin`、`/tmp/stage_*.bin`、`/tmp/posembed_npu_*.bin`、`/tmp/visrope_npu_*.bin`。**注意**：这 27 个测试在数据缺失时会走 `LOG_ERROR(SKIP) + return` 静默"通过"——所以脚本默认每次刷新，加 `--no-refresh-refdata` 可以复用已有数据（缺则自动 fallback 到 `--no-refdata` 模式主动排除它们）。
 
 手动单独生成参考数据：
 
@@ -159,7 +163,8 @@ bash build_and_test.sh --list                            # 列出所有测试 + 
 # 一次生成全部（5 个生成器串行；每个独立进程避免 set_atb_buffer_size 冲突）
 python atb_cpp_llm/tests/python_reference/gen_all.py
 
-# 仅生成缺失的（已存在的跳过）
+# gen_all.py 自身的 --skip-fresh: 跳过哨兵文件已存在的生成器（脚本默认 mode 不传这个 flag，
+# 用户在脚本层用 --no-refresh-refdata 控制，详见 atb_cpp_llm/docs/testing-guide.md § 一·五 #8）
 python atb_cpp_llm/tests/python_reference/gen_all.py --skip-fresh
 ```
 
