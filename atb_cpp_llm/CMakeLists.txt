@@ -183,6 +183,16 @@ function(add_atb_test name source)
     # Register as CTest target unless it's a benchmark
     if(NOT name MATCHES "^bench_")
         add_test(NAME ${name} COMMAND ${name})
+        # Auto-derive a CTest label from the source path:
+        #   tests/level1_cpu_pure/foo.cpp  →  label "level1_cpu_pure"
+        # This is what powers `build_and_test.sh level1_cpu_pure` (uses
+        # `ctest -L`). Keep .cpp files under tests/levelN_<tag>/ to inherit
+        # the label automatically — no manual config needed when adding tests.
+        get_filename_component(_test_dir "${source}" DIRECTORY)
+        get_filename_component(_test_label "${_test_dir}" NAME)
+        if(_test_label MATCHES "^level[0-9]")
+            set_tests_properties(${name} PROPERTIES LABELS "${_test_label}")
+        endif()
     endif()
 endfunction()
 
@@ -273,6 +283,8 @@ target_link_directories(test_io_adapters
 )
 target_link_libraries(test_io_adapters PRIVATE atb_llm_engine atb ascendcl)
 add_test(NAME test_io_adapters COMMAND test_io_adapters)
+# Match the label scheme used by add_atb_test() above.
+set_tests_properties(test_io_adapters PROPERTIES LABELS "level0_framework")
 
 # Benchmarks (not registered as CTest tests)
 add_atb_test(benchmark                 tests/benchmark.cpp)  # stays at tests/ root

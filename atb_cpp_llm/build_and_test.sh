@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────
-# atb_cpp_llm — one-shot build & test driver
+# atb_cpp_llm — build & test driver
 #
 # What it does:
 #   1. Loads `.env` from the repo root (or this project dir).
@@ -17,15 +17,43 @@
 #     libs — that is expected; we surface the failure).
 #   - Skips test execution and prints how to run it on an NPU host.
 #
-# Usage:
+# Usage (full build + test):
 #   bash atb_cpp_llm/build_and_test.sh
 #   bash atb_cpp_llm/build_and_test.sh --debug
 #   bash atb_cpp_llm/build_and_test.sh --clean
 #   bash atb_cpp_llm/build_and_test.sh --no-test         # build only
 #   bash atb_cpp_llm/build_and_test.sh --no-refdata      # skip the reference-data step
 #   bash atb_cpp_llm/build_and_test.sh --refresh-refdata # regenerate every reference bin
+#
+# Fast iteration (skip build, run only what you want):
+#   bash atb_cpp_llm/build_and_test.sh --test-only                       # rerun all tests, no build
+#   bash atb_cpp_llm/build_and_test.sh --test-only level1_cpu_pure       # one level
+#   bash atb_cpp_llm/build_and_test.sh --test-only level1_cpu_pure level3_integration
+#   bash atb_cpp_llm/build_and_test.sh --test-only test_bin_format test_text_model
+#   bash atb_cpp_llm/build_and_test.sh --test-only level1_cpu_pure test_text_model
+#       (mixing both: level filter AND name filter — ctest intersects them)
+#   bash atb_cpp_llm/build_and_test.sh --list            # list registered tests + labels
+#   bash atb_cpp_llm/build_and_test.sh --test-only -v test_vision_stages  # verbose
+#
+# Positional args are auto-classified:
+#   - matches a known level dir (level0_framework, level1_cpu_pure,
+#     level2_op_precision, level3_integration, level4_e2e) → ctest -L
+#   - otherwise → ctest -R   (test-name regex; exact-match anchored)
 # ─────────────────────────────────────────────────────────────────────
 set -o pipefail
+
+# ── Known test levels (kept in sync with tests/levelN_*/ dirs) ──────
+# Anything matching one of these as a positional arg is treated as a
+# LABEL filter (ctest -L). Everything else is treated as a NAME filter
+# (ctest -R). These names must match the directory names under tests/
+# AND the labels emitted by CMakeLists.txt's add_atb_test() helper.
+KNOWN_LEVELS=(
+    level0_framework
+    level1_cpu_pure
+    level2_op_precision
+    level3_integration
+    level4_e2e
+)
 
 # ── CLI arg parsing ─────────────────────────────────────────────────
 BUILD_TYPE="Release"
@@ -33,6 +61,22 @@ CLEAN=0
 NO_TEST=0
 NO_REFDATA=0
 REFRESH_REFDATA=0
+TEST_ONLY=0
+LIST_ONLY=0
+VERBOSE=0
+LABEL_FILTERS=()
+NAME_FILTERS=()
+
+is_known_level() {
+    local needle="$1"
+    for lvl in "${KNOWN_LEVELS[@]}"; do
+        if [ "$lvl" = "$needle" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
 for arg in "$@"; do
     case "$arg" in
         --debug)            BUILD_TYPE="Debug" ;;
@@ -41,13 +85,25 @@ for arg in "$@"; do
         --no-test)          NO_TEST=1 ;;
         --no-refdata)       NO_REFDATA=1 ;;
         --refresh-refdata)  REFRESH_REFDATA=1 ;;
+        --test-only|-t)     TEST_ONLY=1 ;;
+        --list|-l)          LIST_ONLY=1 ;;
+        --verbose|-v)       VERBOSE=1 ;;
         -h|--help)
-            sed -n '2,28p' "$0"
+            sed -n '2,46p' "$0"
             exit 0
             ;;
-        *)
-            echo "[build_and_test] Unknown arg: $arg" >&2
+        --*|-*)
+            echo "[build_and_test] Unknown flag: $arg" >&2
+            echo "[build_and_test] Run with --help for usage." >&2
             exit 2
+            ;;
+        *)
+            # Positional: classify as level (LABEL) or test name (NAME).
+            if is_known_level "$arg"; then
+                LABEL_FILTERS+=("$arg")
+            else
+                NAME_FILTERS+=("$arg")
+            fi
             ;;
     esac
 done
@@ -144,40 +200,62 @@ for candidate in "${TOOLKIT_CANDIDATES[@]}"; do
     fi
 done
 
-# ── 3. Configure + build ────────────────────────────────────────────
-if [ "$CLEAN" = "1" ] && [ -d "$BUILD_DIR" ]; then
-    log "Removing $BUILD_DIR"
-    rm -rf "$BUILD_DIR"
-fi
-mkdir -p "$BUILD_DIR"
-
-CMAKE_EXTRA_ARGS=()
-if [ -n "$ATB_CXX_ABI_DIR" ]; then
-    CMAKE_EXTRA_ARGS+=(-DATB_DIR="$ATB_CXX_ABI_DIR")
-fi
-if [ -n "$ASCEND_TOOLKIT_DIR" ]; then
-    CMAKE_EXTRA_ARGS+=(-DASCEND_TOOLKIT_DIR="$ASCEND_TOOLKIT_DIR")
-fi
-
-log "Configuring CMake (build type: $BUILD_TYPE)..."
-if ! cmake -S "$SCRIPT_DIR" -B "$BUILD_DIR" \
-    -DCMAKE_BUILD_TYPE="$BUILD_TYPE" \
-    "${CMAKE_EXTRA_ARGS[@]}"; then
-    log "ERROR: CMake configure failed."
-    exit 1
-fi
-
-log "Building (parallel jobs: $(nproc))..."
-if ! cmake --build "$BUILD_DIR" -j"$(nproc)"; then
-    log "ERROR: Build failed."
-    if [ "$ASCEND_OK" = "0" ]; then
-        log "Hint: Ascend/ATB libraries were not found. The build is expected"
-        log "      to fail at link time without them. Run this script on an"
-        log "      NPU host with CANN+ATB installed to complete the build."
+# ── --list shortcut: just enumerate tests + labels and exit ─────────
+if [ "$LIST_ONLY" = "1" ]; then
+    if [ ! -d "$BUILD_DIR" ]; then
+        log "ERROR: $BUILD_DIR does not exist. Run a regular build first:"
+        log "       bash build_and_test.sh --no-test"
+        exit 1
     fi
-    exit 1
+    log "Registered tests (with labels):"
+    ctest --test-dir "$BUILD_DIR" -N --print-labels || true
+    ctest --test-dir "$BUILD_DIR" -N
+    exit 0
 fi
-log "Build succeeded."
+
+# ── 3. Configure + build  (skipped under --test-only) ───────────────
+if [ "$TEST_ONLY" = "1" ]; then
+    if [ ! -d "$BUILD_DIR" ] || [ ! -f "$BUILD_DIR/CMakeCache.txt" ]; then
+        log "ERROR: --test-only requires an existing build in $BUILD_DIR"
+        log "       Run a full build first:  bash build_and_test.sh --no-test"
+        exit 1
+    fi
+    log "--test-only: skipping CMake configure + build"
+else
+    if [ "$CLEAN" = "1" ] && [ -d "$BUILD_DIR" ]; then
+        log "Removing $BUILD_DIR"
+        rm -rf "$BUILD_DIR"
+    fi
+    mkdir -p "$BUILD_DIR"
+
+    CMAKE_EXTRA_ARGS=()
+    if [ -n "$ATB_CXX_ABI_DIR" ]; then
+        CMAKE_EXTRA_ARGS+=(-DATB_DIR="$ATB_CXX_ABI_DIR")
+    fi
+    if [ -n "$ASCEND_TOOLKIT_DIR" ]; then
+        CMAKE_EXTRA_ARGS+=(-DASCEND_TOOLKIT_DIR="$ASCEND_TOOLKIT_DIR")
+    fi
+
+    log "Configuring CMake (build type: $BUILD_TYPE)..."
+    if ! cmake -S "$SCRIPT_DIR" -B "$BUILD_DIR" \
+        -DCMAKE_BUILD_TYPE="$BUILD_TYPE" \
+        "${CMAKE_EXTRA_ARGS[@]}"; then
+        log "ERROR: CMake configure failed."
+        exit 1
+    fi
+
+    log "Building (parallel jobs: $(nproc))..."
+    if ! cmake --build "$BUILD_DIR" -j"$(nproc)"; then
+        log "ERROR: Build failed."
+        if [ "$ASCEND_OK" = "0" ]; then
+            log "Hint: Ascend/ATB libraries were not found. The build is expected"
+            log "      to fail at link time without them. Run this script on an"
+            log "      NPU host with CANN+ATB installed to complete the build."
+        fi
+        exit 1
+    fi
+    log "Build succeeded."
+fi
 
 # ── 4. Decide whether to run tests ──────────────────────────────────
 if [ "$NO_TEST" = "1" ]; then
@@ -222,8 +300,33 @@ fi
 
 log "Detected NPU; running CTest..."
 npu-smi info | head -20 || true
-if ctest --test-dir "$BUILD_DIR" --output-on-failure -j4; then
-    log "All tests passed."
+
+# Assemble ctest filter args. -L and -R together = AND (test must satisfy both).
+CTEST_FILTER_ARGS=()
+if [ "${#LABEL_FILTERS[@]}" -gt 0 ]; then
+    # Anchor each level name so "level1" does NOT match "level10" if ever added.
+    label_regex="^($(IFS='|'; echo "${LABEL_FILTERS[*]}"))$"
+    CTEST_FILTER_ARGS+=(-L "$label_regex")
+    log "Label filter: $label_regex"
+fi
+if [ "${#NAME_FILTERS[@]}" -gt 0 ]; then
+    # Anchor names so "test_e2e" doesn't accidentally match "test_e2e_extra".
+    name_regex="^($(IFS='|'; echo "${NAME_FILTERS[*]}"))$"
+    CTEST_FILTER_ARGS+=(-R "$name_regex")
+    log "Name filter:  $name_regex"
+fi
+if [ "${#LABEL_FILTERS[@]}" -gt 0 ] && [ "${#NAME_FILTERS[@]}" -gt 0 ]; then
+    log "Note: -L and -R combine with AND — a test must match BOTH to run."
+fi
+
+CTEST_VERBOSE_ARGS=()
+if [ "$VERBOSE" = "1" ]; then
+    CTEST_VERBOSE_ARGS+=(-V)
+fi
+
+if ctest --test-dir "$BUILD_DIR" --output-on-failure -j4 \
+        "${CTEST_FILTER_ARGS[@]}" "${CTEST_VERBOSE_ARGS[@]}"; then
+    log "All selected tests passed."
 else
     log "Some tests FAILED — see ctest output above for details."
     exit 1
