@@ -309,6 +309,58 @@ set_tests_properties(
     PROPERTIES RESOURCE_LOCK "npu_e2e"
 )
 
+# ── Reference-data dependency labels ──────────────────────
+# Tests that fopen() /tmp/{cpu_,stage_,posembed_npu_,visrope_npu_}*.bin
+# files produced by tests/python_reference/gen_all.py. When those .bin
+# files are absent the tests silently skip (LOG_ERROR + return), which
+# looks like PASS from ctest's perspective — a real footgun.
+#
+# build_and_test.sh's --no-refdata mode passes `ctest -LE "needs_refdata"`
+# to actively exclude these tests when reference data is unavailable
+# (either explicitly via the flag, or via auto-fallback from
+# --no-refresh-refdata when sentinel files are missing).
+#
+# Maintenance contract: when a new test reads a /tmp/*.bin file, list it
+# here. Discovered via: grep -lE '/tmp/(cpu_|stage_|posembed_npu_|visrope_npu_)' \
+#                          tests/level*/*.cpp
+set(REFDATA_DEPENDENT_TESTS
+    # Level 1 CPU pure-function tests
+    test_float_utils
+    test_mrope_cpu
+    test_pos_embed_cpu
+    test_preprocess_cpu
+    test_vision_rope_cpu
+    # Level 2 op-precision tests
+    test_rms_norm_precision
+    test_layer_norm_precision
+    test_linear_precision
+    test_activation_precision
+    test_elewise_precision
+    test_split_concat_precision
+    test_softmax_precision
+    test_gather_reduce_precision
+    test_transpose_set_value_precision
+    test_rope_precision
+    test_self_attention_precision
+    test_swiglu_mlp_precision
+    test_text_decoder_layer_precision
+    test_vision_attention_precision
+    test_vision_mlp_precision
+    test_vision_block_precision
+    test_patch_embed_precision
+    test_vision_merger_precision
+    test_pos_embed_npu_graph
+    test_vis_rope_npu_graph
+    # Level 3 integration
+    test_vision_stages
+    # Level 4 E2E
+    test_stage_precision
+)
+foreach(_t ${REFDATA_DEPENDENT_TESTS})
+    # APPEND so we don't clobber the levelN_* label set by add_atb_test().
+    set_property(TEST ${_t} APPEND PROPERTY LABELS "needs_refdata")
+endforeach()
+
 # ── Install ───────────────────────────────────────────────
 install(TARGETS atb_llm_engine
     LIBRARY DESTINATION lib
