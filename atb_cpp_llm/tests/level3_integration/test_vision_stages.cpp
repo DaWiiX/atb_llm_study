@@ -348,8 +348,10 @@ static bool TestL1_PatchEmbed(int& passed, int& failed,
                         flat_pixels * sizeof(uint16_t));
 
     // Load patch_embed weights from safetensors
+    // Real tensor names are model.visual.patch_embed.proj.{weight,bias} —
+    // matches what qwen3vl_weights.cpp uses in production.
     s = atb_llm::io::CopyWeightToFp16NPU(*weight_loader,
-                                           "model.visual.patch_embed.weight",
+                                           "model.visual.patch_embed.proj.weight",
                                            *alloc, weight_tensor);
     if (!IS_OK(s)) {
         LOG_ERROR("  Failed to load patch_embed weight: %d", static_cast<int>(s));
@@ -358,7 +360,7 @@ static bool TestL1_PatchEmbed(int& passed, int& failed,
     }
 
     s = atb_llm::io::CopyWeightToFp16NPU(*weight_loader,
-                                           "model.visual.patch_embed.bias",
+                                           "model.visual.patch_embed.proj.bias",
                                            *alloc, bias_tensor);
     if (!IS_OK(s)) {
         LOG_ERROR("  Failed to load patch_embed bias: %d", static_cast<int>(s));
