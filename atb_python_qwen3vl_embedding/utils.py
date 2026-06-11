@@ -9,10 +9,24 @@ Also provides:
     - Buffer size configuration (must be called once before any graph build)
     - Builder instantiation helper
     - Cosine similarity comparison utility for testing
+    - Platform detection (910B vs 310P) for operator compatibility
 """
+import os
 import torch
 import torch_atb
 import torch.nn.functional as F
+
+
+# ── Platform detection ────────────────────────────────────────────────
+
+def get_platform() -> str:
+    """Return the current Ascend NPU platform: '910B' or '310P'."""
+    return os.getenv("ASCEND_PLATFORM", "910B")
+
+
+def is_310p() -> bool:
+    """Return True when running on Ascend 310P (Atlas推理系列产品)."""
+    return get_platform() == "310P"
 
 
 # ── Buffer management ───────────────────────────────────────────────

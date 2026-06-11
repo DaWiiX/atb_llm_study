@@ -10,7 +10,7 @@ The `atb_cpp_llm` directory contains a C++ multi-model LLM engine built on ATB, 
 
 ## Hardware requirements
 
-- Huawei Ascend NPU (tested on 910B)
+- Huawei Ascend NPU (tested on 910B and 310P)
 - `torch_npu` (NPU runtime)
 - `torch_atb` (Ascend Transformer Boost graph compiler)
 
@@ -144,67 +144,112 @@ from engine_utils import get_rope_index
 
 这是因为 `gen_all.py` 从 repo root 调用子进程，`sys.path` 里只有 repo root，没有 `atb_python_qwen3vl_embedding/` 子目录。验收：`python tests/python_reference/gen_all.py` 5/5 生成器全部 OK。
 
-### 查阅昇腾/CANN/ATB 文档的标准方法
+### 查阅 ATB 文档
 
-**环境说明**: Linux Arm64 (aarch64)，Chrome 不可用。Playwright 使用 Firefox。需要先 `cd /tmp && npm install playwright`（已有则跳过），然后将脚本写入 `/tmp/playwright_test.js` 用 `node` 执行。
+**环境**: Linux aarch64，Playwright + Chromium（已装于 `/tmp/node_modules/playwright`，浏览器在 `~/.cache/ms-playwright/chromium-1223/`）。
 
-**1. 文档首页入口**
-
-ATB API 参考主页（变更声明）: `https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/900/API/ascendtb/ascendtb_01_0098.html`
-
-**2. 快速查某个算子/类名的所有页面（通过元数据）**
-
+**脚本模板**（`cd /tmp && node playwright_test.js`）：
 ```js
-// 在 page.evaluate 中 fetch ALL_META.TXT.json，按关键词过滤
-const metaText = await page.evaluate(async () => {
-  const resp = await fetch('/doc_center/source/zh/CANNCommunityEdition/900/API/ascendtb/ALL_META.TXT.json');
-  const data = await resp.json();
-  return data.filter(item => item.kw && item.kw.includes('目标关键词'))
-    .map(item => ({ uri: item.uri, code: item.code, title: item.title, des: (item.des || '').substring(0, 200) }));
-});
-```
-
-每个条目包含 `uri`（如 `ascendtb_01_0262.html`），拼接 `https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/900/API/ascendtb/{uri}` 即可直接访问。
-
-**3. 获取文档完整目录树（含所有子页面）**
-
-API: `GET https://www.hiascend.com/ascendgateway/ascendservice/doc/node/tree/zh/CANNCommunityEdition/900/API/ascendtb/ascendtb_01_0098_90x_html`（需带 Referer header）
-
-返回的 `directory` 中包含完整的层级结构，每个节点有 `nodeName`、`nodeHtml`（HTML 文件名）、`nodeId`。
-
-**4. Playwright 脚本模板**
-
-```js
-const { firefox } = require('playwright');
+const { chromium } = require('playwright');
 (async () => {
-  const browser = await firefox.launch({ headless: true });
+  const browser = await chromium.launch({ headless: true });
   const page = await browser.newPage();
   await page.goto('目标URL', { timeout: 30000, waitUntil: 'networkidle' });
-  await page.waitForTimeout(3000); // 等 SPA 渲染
-
-  // 提取主内容区的文本
+  await page.waitForTimeout(3000);
   const content = await page.evaluate(() => {
     const main = document.querySelector('.document-main');
-    return main ? main.innerText : 'no content';
+    return main ? main.innerText : document.body.innerText;
   });
   console.log(content);
-
   await browser.close();
 })();
 ```
 
-**5. API 页面 URL 结构规律**
+**搜索算子/类名**（过滤 ALL_META.TXT.json）：
+```js
+const metaText = await page.evaluate(async () => {
+  const resp = await fetch('/doc_center/source/zh/CANNCommunityEdition/900/API/ascendtb/ALL_META.TXT.json');
+  const data = await resp.json();
+  return data.filter(item => item.kw && item.kw.includes('目标关键词'))
+    .map(item => ({ uri: item.uri, title: item.title, des: (item.des || '').substring(0, 200) }));
+});
+```
 
-- 变更声明: `ascendtb_01_0098.html`
-- C++ 算子定义/说明子页面: `ascendtb_01_0{编号}.html`（编号范围 0100~0320 左右）
-- Python API（OpParam/SelfAttentionParam 等）: `ascendtb_01_0{编号}.html`（编号范围 0330+）
-- 头文件索引: `ascendtb_0012.html`
-- 所有页面都在 `https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/900/API/ascendtb/` 下
+**入口 & URL**: 参考主页 `ascendtb_01_0098.html`，C++ 算子 `01_0{0100~0320}`，Python API `01_0{0330+}`。基 URL: `https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/900/API/ascendtb/`。
 
-**6. 常见问题排查思路**
+**排查指引**: 参数→"参数列表"，硬件→"产品支持"，报错→"约束说明"，Python/C++ API 参数一一对应（`torch_atb.XxxParam` vs `atb::infer::XxxParam`）。
 
-- 算子参数不确定 → 查该算子的"参数列表"子页面（定义/默认值/是否必选）
-- 某个硬件是否支持 → 查该算子的"产品支持情况"子页面
-- 报错/约束 → 查"约束说明"子页面
-- Python API vs C++ API → 两者参数一一对应，类型名略有不同（`torch_atb.XxxParam` vs `atb::infer::XxxParam`）
-- 不确定算子有哪些功能 → 查"功能列表"及"各功能共存情况"子页面
+### 310P 平台适配
+
+310P 上 SelfAttention 不支持 GQA 模式（`kv_head_num < head_num`）。解决方案是在权重加载时将 GQA 展开为 MHA（数学精确变换）。详见 [`atb_cpp_llm/docs/platform-310p.md`](./atb_cpp_llm/docs/platform-310p.md)。
+
+关键要点：
+- Python: `is_310p()` 检测平台 → engine 层自动展开 K/V 权重
+- C++: `Is310P()` 检测平台 → `Qwen3VLModel::Load()` 中自动展开
+- 新增 GQA 测试必须加 `Is310P()` 守卫（910B 可运行 310P 路径，310P 不可运行原生 GQA）
+- 平台配置：`.env` 中 `ASCEND_PLATFORM=310P`（默认 910B）
+# CLAUDE.md
+
+Behavioral guidelines to reduce common LLM coding mistakes. Merge with project-specific instructions as needed.
+
+**Tradeoff:** These guidelines bias toward caution over speed. For trivial tasks, use judgment.
+
+## 1. Think Before Coding
+
+**Don't assume. Don't hide confusion. Surface tradeoffs.**
+
+Before implementing:
+- State your assumptions explicitly. If uncertain, ask.
+- If multiple interpretations exist, present them - don't pick silently.
+- If a simpler approach exists, say so. Push back when warranted.
+- If something is unclear, stop. Name what's confusing. Ask.
+
+## 2. Simplicity First
+
+**Minimum code that solves the problem. Nothing speculative.**
+
+- No features beyond what was asked.
+- No abstractions for single-use code.
+- No "flexibility" or "configurability" that wasn't requested.
+- No error handling for impossible scenarios.
+- If you write 200 lines and it could be 50, rewrite it.
+
+Ask yourself: "Would a senior engineer say this is overcomplicated?" If yes, simplify.
+
+## 3. Surgical Changes
+
+**Touch only what you must. Clean up only your own mess.**
+
+When editing existing code:
+- Don't "improve" adjacent code, comments, or formatting.
+- Don't refactor things that aren't broken.
+- Match existing style, even if you'd do it differently.
+- If you notice unrelated dead code, mention it - don't delete it.
+
+When your changes create orphans:
+- Remove imports/variables/functions that YOUR changes made unused.
+- Don't remove pre-existing dead code unless asked.
+
+The test: Every changed line should trace directly to the user's request.
+
+## 4. Goal-Driven Execution
+
+**Define success criteria. Loop until verified.**
+
+Transform tasks into verifiable goals:
+- "Add validation" → "Write tests for invalid inputs, then make them pass"
+- "Fix the bug" → "Write a test that reproduces it, then make it pass"
+- "Refactor X" → "Ensure tests pass before and after"
+
+For multi-step tasks, state a brief plan:
+```
+1. [Step] → verify: [check]
+2. [Step] → verify: [check]
+3. [Step] → verify: [check]
+```
+
+Strong success criteria let you loop independently. Weak criteria ("make it work") require constant clarification.
+
+---
+
+**These guidelines are working if:** fewer unnecessary changes in diffs, fewer rewrites due to overcomplication, and clarifying questions come before implementation rather than after mistakes.

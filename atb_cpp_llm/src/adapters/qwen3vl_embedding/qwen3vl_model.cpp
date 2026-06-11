@@ -75,7 +75,107 @@ Status Qwen3VLModel::Load(const std::string& model_dir, IRuntime* runtime) {
         }
     }
 
-    // 2c. Upload pos_embed to NPU + build the interp graph (one-time cost).
+    // 2c. 310P GQA→MHA weight expansion.
+    //     310P SelfAttention may not support GQA (kv_head_num < head_num).
+    //     Expand K/V/K-norm weights so the graph uses MHA (same as vision path).
+    if (Is310P() && config_.text_num_kv_heads < config_.text_num_heads) {
+        int32_t nh = config_.text_num_heads;
+        int32_t kv_nh = config_.text_num_kv_heads;
+        int32_t hd = config_.text_head_dim;
+        int32_t ratio = nh / kv_nh;
+        LOG_INFO("310P: Expanding GQA→MHA: nh=%d kv_nh=%d ratio=%d hd=%d",
+                 nh, kv_nh, ratio, hd);
+
+        auto* alloc = runtime_->GetAllocator();
+        for (int32_t i = 0; i < config_.text_num_layers; i++) {
+            auto& lw = weights_.text_layers[i];
+
+            // k_weight: (kv_nh*hd, hidden) → (nh*hd, hidden)
+            {
+                int64_t old_rows = lw.k_weight.desc.shape.dims[0];  // kv_nh * hd
+                int64_t hidden = lw.k_weight.desc.shape.dims[1];
+                size_t old_elems = static_cast<size_t>(old_rows * hidden);
+
+                std::vector<uint16_t> k_old(old_elems);
+                s = alloc->CopyToHost(k_old.data(), lw.k_weight,
+                                      old_elems * sizeof(uint16_t));
+                if (s != STATUS_OK) return s;
+
+                std::vector<uint16_t> k_new(nh * hd * hidden);
+                for (int32_t h = 0; h < nh; h++) {
+                    int32_t src_h = h / ratio;
+                    std::memcpy(k_new.data() + h * hd * hidden,
+                                k_old.data() + src_h * hd * hidden,
+                                hd * hidden * sizeof(uint16_t));
+                }
+
+                s = alloc->AllocFloat16(lw.k_weight, {nh * hd, hidden});
+                if (s != STATUS_OK) return s;
+                s = alloc->CopyToDevice(lw.k_weight, k_new.data(),
+                                        k_new.size() * sizeof(uint16_t));
+                if (s != STATUS_OK) return s;
+            }
+
+            // v_weight: (kv_nh*hd, hidden) → (nh*hd, hidden)
+            {
+                int64_t old_rows = lw.v_weight.desc.shape.dims[0];
+                int64_t hidden = lw.v_weight.desc.shape.dims[1];
+                size_t old_elems = static_cast<size_t>(old_rows * hidden);
+
+                std::vector<uint16_t> v_old(old_elems);
+                s = alloc->CopyToHost(v_old.data(), lw.v_weight,
+                                      old_elems * sizeof(uint16_t));
+                if (s != STATUS_OK) return s;
+
+                std::vector<uint16_t> v_new(nh * hd * hidden);
+                for (int32_t h = 0; h < nh; h++) {
+                    int32_t src_h = h / ratio;
+                    std::memcpy(v_new.data() + h * hd * hidden,
+                                v_old.data() + src_h * hd * hidden,
+                                hd * hidden * sizeof(uint16_t));
+                }
+
+                s = alloc->AllocFloat16(lw.v_weight, {nh * hd, hidden});
+                if (s != STATUS_OK) return s;
+                s = alloc->CopyToDevice(lw.v_weight, v_new.data(),
+                                        v_new.size() * sizeof(uint16_t));
+                if (s != STATUS_OK) return s;
+            }
+
+            // k_norm_weight: (hd,) or (kv_nh*hd,) → (nh*hd,)
+            {
+                int64_t kn_dim0 = lw.k_norm_weight.desc.shape.dims[0];
+                int64_t kn_elems = kn_dim0;
+                // If per-kv-group (kv_nh*hd,), expand to (nh*hd,)
+                if (kn_elems == kv_nh * hd) {
+                    std::vector<uint16_t> kn_old(kn_elems);
+                    s = alloc->CopyToHost(kn_old.data(), lw.k_norm_weight,
+                                          kn_elems * sizeof(uint16_t));
+                    if (s != STATUS_OK) return s;
+
+                    std::vector<uint16_t> kn_new(nh * hd);
+                    for (int32_t h = 0; h < nh; h++) {
+                        int32_t src_h = h / ratio;
+                        std::memcpy(kn_new.data() + h * hd,
+                                    kn_old.data() + src_h * hd,
+                                    hd * sizeof(uint16_t));
+                    }
+
+                    s = alloc->AllocFloat16(lw.k_norm_weight, {nh * hd});
+                    if (s != STATUS_OK) return s;
+                    s = alloc->CopyToDevice(lw.k_norm_weight, kn_new.data(),
+                                            kn_new.size() * sizeof(uint16_t));
+                    if (s != STATUS_OK) return s;
+                }
+                // else: per-head (hd,) — already correct for MHA, no expansion needed
+            }
+        }
+
+        // Update effective head count so graph uses MHA
+        config_.text_num_kv_heads = config_.text_num_heads;
+    }
+
+    // 2d. Upload pos_embed to NPU + build the interp graph (one-time cost).
     // The graph is shape-agnostic; runtime tensors carry the actual N.
     {
         int64_t num_pos = config_.vis_num_position_embeddings;

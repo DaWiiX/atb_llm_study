@@ -67,3 +67,26 @@ const T& clamp(const T& v, const T& lo, const T& hi) {
 }
 
 }  // namespace atb_llm
+
+// ─────────────────────────────────────────────────────────────
+// Platform detection helpers (inline, no dependency).
+//
+// Reads ASCEND_PLATFORM from environment once per call.
+// Valid values: "910B" (Atlas A2), "310P" (Atlas推理系列).
+// ─────────────────────────────────────────────────────────────
+#include <cstdlib>
+#include <cstring>
+
+namespace atb_llm {
+
+inline bool Is310P() {
+    const char* p = std::getenv("ASCEND_PLATFORM");
+    return p != nullptr && std::strcmp(p, "310P") == 0;
+}
+
+inline bool Is910B() {
+    const char* p = std::getenv("ASCEND_PLATFORM");
+    return p == nullptr || std::strcmp(p, "910B") == 0;
+}
+
+}  // namespace atb_llm

@@ -193,6 +193,19 @@ function(add_atb_test name source)
         if(_test_label MATCHES "^level[0-9]")
             set_tests_properties(${name} PROPERTIES LABELS "${_test_label}")
         endif()
+        # Propagate critical env vars from .env to ctest subprocesses.
+        # This ensures C++ tests can access ASCEND_PLATFORM, model dirs, etc.
+        # even when ctest is invoked from a shell that hasn't sourced .env.
+        set(_test_env "")
+        if(DEFINED ENV{ASCEND_PLATFORM})
+            list(APPEND _test_env "ASCEND_PLATFORM=$ENV{ASCEND_PLATFORM}")
+        endif()
+        if(DEFINED ENV{QWEN3VL_EMB_MODEL_DIR})
+            list(APPEND _test_env "QWEN3VL_EMB_MODEL_DIR=$ENV{QWEN3VL_EMB_MODEL_DIR}")
+        endif()
+        if(_test_env)
+            set_tests_properties(${name} PROPERTIES ENVIRONMENT "${_test_env}")
+        endif()
     endif()
 endfunction()
 

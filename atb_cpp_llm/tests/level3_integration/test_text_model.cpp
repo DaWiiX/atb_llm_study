@@ -18,6 +18,7 @@
 #include "core/raii.h"
 #include "core/graph_builder.h"
 #include "core/context_manager.h"
+#include "util/cpp11_compat.h"
 #include "core/tensor_allocator.h"
 #include "runners/text_runner.h"
 #include "engine/runtime_impl.h"
@@ -261,8 +262,16 @@ TEST_CASE("TextModel Execute") {
 
 // ══════════════════════════════════════════════════════════
 // Test: TextModel with GQA
+//
+// SKIP on 310P: SelfAttention GQA (kv_head_num < head_num) is not
+// supported on 310P hardware.  Production inference uses GQA→MHA weight
+// expansion in Qwen3VLModel::Load() instead.
 // ══════════════════════════════════════════════════════════
 TEST_CASE("TextModel GQA") {
+    if (atb_llm::Is310P()) {
+        MESSAGE("Skipping TextModel GQA test on 310P (GQA→MHA expansion handles this at engine layer)");
+        return;
+    }
     LOG_INFO("=== Test: TextModel GQA ===");
 
     atb_llm::runners::TextRunner::Config cfg;

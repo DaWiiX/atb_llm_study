@@ -15,7 +15,7 @@
 
 ## 适用场景
 
-- 想在 Ascend 910B 上跑 Qwen3-VL-Embedding-2B 推理 → 用 Python 子项目。
+- 想在 Ascend 910B 或 310P 上跑 Qwen3-VL-Embedding-2B 推理 → 用 Python 子项目。
 - 想在 Ascend NPU 上跑多种主流 LLM 推理（C++ 性能优先） → 用 C++ 子项目。
 - 想学习如何用 torch_atb / atb C++ API 手动搭计算图、做权重加载、做 split-graph 优化 → 两个都看。
 
@@ -25,7 +25,7 @@
 
 | 类别 | 要求 |
 |---|---|
-| 硬件 | 华为昇腾 NPU（在 910B 上验证过） |
+| 硬件 | 华为昇腾 NPU（在 910B 和 310P 上验证过） |
 | 操作系统 | Linux aarch64（其他架构未验证） |
 | 驱动 | 昇腾 NPU 驱动 + `npu-smi` 可用 |
 | 软件栈 | CANN 9.0.0、NNAL/ATB（带 `cxx_abi=1`） |
@@ -71,6 +71,8 @@ $EDITOR .env
 
 ```bash
 QWEN3VL_EMB_MODEL_DIR=/abs/path/to/Qwen3-VL-Embedding-2B
+# 可选：指定 NPU 平台（910B 或 310P），默认 910B
+ASCEND_PLATFORM=910B
 ```
 
 > `.env` 已被 `.gitignore` 忽略，不会泄漏机器路径。Python 和 C++ 都会从仓库根目录自动加载它。

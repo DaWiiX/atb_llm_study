@@ -106,6 +106,10 @@ QWEN3VL_EMB_SRC: Optional[str] = get_env("QWEN3VL_EMB_SRC")
 #: impl (compare_with_torch.py, compare_multimodal.py) read it.
 QWEN3VL_EMB_TRANSFORMERS_SRC: Optional[str] = get_env("QWEN3VL_EMB_TRANSFORMERS_SRC")
 
+#: Ascend NPU platform identifier. Valid values: "910B" (Atlas A2), "310P" (Atlas推理系列).
+#: Controls which ATB operator paths are used where platform support differs.
+ASCEND_PLATFORM: str = get_env("ASCEND_PLATFORM", default="910B")
+
 #: Repository root, derived from this file's location. Useful for tests
 #: that need to add the repo to sys.path without hard-coding the path.
 REPO_ROOT: Path = Path(__file__).resolve().parent.parent

@@ -31,6 +31,7 @@ if str(_REPO_ROOT) not in sys.path:
 
 # Re-export everything from the canonical config module.
 from atb_python_qwen3vl_embedding.env import (  # noqa: E402
+    ASCEND_PLATFORM,
     QWEN3VL_EMB_MODEL_DIR as MODEL_DIR,
     QWEN3VL_EMB_SRC,
     QWEN3VL_EMB_TRANSFORMERS_SRC as TRANSFORMERS_SRC,
@@ -43,6 +44,7 @@ from atb_python_qwen3vl_embedding.env import (  # noqa: E402
 CPP_BUILD_DIR: str = str(REPO_ROOT / "atb_cpp_llm" / "build")
 
 __all__ = [
+    "ASCEND_PLATFORM",
     "MODEL_DIR",
     "QWEN3VL_EMB_SRC",
     "TRANSFORMERS_SRC",

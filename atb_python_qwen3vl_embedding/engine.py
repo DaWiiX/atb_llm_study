@@ -38,7 +38,7 @@ from .text_model import (
 )
 
 from .utils import (
-    to_cpu_float, to_npu_half, make_seqlen_tensor
+    to_cpu_float, to_npu_half, make_seqlen_tensor, is_310p,
 )
 
 
@@ -102,6 +102,13 @@ class Qwen3VLEngine:
             for i in range(self.n_layer)
         ]
 
+        # ── 310P GQA→MHA weight expansion ──────────────────────────
+        # 310P SelfAttention may not support GQA (kv_head_num < head_num).
+        # Expand K/V/K-norm weights to MHA so the graph uses the same
+        # MHA SelfAttention that is confirmed working for vision path.
+        if is_310p() and self.nkv_t < self.nh_t:
+            self._expand_kv_weights_to_mha()
+
         # Vision: block weights by layer (NPU-resident)
         self.v_block_weights = [
             [to_npu_half(w) for w in get_vision_block_weights(self.weights, i)]
@@ -131,11 +138,67 @@ class Qwen3VLEngine:
         """Create a config-like object for ATB vision graph builders."""
         return VisionConfigWrapper(self.v_cfg)
 
+    def _expand_kv_weights_to_mha(self):
+        """Expand K/V/K-norm weights from GQA to MHA for 310P compatibility.
+
+        Qwen3VL-Embedding-2B: nh=32, kv_nh=4, ratio=8.
+        K weight (kv_nh*hd, hidden) → (nh*hd, hidden) by repeating each
+        KV head group 8 times. Same for V and K-norm weights.
+
+        This is numerically EXACT: replicated KV heads in MHA produce
+        identical attention output as GQA with shared heads.
+        """
+        ratio = self.nh_t // self.nkv_t
+        print(f"[310P] Expanding GQA→MHA: nh={self.nh_t} kv_nh={self.nkv_t} "
+              f"ratio={ratio} hd={self.hd_t}")
+
+        # K weight: (kv_nh*hd, hidden) → (nh*hd, hidden)
+        # V weight: (kv_nh*hd, hidden) → (nh*hd, hidden)
+        # K-norm: may be (hd,) per-head or (kv_nh*hd,) per-kv-group
+        for li in range(self.n_layer):
+            w = self.t_layer_weights[li]
+            # w[1] = k_proj, w[2] = v_proj, w[5] = k_norm
+            k_w = w[1]  # (kv_nh*hd, hidden)
+            v_w = w[2]  # (kv_nh*hd, hidden)
+            kn_w = w[5]  # (kv_nh*hd,) or (hd,)
+
+            # Reshape, repeat, flatten
+            # K: (kv_nh, hd, hidden) → repeat → (nh, hd, hidden) → (nh*hd, hidden)
+            k_w_exp = k_w.reshape(self.nkv_t, self.hd_t, -1) \
+                .repeat_interleave(ratio, dim=0) \
+                .reshape(self.nh_t * self.hd_t, -1)
+            w[1] = to_npu_half(k_w_exp.contiguous())
+
+            # V: same
+            v_w_exp = v_w.reshape(self.nkv_t, self.hd_t, -1) \
+                .repeat_interleave(ratio, dim=0) \
+                .reshape(self.nh_t * self.hd_t, -1)
+            w[2] = to_npu_half(v_w_exp.contiguous())
+
+            # K-norm: (kv_nh*hd,) or (hd,) → (nh*hd,)
+            if kn_w.numel() == self.nkv_t * self.hd_t:
+                # Full per-kv-group: (kv_nh*hd,) → (kv_nh, hd) → repeat → (nh*hd,)
+                kn_w_exp = kn_w.reshape(self.nkv_t, self.hd_t) \
+                    .repeat_interleave(ratio, dim=0) \
+                    .reshape(self.nh_t * self.hd_t)
+            elif kn_w.numel() == self.hd_t:
+                # Per-head (hd,): no expansion needed, already correct for MHA
+                kn_w_exp = kn_w
+            else:
+                raise RuntimeError(
+                    f"Unexpected k_norm weight shape: {kn_w.shape}, "
+                    f"expected ({self.nkv_t * self.hd_t},) or ({self.hd_t},)")
+            w[5] = to_npu_half(kn_w_exp.contiguous())
+
+        # Update effective head count so graph uses MHA
+        self.nkv_t = self.nh_t
+
     def _ensure_text_graph(self, S: int):
         """Lazily build text decoder layer graph and cached mask for sequence length S."""
         if self._text_S == S and self.g_t_layer is not None:
             return
         self._text_S = S
+        # On 310P, GQA weights have been expanded to MHA (nkv_t == nh_t).
         self.g_t_layer = build_text_layer_graph(
             self.nh_t, self.nkv_t, self.hd_t, self.interm_t,
             B=1, S=S, use_mask=True)

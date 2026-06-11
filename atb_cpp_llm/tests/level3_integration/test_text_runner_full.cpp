@@ -34,6 +34,7 @@
 #include "runners/text_runner.h"
 #include "engine/runtime_impl.h"
 #include "log/logger.h"
+#include "util/cpp11_compat.h"
 
 #include <cstdio>
 #include <cstring>
@@ -247,8 +248,16 @@ TEST_CASE("TextRunner Full Pipeline (multi-layer loop)") {
 //   - num_heads=12, num_kv_heads=4 (3:1 grouping)
 //   - Verifies the shared layer graph handles GQA correctly through the
 //     full multi-layer loop + final norm
+//
+// SKIP on 310P: SelfAttention GQA is not supported on 310P hardware.
+// Production inference uses GQA→MHA weight expansion in
+// Qwen3VLModel::Load() instead.
 // ══════════════════════════════════════════════════════════════════════
 TEST_CASE("TextRunner GQA Full Pipeline") {
+    if (atb_llm::Is310P()) {
+        MESSAGE("Skipping TextRunner GQA Full Pipeline test on 310P (GQA→MHA expansion handles this at engine layer)");
+        return;
+    }
     LOG_INFO("=== Test: TextRunner GQA full pipeline ===");
 
     atb_llm::runners::TextRunner::Config cfg;

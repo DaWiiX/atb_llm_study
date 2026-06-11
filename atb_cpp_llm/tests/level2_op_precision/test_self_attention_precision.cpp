@@ -31,6 +31,7 @@
 #include "engine/runtime_impl.h"
 #include "utils/float_utils.h"
 #include "log/logger.h"
+#include "util/cpp11_compat.h"
 
 #include <cstdio>
 #include <cstdint>
@@ -215,8 +216,14 @@ TEST_CASE("SelfAttentionOp precision: MHA no mask") {
 
 // ═════════════════════════════════════════════════════════════════
 // Case 2: GQA without mask  (nh = 12, kvh = 4, hd = 64)
+// SKIP on 310P: SelfAttention GQA is not supported on 310P hardware.
+// Production inference uses GQA→MHA weight expansion instead.
 // ═════════════════════════════════════════════════════════════════
 TEST_CASE("SelfAttentionOp precision: GQA no mask") {
+    if (atb_llm::Is310P()) {
+        MESSAGE("Skipping SelfAttentionOp GQA precision test on 310P (GQA→MHA expansion handles this at engine layer)");
+        return;
+    }
     auto cs = LoadMeta("gqa_nomask");
     RunSaCase("gqa_nomask", cs);
 }
