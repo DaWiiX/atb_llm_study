@@ -226,9 +226,9 @@ def main():
         use_mask=True, B=B, S=16)
     results["G2"] = (ok, err, cos)
 
-    # ── Section H: Large seqlen (image-only typical) ─────────────
+    # ── Section H: Real model params, large seqlen ───────────────
     print("\n" + "=" * 60)
-    print("SECTION H: Large seqlen")
+    print("SECTION H: Large seqlen (image-only typical)")
     print("=" * 60)
 
     ok, err, cos = _run_full_attention(

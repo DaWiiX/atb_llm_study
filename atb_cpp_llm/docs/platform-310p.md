@@ -2,22 +2,92 @@
 
 ## 概述
 
-ATB LLM 项目已在 **Ascend 310P** (Atlas推理系列产品) 和 **Ascend 910B** (Atlas A2推理系列产品) 两个平台上通过验证，数值结果等价。
+ATB LLM 项目支持 **Ascend 310P** (Atlas推理系列产品) 和 **Ascend 910B** (Atlas A2推理系列产品) 两个平台，数值结果等价。
 
-两个平台的差异在于 ATB 算子支持范围不同。本文档记录适配策略、架构设计、测试结果和运维要点。
+两个平台的差异在于 ATB 算子支持范围不同。本文档记录适配策略、架构设计、测试方法、已发现问题和运维要点。
 
 ## 平台差异
 
+### 已知兼容性
+
 | 特性 | 910B | 310P |
 |------|------|------|
-| SelfAttention MHA | ✅ 支持 | ✅ 支持 |
 | SelfAttention GQA (`kv_head_num < head_num`) | ✅ 支持 | ❌ 不支持 |
-| SelfAttention MASK_TYPE_NORM | ✅ 支持 | ✅ 支持 |
 | RopeOperation | ✅ 支持 | ✅ 支持 |
 | Linear / RMSNorm / LayerNorm | ✅ 支持 | ✅ 支持 |
 | 所有 Vision 路径算子 | ✅ 支持 | ✅ 支持 |
 
-**核心结论**：310P 的唯一限制是 SelfAttention 不支持 GQA 模式。其他所有算子（包括 Vision 路径使用的 MHA SelfAttention、RopeOp 等）均可用。
+### 待验证（需在 310P 实测）
+
+| 特性 | 910B 基线 | 310P 预期 |
+|------|-----------|----------|
+| SelfAttention BSND+PA_ENCODER+MASK_NORM+hd=64 | ✅ PASS | ✅ 同 Vision path |
+| SelfAttention BSND+PA_ENCODER+MASK_NORM+hd=128 | ✅ PASS | ❌ 实测失败（TransdataOperation）|
+| SelfAttention BSND+PA_ENCODER+MASK_NORM+is_triu=1 | ✅ PASS | ⏳ 待实测 |
+| SelfAttention BSND+PA_ENCODER+KERNELTYPE_HIGH_PRECISION | ❌ cos=nan (910B 也可复现) | — |
+| BNSD 布局（所有 calcType） | ❌ CreateOp failed | — |
+| MASK_TYPE_NORM_COMPRESS | ❌ CreateOp failed | — |
+| 非 PA_ENCODER (UNDEFINED/ENCODER/DECODER) | ❌ CreateOp failed | — |
+
+**重点**：310P 上唯一确认可用的是 BSND+PA_ENCODER+MASK_NORM 组合。`is_triu_mask=1` 在 910B 上兼容且精度正常，是 310P 最优先的备选方案。
+
+## 已知问题：SelfAttention head_dim=128 + mask 在 310P 上失败
+
+### 现象
+
+310P 实测 `test_accuracy` 中 Vision path 全部通过，Text path 在第一个 decoder layer 的 SelfAttention 报错：
+
+```
+SelfAttentionEncoderFusionOpsRunner: TransdataOperation mki node infer shape fail, inDims is not support
+```
+
+### 失败对比
+
+| 参数 | Vision Path ✅ | Text Path ❌ |
+|------|---------------|-------------|
+| headDim | 64 | **128** |
+| mask | **false** | **true (MASK_TYPE_NORM, 2D [S,S] tensor)** |
+| headNum | 16 | 16（GQA→MHA 展开后）|
+| kvHeadNum | 16 | 16 |
+| inputLayout | BSND | BSND |
+| calcType | PA_ENCODER | PA_ENCODER |
+
+### 根因分析
+
+1. **310P 的 SelfAttentionEncoderFusionOpsRunner** 内部做 ND→NZ 格式转换（TransdataOperation），当传入 2D mask tensor [S, S] 且 head_dim=128 时，某个中间 tensor 的维度不满足 Transdata 的对齐约束
+
+2. **ATB 文档**（[产品支持情况](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/900/API/ascendtb/ascendtb_01_0256.html)）：
+   - 310P（Atlas 推理系列产品）对 SelfAttention 是"部分场景支持，BNSD维度输入，高精度，压缩mask"
+   - 310P 支持 PA_ENCODER（文档提到 nTokens 对齐规则）
+   - BNSD + PA_ENCODER 不支持 310P（文档明确说"不支持Atlas 推理系列产品"）
+   - 非 PA_ENCODER + BNSD 需要 KV cache（NZ 格式），不适用于无 KV cache 的全量场景
+
+3. **结论**：问题锁定在 BSND+PA_ENCODER+MASK_NORM+head_dim=128 这个四元组。910B 上所有参数组合实验表明，BSND 下只有 PA_ENCODER 能工作，BNSD 不可用
+
+### 参数组合实验（910B 基线）
+
+在 910B 上测试了 18 种 BSND 参数组合（脚本：`test_310p_combinations.py`）：
+
+**通过（12/18）：**
+- BSND + PA_ENCODER + MASK_TYPE_NORM：所有 S (4,16,32,64,256,880) ✅
+- BSND + PA_ENCODER + MASK_TYPE_NORM + is_triu_mask=1 ✅
+- BSND + PA_ENCODER + MASK_TYPE_UNDEFINED（无 mask）✅
+- BSND + PA_ENCODER + MASK_TYPE_NORM (GQA) ✅
+- BSND + PA_ENCODER + MASK_TYPE_NORM (hd=64) ✅
+
+**失败（6/18）：**
+- BNSD 布局（所有 calcType）：CreateOp failed（需要 KV cache）
+- MASK_TYPE_NORM_COMPRESS：CreateOp failed
+- 非 PA_ENCODER (UNDEFINED/ENCODER/DECODER)：CreateOp failed
+- NO_MASK + is_triu_mask=1：互不兼容
+- HIGH_PRECISION：cos=nan
+
+### 下一步方向
+
+1. **优先方案**：在 310P 上测试 `is_triu_mask=1` 是否能绕过 Transdata 问题（910B 已确认精度正常）
+2. **备选方案 A**：`MASK_TYPE_UNDEFINED` 无 mask（但不满足 causal attention 需求）
+3. **备选方案 B**：C++ 侧用 `MASK_TYPE_CAUSAL_MASK`（ATB 内部生成因果 mask，不传外部 mask tensor）— 已实现但未在 310P 上实测
+4. **长线方案**：确认 310P 是否支持通过其他 ATB 算子（MatMul+Softmax+Elewise）构建 attention
 
 ## 适配策略：GQA→MHA 权重展开
 
@@ -159,19 +229,46 @@ bash atb_cpp_llm/build_and_test.sh --test-only --no-refresh-refdata level4_e2e
 
 ### 诊断脚本
 
-如果 E2E 测试失败，运行诊断脚本定位具体失败点：
+如果 E2E 测试失败，先运行基础诊断脚本定位具体失败点：
 
 ```bash
 ASCEND_PLATFORM=310P python atb_python_qwen3vl_embedding/tests/test_310p_diag.py
 ```
 
-该脚本依次测试 6 种 SelfAttention 参数组合：
+该脚本依次测试 11 种 SelfAttention 参数组合（hd=64 和 hd=128 全覆盖）：
 1. MHA + 无 mask（基线）
 2. MHA + causal mask
 3. GQA + 无 mask
 4. GQA + causal mask
 5. 真实模型 GQA (nh=32, kv_nh=4)
 6. 真实模型 MHA (nh=32, kv_nh=32)
+7. MHA + mask + hd=128（隔离 head_dim 影响）
+8. MHA + nomask + hd=128
+9. Real MHA + mask + hd=128 (nh=16)
+10. Real MHA + mask + hd=128 S=4
+11. Real MHA + mask + hd=128 S=880
+
+### 参数组合深度扫描
+
+在诊断脚本通过后，运行参数组合扫描进一步验证：
+
+```bash
+ASCEND_PLATFORM=310P python atb_python_qwen3vl_embedding/tests/test_310p_combinations.py
+```
+
+该脚本覆盖 18 种 BSND 参数组合（不含 BNSD，BNSD 在 910B 上已确认不可用）：
+- A组 (5)：不同 seqlen (4,16,32,64,256)
+- B组 (2)：is_triu_mask 变体
+- C组 (1)：HIGH_PRECISION kernel
+- D组 (2)：不同 mask type
+- E组 (3)：不同 calc_type
+- F组 (1)：GQA 模式
+- G组 (2)：hd=64 对比
+- H组 (2)：大 seqlen (880)
+
+两组脚本的关系：
+- `test_310p_diag.py`：快速诊断，SelfAttention 单元级，30s 内出结果
+- `test_310p_combinations.py`：深度扫描，完整 AttentionGraph 级（含 Q/K/V proj + RoPE + O-proj），全面覆盖
 
 ### 参考数据生成
 
@@ -222,15 +319,58 @@ cat /root/atb/log/$(ls -rt /root/atb/log/ | tail -n 1)
 4. **新增 ATB 算子**：先在 310P 诊断脚本中验证可用性
 5. **精度不变**：310P 路径的输出必须与 910B 路径数值等价（cos > 0.99）
 
+## 代码组织
+
+### Python 参数灵活化
+
+为了支持 SelfAttention 参数组合实验，对 ATB factory 做了参数灵活化：
+
+**`utils.py:make_self_attention()`** — 扩展额外参数：
+```python
+def make_self_attention(num_heads, num_kv_heads, head_dim,
+                        mask_type=None, use_mask=False,
+                        calc_type=None, input_layout=None,
+                        is_triu_mask=0, kernel_type=None,
+                        kvcache_cfg=None):
+```
+默认值保持原有行为（PA_ENCODER + BSND），所有新参数通过 `**sa_kwargs` 透传。
+
+**`text_attention.py:build_attention()` / `add_attention_graph()`** — 接受 `**sa_kwargs`：
+```python
+def build_attention(num_heads, num_kv_heads, head_dim, ..., **sa_kwargs):
+def add_attention_graph(builder, ..., **sa_kwargs):
+```
+调用 `make_self_attention()` 时透传所有额外参数，不影响现有调用。
+
+**`engine.py`** — 310P 侧当前只做 GQA→MHA 权重展开：
+- `_expand_kv_weights_to_mha()`：K/V/K-norm 权重展开（数学精确变换）
+- `_ensure_text_graph()`：构建统一的 decoder layer graph（无特殊处理）
+- **待定**：如果 310P 上 `is_triu_mask=1` 确认有效，在 `build_text_layer_graph()` 中传入该参数
+
+### 测试脚本架构
+
+```
+test_310p_diag.py          ← 快速诊断：SelfAttention 单元级，11 种组合
+test_310p_combinations.py  ← 深度扫描：完整 AttentionGraph 级，18 种组合
+                              (Q/K/V proj → norm → RoPE → SelfAttn → O-proj)
+```
+
+两个脚本都使用测试数据生成器（`data_utils`）和 transformers 参考实现（`transformers_runner`），精度标准 `cos > 0.99`。
+
 ## 相关文件索引
 
 | 文件 | 角色 |
 |------|------|
 | `atb_python_qwen3vl_embedding/utils.py:22-29` | Python 平台检测 |
+| `atb_python_qwen3vl_embedding/utils.py:132-176` | make_self_attention() 参数灵活化 |
+| `atb_python_qwen3vl_embedding/text_attention.py:19-49` | build_attention/add_attention_graph **sa_kwargs 透传 |
 | `atb_python_qwen3vl_embedding/engine.py:105-194` | Python GQA→MHA 展开 |
-| `atb_python_qwen3vl_embedding/tests/test_310p_diag.py` | 310P 诊断脚本 |
+| `atb_python_qwen3vl_embedding/tests/test_310p_diag.py` | 310P 快速诊断（11种组合）|
+| `atb_python_qwen3vl_embedding/tests/test_310p_combinations.py` | 310P 参数深度扫描（18种组合）|
+| `atb_cpp_llm/docs/platform-310p.md` | 本文档 |
 | `atb_cpp_llm/src/util/cpp11_compat.h:74-89` | C++ 平台检测 |
 | `atb_cpp_llm/src/adapters/qwen3vl_embedding/qwen3vl_model.cpp:78-176` | C++ GQA→MHA 展开 |
+| `atb_cpp_llm/src/ops/self_attention_op.cpp` | C++ MASK_TYPE_CAUSAL_MASK（待实测）|
 | `atb_cpp_llm/CMakeLists.txt:197-208` | ctest ENVIRONMENT 属性 |
 | `atb_cpp_llm/build_and_test.sh:336-341` | gen_all 容错 fallback |
 | `.env.example:24-29` | ASCEND_PLATFORM 配置说明 |
