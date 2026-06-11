@@ -198,7 +198,6 @@ class Qwen3VLEngine:
         if self._text_S == S and self.g_t_layer is not None:
             return
         self._text_S = S
-        # On 310P, GQA weights have been expanded to MHA (nkv_t == nh_t).
         self.g_t_layer = build_text_layer_graph(
             self.nh_t, self.nkv_t, self.hd_t, self.interm_t,
             B=1, S=S, use_mask=True)

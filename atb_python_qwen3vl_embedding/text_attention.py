@@ -22,7 +22,8 @@ def add_attention_graph(builder, inp_hidden,
                         inp_cos, inp_sin, inp_seqlen,
                         B, S, num_heads, num_kv_heads, head_dim,
                         name_prefix="attn_", eps=1e-6, use_mask=True,
-                        inp_mask=None):
+                        inp_mask=None,
+                        **sa_kwargs):
     """Add Qwen3VLTextAttention subgraph into an existing builder.
 
     Args:
@@ -82,7 +83,8 @@ def add_attention_graph(builder, inp_hidden,
 
     sa = builder.add_node(
         sa_inputs,
-        make_self_attention(num_heads, num_kv_heads, head_dim, use_mask=use_mask),
+        make_self_attention(num_heads, num_kv_heads, head_dim,
+                            use_mask=use_mask, **sa_kwargs),
     )
     builder.reshape(sa.get_output(0),
                     lambda s: [B, S, s[1] * s[2]], pfx + "attn_flat")
@@ -92,7 +94,7 @@ def add_attention_graph(builder, inp_hidden,
 
 
 def build_attention(num_heads, num_kv_heads, head_dim, B=1, S=16,
-                    eps=1e-6, use_mask=False):
+                    eps=1e-6, use_mask=False, **sa_kwargs):
     """Build standalone Qwen3VLTextAttention ATB graph for testing.
 
     Returns (builder, graph_op, input_names).
@@ -116,6 +118,7 @@ def build_attention(num_heads, num_kv_heads, head_dim, B=1, S=16,
         inp_qn_w, inp_kn_w, inp_cos, inp_sin, inp_seqlen,
         B, S, num_heads, num_kv_heads, head_dim,
         eps=eps, use_mask=use_mask, inp_mask=inp_mask,
+        **sa_kwargs,
     )
     builder.mark_output(out_name)
 

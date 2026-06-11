@@ -130,26 +130,41 @@ def make_split(split_dim: int, split_num: int):
 
 
 def make_self_attention(num_heads: int, num_kv_heads: int, head_dim: int,
-                        mask_type=None, use_mask=False):
-    """ATB SelfAttentionParam.
+                        mask_type=None, use_mask=False,
+                        calc_type=None, input_layout=None,
+                        is_triu_mask: int = 0,
+                        kernel_type=None,
+                        kvcache_cfg=None):
+    """ATB SelfAttentionParam with flexible configuration.
 
     Args:
-        num_heads:   number of query heads
+        num_heads:    number of query heads
         num_kv_heads: number of key/value heads (supports GQA when < num_heads)
-        head_dim:    dimension per attention head
-        mask_type:   explicit mask type (if use_mask is False)
-        use_mask:    if True, sets MASK_TYPE_NORM (additive causal mask, 0=attend)
-
-    Layout is TYPE_BSND (batch × seq × num_heads × head_dim), 3D input.
-    Uses PA_ENCODER calc type with scaling factor 1/sqrt(head_dim).
+        head_dim:     dimension per attention head
+        mask_type:    explicit mask type (if use_mask is False)
+        use_mask:     if True, sets MASK_TYPE_NORM
+        calc_type:    calc type enum (default PA_ENCODER)
+        input_layout: input layout enum (default TYPE_BSND)
+        is_triu_mask: 0/1, enable causal mask internal optimization
+        kernel_type:  kernel precision type (default KERNELTYPE_DEFAULT)
     """
     p = torch_atb.SelfAttentionParam(
         head_num=num_heads,
         kv_head_num=num_kv_heads,
         qk_scale=1.0 / (head_dim ** 0.5),
-        calc_type=torch_atb.SelfAttentionParam.CalcType.PA_ENCODER,
-        input_layout=torch_atb.InputLayout.TYPE_BSND,
     )
+    p.calc_type = (calc_type
+                   if calc_type is not None
+                   else torch_atb.SelfAttentionParam.CalcType.PA_ENCODER)
+    p.input_layout = (input_layout
+                      if input_layout is not None
+                      else torch_atb.InputLayout.TYPE_BSND)
+    p.is_triu_mask = is_triu_mask
+    if kernel_type is not None:
+        p.kernel_type = kernel_type
+    if kvcache_cfg is not None:
+        p.kvcache_cfg = kvcache_cfg
+
     if use_mask:
         p.mask_type = torch_atb.SelfAttentionParam.MaskType.MASK_TYPE_NORM
     elif mask_type is not None:
