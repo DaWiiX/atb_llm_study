@@ -168,7 +168,12 @@ def make_self_attention(num_heads: int, num_kv_heads: int, head_dim: int,
     if use_mask:
         p.mask_type = torch_atb.SelfAttentionParam.MaskType.MASK_TYPE_NORM
     elif mask_type is not None:
-        p.mask_type = mask_type
+        if isinstance(mask_type, int):
+            # Support MASK_TYPE_CAUSAL_MASK (value=9) which is not exposed
+            # in the Python MaskType enum but IS supported by C++ ATB.
+            p.mask_type = torch_atb.SelfAttentionParam.MaskType(mask_type)
+        else:
+            p.mask_type = mask_type
     return p
 
 

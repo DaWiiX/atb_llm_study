@@ -44,4 +44,33 @@ inline void Bf16ToFp16Buffer(const uint16_t* src, uint16_t* dst, size_t num_elem
     }
 }
 
+/// Convert a 2D fp16 matrix from ND (row-major) layout to FRACTAL_NZ layout.
+/// FRACTAL_NZ divides the matrix into 16×16 blocks; blocks are in column-major
+/// order within each block.  Padding elements are zero-filled.
+///
+/// @param nd_data   Input  [m, n] in row-major (ND) layout
+/// @param m         Logical rows
+/// @param n         Logical columns
+/// @param nz_data   Output [1, ceil(n/16), ceil(m/16)*16, 16] in NZ layout
+///                  (must be pre-allocated to total NZ elements)
+inline void ConvertNdToNzFp16(const uint16_t* nd_data,
+                               int64_t m, int64_t n,
+                               uint16_t* nz_data) {
+    int64_t m_pad = ((m + 15) / 16) * 16;
+    int64_t n_pad = ((n + 15) / 16) * 16;
+    int64_t n_blocks = n_pad / 16;
+    size_t total = static_cast<size_t>(n_blocks * m_pad * 16);
+    // Zero-fill padding
+    std::memset(nz_data, 0, total * sizeof(uint16_t));
+    // ND[ row ][ col ] → NZ[ 0, col/16, row, col%16 ]
+    for (int64_t row = 0; row < m; row++) {
+        for (int64_t col = 0; col < n; col++) {
+            int64_t block_col = col / 16;
+            int64_t col_in_block = col % 16;
+            int64_t nz_idx = block_col * m_pad * 16 + row * 16 + col_in_block;
+            nz_data[nz_idx] = nd_data[row * n + col];
+        }
+    }
+}
+
 }  // namespace atb_llm

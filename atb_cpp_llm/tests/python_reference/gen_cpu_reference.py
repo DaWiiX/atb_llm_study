@@ -1256,12 +1256,36 @@ def gen_op_self_attention():
         kind = "causal" if causal else ("with-mask" if use_mask else "no-mask")
         print(f"  → {name}: S={S} nh={nh} kvh={kvh} hd={hd} ({kind})")
 
+    # ── Basic cases (910B baseline) ──
     _make("mha_nomask", S=8, nh=4,  kvh=4, hd=32, seed=4001,
           use_mask=False, causal=False)
     _make("gqa_nomask", S=8, nh=12, kvh=4, hd=64, seed=4002,
           use_mask=False, causal=False)
     _make("mha_causal", S=8, nh=4,  kvh=4, hd=32, seed=4003,
           use_mask=True,  causal=True)
+
+    # ── 310P NZ mask tests: different S values (causal mask, MHA) ──
+    # S=4:  not 16-aligned → tests padding behaviour
+    _make("mha_causal_s4", S=4, nh=4, kvh=4, hd=32, seed=4100,
+          use_mask=True, causal=True)
+    # S=16: 16-aligned → ideal case for 310P
+    _make("mha_causal_s16", S=16, nh=4, kvh=4, hd=32, seed=4101,
+          use_mask=True, causal=True)
+    # S=32: 16-aligned, larger
+    _make("mha_causal_s32", S=32, nh=4, kvh=4, hd=32, seed=4102,
+          use_mask=True, causal=True)
+
+    # ── 310P NZ mask tests: real model params (hd=128, nh=16 MHA) ──
+    # S=4:  real Qwen3VL-Embedding-2B MHA, not 16-aligned
+    _make("mha_causal_hd128_s4", S=4, nh=16, kvh=16, hd=128, seed=4103,
+          use_mask=True, causal=True)
+    # S=16: real model, 16-aligned
+    _make("mha_causal_hd128_s16", S=16, nh=16, kvh=16, hd=128, seed=4104,
+          use_mask=True, causal=True)
+
+    # ── No-mask cases with real model params (sanity check) ──
+    _make("mha_nomask_hd128_s16", S=16, nh=16, kvh=16, hd=128, seed=4105,
+          use_mask=False, causal=False)
 
 
 # ═══════════════════════════════════════════════════════════════════

@@ -1,5 +1,6 @@
 #include "ops/self_attention_op.h"
 #include "log/logger.h"
+#include "util/cpp11_compat.h"
 #include <cmath>
 
 namespace atb_llm {

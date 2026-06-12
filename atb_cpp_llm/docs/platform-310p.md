@@ -6,6 +6,57 @@ ATB LLM 项目支持 **Ascend 310P** (Atlas推理系列产品) 和 **Ascend 910B
 
 两个平台的差异在于 ATB 算子支持范围不同。本文档记录适配策略、架构设计、测试方法、已发现问题和运维要点。
 
+## ATB 文档关键发现（2026-06-12 重新审查）
+
+### 文档来源
+
+| 页面 | 内容 | 关键发现 |
+|------|------|---------|
+| [0261 定义](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/850/API/ascendtbapi/ascendtb_01_0261.html) | SelfAttentionParam 结构体 | 完整枚举值列表 |
+| [0262 参数列表](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/850/API/ascendtbapi/ascendtb_01_0262.html) | 每个参数的含义和默认值 | isTriuMask 只对倒三角 mask 有效 |
+| [0264 输入输出](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/850/API/ascendtbapi/ascendtb_01_0264.html) | 通用输入输出列表 | attentionMask 支持 6 种 shape |
+| [0265 PA_ENCODER](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/850/API/ascendtbapi/ascendtb_01_0265.html) | **PA_ENCODER 输入输出** | **310P mask 格式为 NZ！** |
+| [0266 PREFIX_ENCODER](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/850/API/ascendtbapi/ascendtb_01_0266.html) | PREFIX_ENCODER 输入输出 | 需要 blockTables + kvCache |
+| [0267 CAUSAL_MASK](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/850/API/ascendtbapi/ascendtb_01_0267.html) | PREFIX_ENCODER + CAUSAL_MASK | 无 mask 输入，仅 seqLen + kvSeqLen |
+| [0268 约束说明](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/850/API/ascendtbapi/ascendtb_01_0268.html) | **310P 特殊约束** | headSize∈(0,256]、16对齐、nTokens 向上对齐16 |
+| [0010 TensorDesc](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/850/API/ascendtbapi/ascendtb_01_0010.html) | Tensor 描述符 | format 字段可指定 ACL_FORMAT_FRACTAL_NZ |
+
+### 关键发现 1：PA_ENCODER 在 310P 上 mask 格式是 NZ（不是 ND！）
+
+文档 0265 页**明确**指出 PA_ENCODER 下 attentionMask 的格式：
+
+| 平台 | Mask 格式 |
+|------|----------|
+| Atlas A2 训练/推理系列产品 (910B) | **ND** |
+| Atlas 推理系列产品 (310P) | **NZ** |
+| Atlas 训练系列产品 | NZ |
+
+**这意味着**：在 310P 上，传给 PA_ENCODER SelfAttention 的 mask tensor **必须是 NZ (FRACTAL_NZ) 格式**，不是 ND 格式。这正是我们之前用 TransdataOp ND→NZ 预转换的方向！
+
+### 关键发现 2：310P 约束汇总（0268 页）
+
+从约束说明页面提取的 **310P 专属约束**：
+
+| 约束项 | 说明 |
+|--------|------|
+| batch 范围 | `0 < batch <= 2000` |
+| headSize 范围 | `(0, 256]`（开启量化/logN缩放/SWA/BNSD时）；否则 `(0, 576]` |
+| headSize 对齐 | **必须为 16 的倍数** |
+| max_seq_len 对齐 | **应 16 对齐** |
+| qSeqLen == kvSeqLen | PA_ENCODER 下必须相等 |
+| headSize == vHeadSize | 量化/logN/SWA/BNSD 场景下 |
+| nTokens 计算 | PA_ENCODER 下：所有 batch seqLen 之和向上对齐到 16 的整数倍 |
+| GQA 支持 | PA_ENCODER 下 `headNum > kvHeadNum` 即可 |
+| headNum % kvHeadNum == 0 | 必须整除 |
+
+### 关键发现 3：TensorDesc format 字段
+
+从 0010 页确认：`TensorDesc.format` 字段类型为 `aclFormat`，默认 `ACL_FORMAT_UNDEFINED`。创建 tensor 时可以指定 format。但 **数据必须按照指定 format 的物理布局写入**，不能以 ND 布局数据写入 NZ 格式 tensor。
+
+### 关键发现 4：之前文档的错误
+
+原 platform-310p.md 说 "BNSD 布局（所有 calcType）：CreateOp failed" — 这是在 910B 上测试的结果。文档 0262 页显示 `inputLayout` 可设为 `TYPE_BNSD`（枚举值 1），310P 产品支持页面显示 BNSD 在 310P 上部分支持。需要在真实 310P 上重新验证。
+
 ## 平台差异
 
 ### 已知兼容性
@@ -16,78 +67,311 @@ ATB LLM 项目支持 **Ascend 310P** (Atlas推理系列产品) 和 **Ascend 910B
 | RopeOperation | ✅ 支持 | ✅ 支持 |
 | Linear / RMSNorm / LayerNorm | ✅ 支持 | ✅ 支持 |
 | 所有 Vision 路径算子 | ✅ 支持 | ✅ 支持 |
+| SelfAttention PA_ENCODER mask=ND | ✅ 支持 | ❌ 不支持（需 NZ 格式）|
+| SelfAttention PA_ENCODER mask=NZ | ❓ 未测试 | ✅ 文档声称支持 |
 
-### 待验证（需在 310P 实测）
-
-| 特性 | 910B 基线 | 310P 预期 |
-|------|-----------|----------|
-| SelfAttention BSND+PA_ENCODER+MASK_NORM+hd=64 | ✅ PASS | ✅ 同 Vision path |
-| SelfAttention BSND+PA_ENCODER+MASK_NORM+hd=128 | ✅ PASS | ❌ 实测失败（TransdataOperation）|
-| SelfAttention BSND+PA_ENCODER+MASK_NORM+is_triu=1 | ✅ PASS | ⏳ 待实测 |
-| SelfAttention BSND+PA_ENCODER+KERNELTYPE_HIGH_PRECISION | ❌ cos=nan (910B 也可复现) | — |
-| BNSD 布局（所有 calcType） | ❌ CreateOp failed | — |
-| MASK_TYPE_NORM_COMPRESS | ❌ CreateOp failed | — |
-| 非 PA_ENCODER (UNDEFINED/ENCODER/DECODER) | ❌ CreateOp failed | — |
-
-**重点**：310P 上唯一确认可用的是 BSND+PA_ENCODER+MASK_NORM 组合。`is_triu_mask=1` 在 910B 上兼容且精度正常，是 310P 最优先的备选方案。
-
-## 已知问题：SelfAttention head_dim=128 + mask 在 310P 上失败
-
-### 现象
-
-310P 实测 `test_accuracy` 中 Vision path 全部通过，Text path 在第一个 decoder layer 的 SelfAttention 报错：
+### Mask 格式需求（基于文档 0265）
 
 ```
-SelfAttentionEncoderFusionOpsRunner: TransdataOperation mki node infer shape fail, inDims is not support
+310P PA_ENCODER mask 要求:
+  格式: FRACTAL_NZ (ACL_FORMAT=29)
+  逻辑 shape: [maxSeqLen, maxSeqLen] 等（与 910B 相同的逻辑 shape）
+  物理 shape: [1, ceil(S/16), ceil(S/16)*16, 16]（float16 下）
+  
+910B PA_ENCODER mask 要求:
+  格式: ND (ACL_FORMAT=2)
+  shape: [maxSeqLen, maxSeqLen]
 ```
 
-### 失败对比
+## 实验矩阵：SelfAttentionOp 原子级参数组合
 
-| 参数 | Vision Path ✅ | Text Path ❌ |
-|------|---------------|-------------|
-| headDim | 64 | **128** |
-| mask | **false** | **true (MASK_TYPE_NORM, 2D [S,S] tensor)** |
-| headNum | 16 | 16（GQA→MHA 展开后）|
-| kvHeadNum | 16 | 16 |
-| inputLayout | BSND | BSND |
-| calcType | PA_ENCODER | PA_ENCODER |
+> **实验原则**：先基础功能，后高级功能。每次只改变一个变量。记录所有结果。
 
-### 根因分析
+### 基础功能矩阵（必须通过）
 
-1. **310P 的 SelfAttentionEncoderFusionOpsRunner** 内部做 ND→NZ 格式转换（TransdataOperation），当传入 2D mask tensor [S, S] 且 head_dim=128 时，某个中间 tensor 的维度不满足 Transdata 的对齐约束
+| # | S | nh | kvh | hd | mask | mask格式 | isTriuMask | 预期 | 状态 |
+|---|----|----|-----|-----|------|---------|------------|------|------|
+| B1 | 16 | 4 | 4 | 32 | none | — | 0 | ✅ PASS | **待310P实测** |
+| B2 | 16 | 4 | 4 | 32 | causal | ND | 0 | ❌ Transdata fail | **待310P实测** |
+| B3 | 16 | 4 | 4 | 32 | causal | ND | 1 | ❓ | **待310P实测** |
+| B4 | 16 | 4 | 4 | 32 | causal | NZ | 0 | ✅ 应通过(文档) | **待310P实测** |
+| B5 | 16 | 4 | 4 | 32 | causal | NZ | 1 | ❓ | **待310P实测** |
+| B6 | 4 | 4 | 4 | 32 | causal | NZ | 0 | ❓ S非16对齐 | **待310P实测** |
+| B7 | 8 | 4 | 4 | 32 | causal | NZ | 0 | ❓ S非16对齐 | **待310P实测** |
+| B8 | 32 | 4 | 4 | 32 | causal | NZ | 0 | ✅ 应通过 | **待310P实测** |
 
-2. **ATB 文档**（[产品支持情况](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/900/API/ascendtb/ascendtb_01_0256.html)）：
-   - 310P（Atlas 推理系列产品）对 SelfAttention 是"部分场景支持，BNSD维度输入，高精度，压缩mask"
-   - 310P 支持 PA_ENCODER（文档提到 nTokens 对齐规则）
-   - BNSD + PA_ENCODER 不支持 310P（文档明确说"不支持Atlas 推理系列产品"）
-   - 非 PA_ENCODER + BNSD 需要 KV cache（NZ 格式），不适用于无 KV cache 的全量场景
+### 真实模型参数矩阵
 
-3. **结论**：问题锁定在 BSND+PA_ENCODER+MASK_NORM+head_dim=128 这个四元组。910B 上所有参数组合实验表明，BSND 下只有 PA_ENCODER 能工作，BNSD 不可用
+| # | S | nh | kvh | hd | mask | mask格式 | 说明 | 状态 |
+|---|----|----|-----|-----|------|---------|------|------|
+| R1 | 16 | 16 | 16 | 128 | causal | NZ | 真实MHA+hd=128+16对齐 | **待310P实测** |
+| R2 | 4 | 16 | 16 | 128 | causal | NZ | 真实MHA+hd=128+S=4 | **待310P实测** |
+| R3 | 880 | 16 | 16 | 128 | causal | NZ | 真实MHA+hd=128+S=880 | **待310P实测** |
 
-### 参数组合实验（910B 基线）
+### 高级功能矩阵（基础功能通过后再测）
 
-在 910B 上测试了 18 种 BSND 参数组合（脚本：`test_310p_combinations.py`）：
+| # | 功能 | 参数 | 依赖 | 状态 |
+|---|------|------|------|------|
+| A1 | 高精度 | `kernelType=KERNELTYPE_HIGH_PRECISION` | 基础mask通过 | 未开始 |
+| A2 | clamp缩放 | `clampType=CLAMP_TYPE_MIN_MAX` | 基础mask通过 | 未开始 |
+| A3 | 压缩mask | `maskType=MASK_TYPE_NORM_COMPRESS` | 基础mask通过 | 未开始 |
+| A4 | kv-bypass | `kvcacheCfg=K_BYPASS_V_BYPASS` | 基础mask通过 | 未开始 |
+| A5 | logN缩放 | `scaleType=SCALE_TYPE_LOGN` | 基础mask通过 | 未开始 |
+| A6 | BNSD维度输入 | `inputLayout=TYPE_BNSD` | 基础mask通过 | 未开始 |
+| A7 | kv tensorlist | CPU侧kv cache输入 | 需要kv cache | 未开始 |
+| A8 | SWA | `cacheType=CACHE_TYPE_SWA` | 基础mask通过 | 未开始 |
 
-**通过（12/18）：**
-- BSND + PA_ENCODER + MASK_TYPE_NORM：所有 S (4,16,32,64,256,880) ✅
-- BSND + PA_ENCODER + MASK_TYPE_NORM + is_triu_mask=1 ✅
-- BSND + PA_ENCODER + MASK_TYPE_UNDEFINED（无 mask）✅
-- BSND + PA_ENCODER + MASK_TYPE_NORM (GQA) ✅
-- BSND + PA_ENCODER + MASK_TYPE_NORM (hd=64) ✅
+## 已尝试方案及结果
 
-**失败（6/18）：**
-- BNSD 布局（所有 calcType）：CreateOp failed（需要 KV cache）
-- MASK_TYPE_NORM_COMPRESS：CreateOp failed
-- 非 PA_ENCODER (UNDEFINED/ENCODER/DECODER)：CreateOp failed
-- NO_MASK + is_triu_mask=1：互不兼容
-- HIGH_PRECISION：cos=nan
+### 方案 1: 原生 MASK_TYPE_NORM + ND mask（910B 默认）
 
-### 下一步方向
+```cpp
+param.maskType = atb::infer::SelfAttentionParam::MASK_TYPE_NORM;
+// mask: 2D ND [S, S]
+```
 
-1. **优先方案**：在 310P 上测试 `is_triu_mask=1` 是否能绕过 Transdata 问题（910B 已确认精度正常）
-2. **备选方案 A**：`MASK_TYPE_UNDEFINED` 无 mask（但不满足 causal attention 需求）
-3. **备选方案 B**：C++ 侧用 `MASK_TYPE_CAUSAL_MASK`（ATB 内部生成因果 mask，不传外部 mask tensor）— 已实现但未在 310P 上实测
-4. **长线方案**：确认 310P 是否支持通过其他 ATB 算子（MatMul+Softmax+Elewise）构建 attention
+**310P 结果**：❌ 失败
+- 错误：`TransdataOperation mki node infer shape fail, inDims is not support`
+- 原因：310P SelfAttentionEncoderFusionOpsRunner 内部做 ND→NZ 转换，TransdataOperation 在 310P 上失败
+- ATB 日志显示：融合 runner 内部调用的 Transdata 不接受输入的维度
+
+### 方案 2: isTriuMask=1 + MASK_TYPE_NORM + ND mask
+
+```cpp
+param.maskType = atb::infer::SelfAttentionParam::MASK_TYPE_NORM;
+param.isTriuMask = 1;
+// mask: 2D ND [S, S]
+```
+
+**910B 结果**：✅ PASS (cos=1.0)
+**310P 结果**：❌ 失败（与前次对话汇总一致）
+- 错误：同样的 TransdataOperation 内部转换失败
+- 说明：isTriuMask=1 不改变内部 Transdata 路径，只是优化标志
+
+### 方案 3: MASK_TYPE_CAUSAL_MASK（内部生成 mask）
+
+```cpp
+param.maskType = atb::infer::SelfAttentionParam::MASK_TYPE_CAUSAL_MASK;
+param.calcType = atb::infer::SelfAttentionParam::PREFIX_ENCODER;
+```
+
+**结果**：❌ 失败
+- 错误：`shape of seqlen should be [batch] or [2, batch]`（错误码 8）
+- 原因：MASK_TYPE_CAUSAL_MASK 仅与 PREFIX_ENCODER 配对（文档 0267 页确认），需要 blockTables + kvCache 输入
+- PREFIX_ENCODER 需要 `[numBlocks, blockSize, ...]` 格式的 K/V 和 blockTables，与我们的无 KV cache 全量 attention 场景不兼容
+
+### 方案 4: MASK_TYPE_NORM_COMPRESS（压缩 mask）
+
+```cpp
+param.maskType = atb::infer::SelfAttentionParam::MASK_TYPE_NORM_COMPRESS;
+```
+
+**910B 结果**：❌ CreateOp failed
+**310P 结果**：❌ CreateOp failed（与前次对话汇总一致）
+- 原因：压缩 mask 需要特殊格式（固定 128×128 上三角 tile），在 PA_ENCODER 下不受支持
+- 文档 0266 页：MASK_TYPE_NORM_COMPRESS 仅在 PREFIX_ENCODER 下列出（shape `[128, 128]`）
+
+### 方案 5: NZ 预转换（TransdataOp ND→NZ）+ MASK_TYPE_NORM
+
+```
+TransdataOp(ND_TO_FRACTAL_NZ): mask [S,S] → mask_nz [1, ceil(S/16), ceil(S/16)*16, 16]
+SelfAttention: 接收 NZ 格式 mask
+```
+
+**310P 结果**：
+- TransdataOp 独立运行：✅ PASS（ND→NZ 转换成功）
+- Graph 构建（含 TransdataOp）：✅ PASS（test_text_ops 7/7 全部通过）
+- Graph Setup：❌ ERROR_RT_FAIL (error 4)
+- SelfAttentionOp 独立测试（含 NZ mask）：❌ 待确认
+
+**分析**：
+- 文档 0265 页明确说 310P PA_ENCODER mask 格式是 NZ，所以 NZ mask 方向是正确的
+- Graph 构建成功但 Setup 失败 → 中间 tensor 的 format 标记可能有问题
+- 可能原因：Graph builder 自动创建的中间 tensor 默认 format=ND，但 TransdataOp 输出的数据是 NZ 布局 → 不一致
+
+### 方案 6: 直接创建 NZ 格式 mask（绕过 TransdataOp）
+
+**思路**（用户建议）：在 `qwen3vl_model.cpp` 的 `cached_mask_npu_` 创建时直接指定 NZ format，数据按 NZ 物理布局写入。这样 SelfAttention 收到的就是 NZ 格式 mask，无需 TransdataOp。
+
+**状态**：⏳ 待实施
+
+**关键问题**：
+1. `AllocNpuFloat16({seq_len, seq_len})` 默认创建 ND 格式 tensor
+2. 要创建 NZ 格式：需要分配 NZ 物理 shape `{1, ceil(S/16), ceil(S/16)*16, 16}` 并设置 `format = ACL_FORMAT_FRACTAL_NZ`
+3. **数据必须按 NZ 布局写入**：FRACTAL_NZ 将矩阵按 16×16 块重排，不能直接写入 ND 布局数据
+4. 需要实现 CPU 侧 ND→NZ 数据重排，或在 NPU 上用 TransdataOp 做一次性转换后保存 NZ 格式的 mask 复用
+
+## 310P 实测指南
+
+> **当前状态 (2026-06-12)**：代码已准备好，待 310P 实测验证。
+> 
+> **核心改动**：310P 上 mask 在 `qwen3vl_model.cpp` 创建时直接转为 NZ (FRACTAL_NZ) 格式，不再在 graph builder 中插入 TransdataOp。
+
+### 前置准备
+
+```bash
+# 1. 进入项目目录
+cd /path/to/atb_llm
+
+# 2. 确认 310P 环境
+echo "ASCEND_PLATFORM=310P" >> .env   # 如果还没有设置
+export ASCEND_PLATFORM=310P
+
+# 3. 加载环境
+source ~/Ascend/ascend-toolkit/set_env.sh
+source ~/Ascend/cann/set_env.sh
+source ~/Ascend/nnal/atb/latest/atb/set_env.sh --cxx_abi=1
+source ~/Ascend/nnal/atb/set_env.sh --cxx_abi=1
+export ATB_BUILD_DEPENDENCY_PATH=~/Ascend/nnal/atb/latest/atb/cxx_abi_1
+
+# 4. 验证是真实 310P（非 910B）
+npu-smi info -t board -i 0 2>/dev/null | grep -i "310P\|Chip"
+# 应该看到 Ascend310P 或类似字样
+```
+
+### 阶段 1：原子级测试（SelfAttentionOp 单算子）
+
+**这是最关键的测试**。如果原子级测试都无法通过，不要浪费时间做 E2E。
+
+```bash
+cd atb_cpp_llm
+
+# Step 1: 生成参考数据（如果还没有，或重新生成）
+# 参考数据在 /tmp/cpu_op_sa_*.bin
+# 如果已有，可以跳过此步
+python3 tests/python_reference/gen_cpu_reference.py --stage op_self_attention
+# 预期输出 9 个 cases：mha_nomask, gqa_nomask, mha_causal, 
+#   mha_causal_s4, mha_causal_s16, mha_causal_s32,
+#   mha_causal_hd128_s4, mha_causal_hd128_s16, mha_nomask_hd128_s16
+
+# Step 2: 构建（如果还没有 build 目录或代码有改动）
+cd build
+cmake .. -DCMAKE_BUILD_TYPE=Release
+cmake --build . --target test_self_attention_precision -j8
+
+# Step 3: 运行 310P 原子级测试
+ASCEND_PLATFORM=310P ./test_self_attention_precision 2>&1 | tee /tmp/310p_sa_test.log
+
+# Step 4: 查看测试结果摘要
+grep -E "cosine|PASSED|FAILED|ERROR|test cases|Skipping" /tmp/310p_sa_test.log
+```
+
+**原子级测试用例清单：**
+
+| # | CASE | S | nh | kvh | hd | mask | 说明 | 预期 (310P) |
+|---|------|---|----|-----|-----|------|------|------------|
+| 1 | mha_nomask | 8 | 4 | 4 | 32 | ❌ | 基础无mask基线 | ✅ PASS |
+| 2 | gqa_nomask | 8 | 12 | 4 | 64 | ❌ | GQA (310P跳过) | ⏭ SKIP |
+| 3 | mha_causal | 8 | 4 | 4 | 32 | ✅ | S=8, 非16对齐, NZ mask | ❓ 关键测试 |
+| 4 | mha_causal_s4 | 4 | 4 | 4 | 32 | ✅ | S=4, 非16对齐, NZ mask | ❓ 关键测试 |
+| 5 | mha_causal_s16 | 16 | 4 | 4 | 32 | ✅ | **S=16, 16对齐, NZ mask** | ✅ 最可能通过 |
+| 6 | mha_causal_s32 | 32 | 4 | 4 | 32 | ✅ | S=32, 16对齐, NZ mask | ✅ 应通过 |
+| 7 | mha_causal_hd128_s4 | 4 | 16 | 16 | 128 | ✅ | 真实MHA, S=4, 非16对齐 | ❓ |
+| 8 | mha_causal_hd128_s16 | 16 | 16 | 16 | 128 | ✅ | **真实MHA, S=16, 16对齐** | ✅ 最可能通过 |
+| 9 | mha_nomask_hd128_s16 | 16 | 16 | 16 | 128 | ❌ | 真实MHA, 无mask | ✅ PASS |
+
+**关键指标：**
+- 所有通过的 CASE：余弦相似度必须 **≥ 0.99**（理想情况下 = 1.0）
+- GQA CASE 应显示 `SKIP`（310P 不支持 GQA）
+- 如果 case 5/6/8（16对齐 S）全部通过但 case 3/4/7（非16对齐 S）失败 → 说明 310P 严格要求 S 16对齐
+
+### 阶段 2：Graph 组件测试
+
+**仅在阶段 1 全部相关 case 通过（cos ≥ 0.99）后执行。**
+
+```bash
+cd atb_cpp_llm/build
+
+# 构建所有测试目标
+cmake --build . -j8
+
+# Step 1: SelfAttentionGraph + TextDecoderLayerGraph 构建测试
+ASCEND_PLATFORM=310P ./test_text_ops 2>&1 | tee /tmp/310p_text_ops.log
+# 预期：7/7 passed
+# 如果 Graph Build 失败，记录哪个 graph 失败和错误信息
+
+# Step 2: TextDecoderLayer 精度测试（含参考数据）
+ASCEND_PLATFORM=310P ./test_text_decoder_layer_precision 2>&1 | tee /tmp/310p_dec.log
+# 检查 cos 值
+
+# Step 3: TextModel 精度测试
+ASCEND_PLATFORM=310P ./test_text_model 2>&1 | tee /tmp/310p_text_model.log
+```
+
+### 阶段 3：E2E 测试
+
+**仅在阶段 1 和 2 全部通过后执行。**
+
+```bash
+cd atb_cpp_llm
+
+# 生成 E2E 参考数据（需要模型文件）
+python3 tests/python_reference/gen_cpu_reference.py --stage e2e 2>&1
+
+# 运行 E2E 测试
+cd build
+ASCEND_PLATFORM=310P ./test_qwen3vl_embedding_e2e 2>&1 | tee /tmp/310p_e2e.log
+
+# 检查 cos 值
+grep -E "cosine|similarity|PASSED|FAILED" /tmp/310p_e2e.log
+```
+
+### 失败诊断：需要反馈的信息
+
+如果任何步骤失败，请收集以下信息并反馈：
+
+```bash
+# === 必收集信息 ===
+
+# 1. 测试输出（完整日志）
+cat /tmp/310p_sa_test.log
+# 或对应阶段的日志文件
+
+# 2. ATB 内部日志（最重要！）
+# C++ 测试的日志：
+cat /root/atb/log/$(ls -rt /root/atb/log/ 2>/dev/null | tail -n 1) 2>/dev/null
+# 或
+cat /home/developer/ascend/log/atb/$(ls -rt /home/developer/ascend/log/atb/ 2>/dev/null | tail -n 1) 2>/dev/null
+
+# 3. 硬件信息
+npu-smi info -t board -i 0 2>/dev/null
+echo "ASCEND_PLATFORM=$ASCEND_PLATFORM"
+
+# 4. ATB 版本
+ls ~/Ascend/nnal/atb/latest/atb/cxx_abi_1/lib/libatb.so
+strings ~/Ascend/nnal/atb/latest/atb/cxx_abi_1/lib/libatb.so | grep -E "SelfAttention.*version\|ATB.*version\|build.*time" | head -5
+
+# 5. 哪些 case 失败、哪些通过
+grep -E "cosine|FAILED|ERROR|Skipping|test cases" /tmp/310p_sa_test.log
+```
+
+**反馈时请同时提供原始日志文件**，不要只粘贴摘要。
+
+### 如果 310P 上 NZ mask 方案全部失败
+
+不要慌。如果所有带 mask 的 case 都失败（但无 mask case 通过），说明 310P 的 SelfAttention fusion kernel 不支持我们提供的 NZ mask 格式。此时：
+
+1. **保存所有日志**（ATB 日志尤其重要，会显示 kernel 内部不接受什么）
+2. **反馈给我**，我会立即切换到**手动 attention 方案**（MatMul → scale → add_mask → Softmax → MatMul，全用基础 ATB 算子）
+3. 手动 attention 方案**保证可行**，只是性能可能略低于融合算子
+
+## 架构设计：310P 逻辑收敛原则
+
+**核心原则**：Graph builder 和 Model 层不感知 310P/910B 差异。所有平台差异仅在对应的 Op 创建函数中处理。
+
+但有一个例外：**mask 的 format 差异**。因为 310P 和 910B 对 PA_ENCODER mask 的 format 要求不同（NZ vs ND），且 tensor 的 format 在创建时就需要确定，这个差异需要在 mask 创建处（`qwen3vl_model.cpp` 或 engine 层）处理。
+
+### 当前实现中的平台差异位置
+
+| 文件 | Is310P() 判断点 | 用途 |
+|------|----------------|------|
+| `src/ops/self_attention_op.cpp` | 1 处 | isTriuMask 参数（可能不需要）|
+| `src/adapters/qwen3vl_embedding/qwen3vl_model.cpp` | 1 处 | GQA→MHA 权重展开 |
+| `src/components/common/self_attention_graph.cpp` | 1 处 | TransdataOp ND→NZ（临时方案）|
+| `src/components/common/gqa_attention_builder.cpp` | 1 处 | TransdataOp ND→NZ（临时方案）|
+| 测试文件 | N 处 | GQA 测试 SKIP guard |
+
+**目标**：将 self_attention_graph.cpp 和 gqa_attention_builder.cpp 中的 TransdataOp 逻辑移除，改为在 mask 创建时直接指定 NZ 格式。
 
 ## 适配策略：GQA→MHA 权重展开
 
@@ -179,105 +463,6 @@ ASCEND_PLATFORM=310P
 | `test_self_attention_precision` | SelfAttentionOp GQA no mask | 同上 |
 | `test_text_decoder_layer_precision` | TextDecoderLayerGraph GQA with mask | 同上 |
 
-这些跳过不影响覆盖率：GQA 路径的正确性通过 engine 层的 GQA→MHA 展开 + E2E 精度测试验证（910B 和 310P 展开后数值等价，cos > 0.99998）。
-
-### 310P 上 910B 代码的兼容性
-
-**910B 可以运行 310P 路径的代码**：设置 `ASCEND_PLATFORM=310P` 即可强制走 GQA→MHA 展开路径。这用于在 910B 上预先验证 310P 兼容性。
-
-**310P 不能运行 910B 原生 GQA 代码**：这就是为什么需要 `ASCEND_PLATFORM=310P` 的设置。engine 层检测到 310P 后自动展开权重，算子层的 GQA 测试自动跳过。
-
-## 验证结果
-
-以下结果在 910B 上以两种模式运行获得（数值等价性已验证）：
-
-| 测试 | 910B 默认 | 310P 强制 | 910B vs 310P 数值等价 |
-|------|----------|----------|----------------------|
-| test_text_attention | PASS (cos=0.999999) | PASS (cos=0.999999) | — |
-| test_text_decoder_layer | — | PASS (cos=0.999999) | — |
-| test_text_model | — | PASS (cos=0.999999) | — |
-| test_e2e Text-Only | PASS (cos=0.999961) | PASS (cos=0.999955) | cos=0.999998 |
-| test_e2e Image-Only | PASS (cos=0.999720) | PASS (cos=0.999713) | cos=0.999982 |
-| test_e2e Image+Text | PASS (cos=0.999916) | PASS (cos=0.999913) | cos=0.999998 |
-| test_stage_reference | PASS | PASS | — |
-
-## 在 310P 上运行
-
-### 首次部署
-
-```bash
-# 1. 配置平台
-cd /path/to/atb_llm
-echo "ASCEND_PLATFORM=310P" >> .env
-
-# 2. Python E2E 测试
-python atb_python_qwen3vl_embedding/tests/test_e2e.py
-
-# 3. 生成 C++ 参考数据 + 构建 + 全量测试
-bash atb_cpp_llm/build_and_test.sh
-```
-
-### 日常开发迭代
-
-```bash
-# 快速验证（复用已有参考数据，不重新生成）
-bash atb_cpp_llm/build_and_test.sh --test-only --no-refresh-refdata
-
-# 只跑 Level 4 E2E
-bash atb_cpp_llm/build_and_test.sh --test-only --no-refresh-refdata level4_e2e
-```
-
-### 诊断脚本
-
-如果 E2E 测试失败，先运行基础诊断脚本定位具体失败点：
-
-```bash
-ASCEND_PLATFORM=310P python atb_python_qwen3vl_embedding/tests/test_310p_diag.py
-```
-
-该脚本依次测试 11 种 SelfAttention 参数组合（hd=64 和 hd=128 全覆盖）：
-1. MHA + 无 mask（基线）
-2. MHA + causal mask
-3. GQA + 无 mask
-4. GQA + causal mask
-5. 真实模型 GQA (nh=32, kv_nh=4)
-6. 真实模型 MHA (nh=32, kv_nh=32)
-7. MHA + mask + hd=128（隔离 head_dim 影响）
-8. MHA + nomask + hd=128
-9. Real MHA + mask + hd=128 (nh=16)
-10. Real MHA + mask + hd=128 S=4
-11. Real MHA + mask + hd=128 S=880
-
-### 参数组合深度扫描
-
-在诊断脚本通过后，运行参数组合扫描进一步验证：
-
-```bash
-ASCEND_PLATFORM=310P python atb_python_qwen3vl_embedding/tests/test_310p_combinations.py
-```
-
-该脚本覆盖 18 种 BSND 参数组合（不含 BNSD，BNSD 在 910B 上已确认不可用）：
-- A组 (5)：不同 seqlen (4,16,32,64,256)
-- B组 (2)：is_triu_mask 变体
-- C组 (1)：HIGH_PRECISION kernel
-- D组 (2)：不同 mask type
-- E组 (3)：不同 calc_type
-- F组 (1)：GQA 模式
-- G组 (2)：hd=64 对比
-- H组 (2)：大 seqlen (880)
-
-两组脚本的关系：
-- `test_310p_diag.py`：快速诊断，SelfAttention 单元级，30s 内出结果
-- `test_310p_combinations.py`：深度扫描，完整 AttentionGraph 级（含 Q/K/V proj + RoPE + O-proj），全面覆盖
-
-### 参考数据生成
-
-```bash
-# gen_all.py 有容错：单个生成器失败不会中断整体
-# 失败时自动 fallback 到 --no-refdata 模式
-ASCEND_PLATFORM=310P python atb_cpp_llm/tests/python_reference/gen_all.py
-```
-
 ## 精度保证
 
 - **绝不降低阈值**：所有精度测试阈值保持 `cos > 0.99`（多数情况下 > 0.9999）
@@ -285,21 +470,6 @@ ASCEND_PLATFORM=310P python atb_cpp_llm/tests/python_reference/gen_all.py
 - **逐阶段验证**：Stage reference 测试覆盖 Vision 和 Text 的每个中间阶段
 
 ## 排查问题
-
-### 常见问题
-
-1. **`ASCEND_PLATFORM` 未设置**
-   - 症状：310P 上 text 路径 SelfAttention 失败
-   - 修复：在 `.env` 中设置 `ASCEND_PLATFORM=310P`
-
-2. **gen_all.py 中 test_stage_reference 失败**
-   - 症状：`stage6` 生成失败
-   - 原因：test_stage_reference 内部调用了完整的 encoder.encode()，触发 GQA SelfAttention
-   - 当前状态：gen_all 有容错，失败后自动 fallback 到 `--no-refdata`
-
-3. **ctest 看不到 ASCEND_PLATFORM**
-   - 检查：`cmake` 配置时是否设置了 ENVIRONMENT 属性
-   - 验证：`ctest --test-dir build -N -R test_e2e` 然后 `ctest --test-dir build -R test_e2e -V | grep ASCEND`
 
 ### ATB 日志
 
@@ -311,51 +481,51 @@ cat /root/ascend/log/atb/$(ls -rt /root/ascend/log/atb/ | tail -n 1)
 cat /root/atb/log/$(ls -rt /root/atb/log/ | tail -n 1)
 ```
 
+### ATB 错误码
+
+| 错误码 | 含义 |
+|--------|------|
+| 0 | NO_ERROR |
+| 4 | ERROR_RT_FAIL（运行时失败）|
+| 8 | ERROR_INVALID_TENSOR_DIM（无效 tensor 维度）|
+| 9 | ERROR_GRAPH_INFERSHAPE_FUNC_FAIL（图形状推导失败）|
+| 13 | ERROR_INVALID_TENSOR_INI_MATCH（tensor 初始化不匹配）|
+
 ## 新增 310P 相关代码时注意事项
 
 1. **Python**：使用 `from .utils import is_310p` 检测平台
 2. **C++**：使用 `#include "util/cpp11_compat.h"` 然后 `atb_llm::Is310P()` 检测平台
-3. **新增 GQA 测试**：必须加上 `Is310P()` 守卫，避免在 310P 上失败
-4. **新增 ATB 算子**：先在 310P 诊断脚本中验证可用性
-5. **精度不变**：310P 路径的输出必须与 910B 路径数值等价（cos > 0.99）
+3. **平台差异收敛**：Graph builder 和 Model 层不应包含 `Is310P()` 判断。所有平台差异仅在对应的 Op 创建函数（如 `self_attention_op.cpp`）中处理。确保两个平台使用相同的输入输出布局（tensor 数量和 shape）。
+4. **新增 GQA 测试**：必须加上 `Is310P()` 守卫，避免在 310P 上失败
+5. **新增 ATB 算子**：先在 310P 诊断脚本中验证可用性
+6. **精度不变**：310P 路径的输出必须与 910B 路径数值等价（cos > 0.99）
 
-## 代码组织
+## FRACTAL_NZ 格式参考
 
-### Python 参数灵活化
-
-为了支持 SelfAttention 参数组合实验，对 ATB factory 做了参数灵活化：
-
-**`utils.py:make_self_attention()`** — 扩展额外参数：
-```python
-def make_self_attention(num_heads, num_kv_heads, head_dim,
-                        mask_type=None, use_mask=False,
-                        calc_type=None, input_layout=None,
-                        is_triu_mask=0, kernel_type=None,
-                        kvcache_cfg=None):
-```
-默认值保持原有行为（PA_ENCODER + BSND），所有新参数通过 `**sa_kwargs` 透传。
-
-**`text_attention.py:build_attention()` / `add_attention_graph()`** — 接受 `**sa_kwargs`：
-```python
-def build_attention(num_heads, num_kv_heads, head_dim, ..., **sa_kwargs):
-def add_attention_graph(builder, ..., **sa_kwargs):
-```
-调用 `make_self_attention()` 时透传所有额外参数，不影响现有调用。
-
-**`engine.py`** — 310P 侧当前只做 GQA→MHA 权重展开：
-- `_expand_kv_weights_to_mha()`：K/V/K-norm 权重展开（数学精确变换）
-- `_ensure_text_graph()`：构建统一的 decoder layer graph（无特殊处理）
-- **待定**：如果 310P 上 `is_triu_mask=1` 确认有效，在 `build_text_layer_graph()` 中传入该参数
-
-### 测试脚本架构
+### NZ 物理 shape 计算（float16）
 
 ```
-test_310p_diag.py          ← 快速诊断：SelfAttention 单元级，11 种组合
-test_310p_combinations.py  ← 深度扫描：完整 AttentionGraph 级，18 种组合
-                              (Q/K/V proj → norm → RoPE → SelfAttn → O-proj)
+ND shape:  [m, n]
+NZ shape:  [1, ceil(n/16), ceil(m/16)*16, 16]
+
+其中:
+  ceil(n/16) = (n + 15) / 16
+  ceil(m/16)*16 = ((m + 15) / 16) * 16
 ```
 
-两个脚本都使用测试数据生成器（`data_utils`）和 transformers 参考实现（`transformers_runner`），精度标准 `cos > 0.99`。
+### NZ 数据布局
+
+FRACTAL_NZ (ACL_FORMAT=29) 将矩阵按 16×16 的块重新组织：
+- 每个 16×16 block 内部是连续存储的
+- block 之间按 (block_row, block_col) 顺序排列
+- 如果 m 或 n 不是 16 的倍数，padding 区域填 0
+
+### 示例
+
+S=8 的 causal mask：
+- ND: `[8, 8]`，64 个 fp16 元素
+- NZ: `[1, ceil(8/16), ceil(8/16)*16, 16]` = `[1, 1, 16, 16]`，256 个 fp16 元素
+- NZ 数据：用 padding 填充到 16×16 后在 block 内连续存储
 
 ## 相关文件索引
 
@@ -363,14 +533,16 @@ test_310p_combinations.py  ← 深度扫描：完整 AttentionGraph 级，18 种
 |------|------|
 | `atb_python_qwen3vl_embedding/utils.py:22-29` | Python 平台检测 |
 | `atb_python_qwen3vl_embedding/utils.py:132-176` | make_self_attention() 参数灵活化 |
-| `atb_python_qwen3vl_embedding/text_attention.py:19-49` | build_attention/add_attention_graph **sa_kwargs 透传 |
+| `atb_python_qwen3vl_embedding/text_attention.py:19-49` | build_attention/add_attention_graph |
 | `atb_python_qwen3vl_embedding/engine.py:105-194` | Python GQA→MHA 展开 |
-| `atb_python_qwen3vl_embedding/tests/test_310p_diag.py` | 310P 快速诊断（11种组合）|
-| `atb_python_qwen3vl_embedding/tests/test_310p_combinations.py` | 310P 参数深度扫描（18种组合）|
+| `atb_python_qwen3vl_embedding/tests/test_310p_diag.py` | 310P 快速诊断 |
+| `atb_python_qwen3vl_embedding/tests/test_310p_combinations.py` | 310P 参数深度扫描 |
 | `atb_cpp_llm/docs/platform-310p.md` | 本文档 |
 | `atb_cpp_llm/src/util/cpp11_compat.h:74-89` | C++ 平台检测 |
 | `atb_cpp_llm/src/adapters/qwen3vl_embedding/qwen3vl_model.cpp:78-176` | C++ GQA→MHA 展开 |
-| `atb_cpp_llm/src/ops/self_attention_op.cpp` | C++ MASK_TYPE_CAUSAL_MASK（待实测）|
+| `atb_cpp_llm/src/ops/self_attention_op.cpp` | C++ SelfAttentionOp 创建 |
+| `atb_cpp_llm/src/components/common/self_attention_graph.cpp` | GQA graph builder（含临时 TransdataOp）|
+| `atb_cpp_llm/src/components/common/gqa_attention_builder.cpp` | MHA graph builder（含临时 TransdataOp）|
 | `atb_cpp_llm/CMakeLists.txt:197-208` | ctest ENVIRONMENT 属性 |
 | `atb_cpp_llm/build_and_test.sh:336-341` | gen_all 容错 fallback |
 | `.env.example:24-29` | ASCEND_PLATFORM 配置说明 |

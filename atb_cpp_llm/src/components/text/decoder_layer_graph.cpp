@@ -5,6 +5,7 @@
 #include "components/common/rms_norm_graph.h"
 #include "ops/elewise_op.h"
 #include "log/logger.h"
+#include "util/cpp11_compat.h"
 
 namespace atb_llm {
 namespace components {

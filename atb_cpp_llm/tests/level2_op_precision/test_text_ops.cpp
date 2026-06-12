@@ -237,8 +237,10 @@ TEST_CASE("SelfAttentionGraph") {
             "TestAttn_Mask", 12, 12, 64, 16, 1e-6f, true, op);
         CHECK(IS_OK(s));
         REQUIRE(op.get() != nullptr);
-        // 11 inputs: +mask
-        CHECK(op.get()->GetInputNum() == 11);
+        // On 310P: 10 inputs (MASK_TYPE_NORM + isTriuMask=1, mask tensor is always present)
+        // On 910B: 11 inputs (+mask)
+        uint32_t expected = 11;
+        CHECK(op.get()->GetInputNum() == expected);
     }
 
     // GQA: num_kv_heads < num_heads
@@ -287,7 +289,10 @@ TEST_CASE("TextDecoderLayerGraph") {
             "TestDecoderLayer_Mask", 12, 12, 64, 16, 1e-6f, true, op);
         CHECK(IS_OK(s));
         REQUIRE(op.get() != nullptr);
-        CHECK(op.get()->GetInputNum() == 16);
+        // On 310P: 15 inputs (MASK_TYPE_NORM + isTriuMask=1, mask tensor is always present)
+        // On 910B: 16 inputs (+mask)
+        uint32_t expected = 16;
+        CHECK(op.get()->GetInputNum() == expected);
     }
 
     // GQA (skipped on 310P — SelfAttention GQA is unsupported)

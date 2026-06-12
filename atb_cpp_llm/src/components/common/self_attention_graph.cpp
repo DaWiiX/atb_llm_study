@@ -6,6 +6,7 @@
 #include "ops/rope_op.h"
 #include "ops/self_attention_op.h"
 #include "log/logger.h"
+#include "util/cpp11_compat.h"
 
 namespace atb_llm {
 namespace components {
@@ -177,6 +178,9 @@ Status SelfAttentionGraph::Build(const std::string& name,
         "k_rope");
 
     // ── SelfAttention: (q_rope, k_rope, v_3d, [mask,] seqlen) -> attn_out ──
+    // The mask tensor is already in the correct format for the platform:
+    //   910B: ND  [S, S]
+    //   310P: NZ  [1, ceil(S/16), ceil(S/16)*16, 16]  (set in qwen3vl_model.cpp)
     OperationHandle sa = ops::SelfAttentionOp::Create(num_heads, num_kv_heads, head_dim, use_mask);
     if (!sa) return ERROR_GRAPH_BUILD;
 

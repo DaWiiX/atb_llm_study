@@ -156,6 +156,8 @@ Status GqaAttentionBuilder::Build(const std::string& name,
         "k_rope");
 
     // ── SelfAttention: (q_rope, k_rope, v_3d, [mask,] seqlen) -> attn_out ──
+    // The mask tensor is already in the correct format for the platform
+    // (ND on 910B, NZ on 310P — set in qwen3vl_model.cpp).
     OperationHandle sa = ops::SelfAttentionOp::Create(nh, kv_nh, hd, use_mask);
     if (!sa) return ERROR_GRAPH_BUILD;
 

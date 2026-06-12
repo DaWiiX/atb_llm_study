@@ -256,6 +256,7 @@ add_atb_test(test_transpose_set_value_precision tests/level2_op_precision/test_t
 # Level 2 advanced precision tests (Wave 3)
 add_atb_test(test_rope_precision                tests/level2_op_precision/test_rope_precision.cpp)
 add_atb_test(test_self_attention_precision      tests/level2_op_precision/test_self_attention_precision.cpp)
+
 add_atb_test(test_swiglu_mlp_precision          tests/level2_op_precision/test_swiglu_mlp_precision.cpp)
 add_atb_test(test_text_decoder_layer_precision  tests/level2_op_precision/test_text_decoder_layer_precision.cpp)
 add_atb_test(test_vision_attention_precision    tests/level2_op_precision/test_vision_attention_precision.cpp)

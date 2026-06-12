@@ -548,16 +548,15 @@ Status Qwen3VLModel::ForwardWithTiming(const InferRequest& request,
     // ── P0: MRoPE cos/sin + Causal mask — direct fp16 + NPU cache ──
     // When seq_len is unchanged across calls, reuse the cached NPU tensors
     // to avoid regeneration + H2D upload (saves ~212ms at S=4096).
-    bool cache_hit = (seq_len == cached_text_seq_len_ && cached_mask_npu_);
+    // On 310P, SelfAttention uses MASK_TYPE_CAUSAL (no external mask tensor)
+    // so mask generation and caching are skipped.
+    bool cache_hit = (seq_len == cached_text_seq_len_ && cached_cos_npu_);
     if (!cache_hit) {
         // Generate cos/sin directly in fp16 (skip fp32 intermediate)
         std::vector<uint16_t> cos16(seq_len * hd);
         std::vector<uint16_t> sin16(seq_len * hd);
         mrope_->ComputeFp16(position_ids.data(), 1, seq_len,
                             cos16.data(), sin16.data());
-        // Generate causal mask directly in fp16 (skip fp32 intermediate)
-        std::vector<uint16_t> m16(static_cast<size_t>(seq_len) * seq_len);
-        runners::MakeCausalMaskFp16(seq_len, m16.data());
         // Upload to NPU and cache
         cached_cos_npu_ = AllocNpuFloat16({seq_len, hd});
         alloc->CopyToDevice(*cached_cos_npu_.Get(), cos16.data(),
@@ -565,9 +564,26 @@ Status Qwen3VLModel::ForwardWithTiming(const InferRequest& request,
         cached_sin_npu_ = AllocNpuFloat16({seq_len, hd});
         alloc->CopyToDevice(*cached_sin_npu_.Get(), sin16.data(),
                             static_cast<size_t>(seq_len) * hd * sizeof(uint16_t));
-        cached_mask_npu_ = AllocNpuFloat16({seq_len, seq_len});
-        alloc->CopyToDevice(*cached_mask_npu_.Get(), m16.data(),
-                            static_cast<size_t>(seq_len) * seq_len * sizeof(uint16_t));
+        // Generate causal mask directly in fp16 (skip fp32 intermediate)
+        std::vector<uint16_t> m16(static_cast<size_t>(seq_len) * seq_len);
+        runners::MakeCausalMaskFp16(seq_len, m16.data());
+        if (Is310P()) {
+            // 310P PA_ENCODER requires NZ (FRACTAL_NZ) format mask.
+            // Pre-convert on CPU so the graph receives a correctly-formatted tensor.
+            int64_t s_pad = ((seq_len + 15) / 16) * 16;
+            int64_t n1    = (seq_len + 15) / 16;
+            int64_t nz_elems = n1 * s_pad * 16;
+            std::vector<uint16_t> m16_nz(static_cast<size_t>(nz_elems));
+            ConvertNdToNzFp16(m16.data(), seq_len, seq_len, m16_nz.data());
+            cached_mask_npu_ = AllocNpuFloat16({1, n1, s_pad, 16});
+            cached_mask_npu_.Get()->desc.format = ACL_FORMAT_FRACTAL_NZ;
+            alloc->CopyToDevice(*cached_mask_npu_.Get(), m16_nz.data(),
+                                static_cast<size_t>(nz_elems) * sizeof(uint16_t));
+        } else {
+            cached_mask_npu_ = AllocNpuFloat16({seq_len, seq_len});
+            alloc->CopyToDevice(*cached_mask_npu_.Get(), m16.data(),
+                                static_cast<size_t>(seq_len) * seq_len * sizeof(uint16_t));
+        }
         cached_text_seq_len_ = seq_len;
     }
 
@@ -604,6 +620,8 @@ Status Qwen3VLModel::ForwardWithTiming(const InferRequest& request,
             const auto& lw = weights_.text_layers[li];
             NpuTensor h_out = AllocNpuFloat16({n, hidden_size});
             atb::VariantPack vp;
+            // All platforms use MASK_TYPE_NORM with external mask tensor.
+            // 310P additionally sets isTriuMask=1 inside SelfAttentionOp::Create().
             vp.inTensors = {*h_npu.Get(),
                             lw.q_weight, lw.k_weight, lw.v_weight, lw.o_weight,
                             lw.q_norm_weight, lw.k_norm_weight,

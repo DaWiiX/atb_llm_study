@@ -5,13 +5,11 @@
  *     softmax(q @ k.T / sqrt(hd) + mask) @ v
  * internally (with optional MASK_TYPE_NORM causal/additive mask).
  *
- * Three cases:
- *   * mha_nomask — nh=4,  kvh=4, hd=32, no mask
- *   * gqa_nomask — nh=12, kvh=4, hd=64, no mask (replicated kv heads)
- *   * mha_causal — nh=4,  kvh=4, hd=32, with causal mask (upper-tri = -65504)
+ * On 310P: mask must be in NZ (FRACTAL_NZ) format.
+ * On 910B: mask must be in ND format.
  *
  * Compares NPU fp16 output to a PyTorch fp32 SDPA reference computed on
- * the same fp16 inputs (round-tripped). cosine similarity ≥ 0.99.
+ * the same fp16 inputs (round-tripped). cosine similarity >= 0.99.
  *
  * Prerequisites:
  *     python tests/gen_cpu_reference.py --stage op_self_attention
@@ -96,44 +94,81 @@ std::vector<float> Fp16Decode(const std::vector<uint16_t>& src) {
     return dst;
 }
 
-struct SaCase {
-    int32_t S;
-    int32_t nh;
-    int32_t kvh;
-    int32_t hd;
-    bool    use_mask;
+// ── NZ mask helper for 310P ──────────────────────────────────────────
+// On 310P, MASK_TYPE_NORM expects NZ (FRACTAL_NZ) format.
+// Convert ND causal mask to NZ and allocate the NZ tensor.
+void PrepareMask310P(atb_llm::TensorAllocator* alloc,
+                     const std::vector<uint16_t>& mask_nd_data,
+                     int64_t S,
+                     atb::Tensor& mask_nz_t) {
+    int64_t s_pad = ((S + 15) / 16) * 16;
+    int64_t n1    = (S + 15) / 16;
+    int64_t nz_elems = n1 * s_pad * 16;
+
+    REQUIRE(IS_OK(alloc->AllocFloat16(mask_nz_t, {1, n1, s_pad, 16})));
+    mask_nz_t.desc.format = ACL_FORMAT_FRACTAL_NZ;
+
+    std::vector<uint16_t> mask_nz_data(static_cast<size_t>(nz_elems));
+    atb_llm::ConvertNdToNzFp16(mask_nd_data.data(), S, S, mask_nz_data.data());
+
+    REQUIRE(IS_OK(alloc->CopyToDevice(mask_nz_t, mask_nz_data.data(),
+                                      static_cast<size_t>(nz_elems) * sizeof(uint16_t))));
+}
+
+// ── Run one SelfAttention case ──────────────────────────────────────
+// name:     test case name (matches .bin file prefix)
+// S, nh, kvh, hd, use_mask: decoded from meta file
+// expected_result: true if the test should pass, false if it should fail
+//                  (e.g. non-16-aligned S on 310P may fail)
+struct SaResult {
+    bool    ok;
+    float   cosine;
+    int32_t atb_error;
+    std::string error_msg;
 };
 
-// Run one SelfAttention case and check cosine similarity vs PyTorch SDPA.
-void RunSaCase(const std::string& name, const SaCase& cs) {
-    LOG_INFO("=== SA precision: %s (S=%d nh=%d kvh=%d hd=%d mask=%d) ===",
-             name.c_str(), cs.S, cs.nh, cs.kvh, cs.hd, cs.use_mask ? 1 : 0);
+SaResult RunOneCase(const std::string& name, int32_t S, int32_t nh,
+                    int32_t kvh, int32_t hd, bool use_mask) {
+    SaResult res = {false, 0.0f, 0, ""};
 
     ArrayFp16 q_in, k_in, v_in, mask_in, out_ref;
-    REQUIRE(q_in.Load("/tmp/cpu_op_sa_" + name + "_q.bin"));
-    REQUIRE(k_in.Load("/tmp/cpu_op_sa_" + name + "_k.bin"));
-    REQUIRE(v_in.Load("/tmp/cpu_op_sa_" + name + "_v.bin"));
-    REQUIRE(out_ref.Load("/tmp/cpu_op_sa_" + name + "_out_ref.bin"));
-    if (cs.use_mask) {
-        REQUIRE(mask_in.Load("/tmp/cpu_op_sa_" + name + "_mask.bin"));
+    if (!q_in.Load("/tmp/cpu_op_sa_" + name + "_q.bin")) {
+        res.error_msg = "Cannot load q reference data";
+        return res;
+    }
+    if (!k_in.Load("/tmp/cpu_op_sa_" + name + "_k.bin")) {
+        res.error_msg = "Cannot load k reference data";
+        return res;
+    }
+    if (!v_in.Load("/tmp/cpu_op_sa_" + name + "_v.bin")) {
+        res.error_msg = "Cannot load v reference data";
+        return res;
+    }
+    if (!out_ref.Load("/tmp/cpu_op_sa_" + name + "_out_ref.bin")) {
+        res.error_msg = "Cannot load out_ref reference data";
+        return res;
+    }
+    if (use_mask) {
+        if (!mask_in.Load("/tmp/cpu_op_sa_" + name + "_mask.bin")) {
+            res.error_msg = "Cannot load mask reference data";
+            return res;
+        }
     }
 
     auto runtime = atb_llm::CreateRuntime(0, 2LL * 1024 * 1024 * 1024);
-    REQUIRE(runtime != nullptr);
-
+    if (!runtime) {
+        res.error_msg = "Cannot create runtime";
+        return res;
+    }
     auto* alloc = runtime->GetAllocator();
     auto* ctx   = runtime->GetContext();
 
-    // ── Allocate device tensors (3D BSND layout, B=1 ⇒ B*S = S) ────
-    atb::Tensor q_t, k_t, v_t, mask_t, seqlen_t, out_t;
-    REQUIRE(IS_OK(alloc->AllocFloat16(q_t,   {cs.S, cs.nh,  cs.hd})));
-    REQUIRE(IS_OK(alloc->AllocFloat16(k_t,   {cs.S, cs.kvh, cs.hd})));
-    REQUIRE(IS_OK(alloc->AllocFloat16(v_t,   {cs.S, cs.kvh, cs.hd})));
-    REQUIRE(IS_OK(alloc->AllocFloat16(out_t, {cs.S, cs.nh,  cs.hd})));
-    if (cs.use_mask) {
-        REQUIRE(IS_OK(alloc->AllocFloat16(mask_t, {cs.S, cs.S})));
-    }
-    REQUIRE(IS_OK(alloc->AllocInt64(seqlen_t, {1})));
+    // ── Allocate and upload Q/K/V ──────────────────────────────────
+    atb::Tensor q_t, k_t, v_t, mask_t, out_t, seqlen_t;
+    REQUIRE(IS_OK(alloc->AllocFloat16(q_t,   {S, nh,  hd})));
+    REQUIRE(IS_OK(alloc->AllocFloat16(k_t,   {S, kvh, hd})));
+    REQUIRE(IS_OK(alloc->AllocFloat16(v_t,   {S, kvh, hd})));
+    REQUIRE(IS_OK(alloc->AllocFloat16(out_t, {S, nh,  hd})));
 
     REQUIRE(IS_OK(alloc->CopyToDevice(q_t, q_in.data.data(),
                                       q_in.data.size() * sizeof(uint16_t))));
@@ -141,12 +176,21 @@ void RunSaCase(const std::string& name, const SaCase& cs) {
                                       k_in.data.size() * sizeof(uint16_t))));
     REQUIRE(IS_OK(alloc->CopyToDevice(v_t, v_in.data.data(),
                                       v_in.data.size() * sizeof(uint16_t))));
-    if (cs.use_mask) {
-        REQUIRE(IS_OK(alloc->CopyToDevice(mask_t, mask_in.data.data(),
-                                          mask_in.data.size() * sizeof(uint16_t))));
+
+    // ── Prepare mask ──────────────────────────────────────────────
+    // 310P: NZ format mask  910B: ND format mask
+    if (use_mask) {
+        if (atb_llm::Is310P()) {
+            PrepareMask310P(alloc, mask_in.data, S, mask_t);
+        } else {
+            REQUIRE(IS_OK(alloc->AllocFloat16(mask_t, {S, S})));
+            REQUIRE(IS_OK(alloc->CopyToDevice(mask_t, mask_in.data.data(),
+                                              mask_in.data.size() * sizeof(uint16_t))));
+        }
     }
 
-    int32_t seqlen_val = cs.S;
+    // ── Seqlen tensor ─────────────────────────────────────────────
+    int32_t seqlen_val = S;
     seqlen_t.desc.dtype = ACL_INT32;
     seqlen_t.desc.format = ACL_FORMAT_ND;
     seqlen_t.desc.shape.dimNum = 1;
@@ -154,12 +198,15 @@ void RunSaCase(const std::string& name, const SaCase& cs) {
     seqlen_t.dataSize = sizeof(int32_t);
     seqlen_t.hostData = &seqlen_val;
 
-    // ── Create and execute SelfAttentionOp ─────────────────────────
-    auto op = atb_llm::ops::SelfAttentionOp::Create(cs.nh, cs.kvh, cs.hd, cs.use_mask);
-    REQUIRE(op.get() != nullptr);
+    // ── Create and execute SelfAttentionOp ────────────────────────
+    auto op = atb_llm::ops::SelfAttentionOp::Create(nh, kvh, hd, use_mask);
+    if (!op.get()) {
+        res.error_msg = "CreateOp failed";
+        return res;
+    }
 
     atb::VariantPack vp;
-    if (cs.use_mask) {
+    if (use_mask) {
         vp.inTensors = {q_t, k_t, v_t, mask_t, seqlen_t};
     } else {
         vp.inTensors = {q_t, k_t, v_t, seqlen_t};
@@ -168,20 +215,34 @@ void RunSaCase(const std::string& name, const SaCase& cs) {
 
     uint64_t ws_size = 0;
     atb::Status atb_s = op.get()->Setup(vp, ws_size, ctx);
-    REQUIRE(atb_s == atb::NO_ERROR);
+    if (atb_s != atb::NO_ERROR) {
+        res.atb_error = static_cast<int32_t>(atb_s);
+        res.error_msg = "Setup failed (error " + std::to_string(res.atb_error) + ")";
+        return res;
+    }
 
     uint8_t* ws_ptr = nullptr;
     if (ws_size > 0) {
-        auto __atb_pair_ws = runtime->GetWorkspace(ws_size); auto& ws = __atb_pair_ws.first; auto& ws_st = __atb_pair_ws.second;
-        REQUIRE(IS_OK(ws_st));
+        auto __atb_pair_ws = runtime->GetWorkspace(ws_size);
+        auto& ws = __atb_pair_ws.first;
+        auto& ws_st = __atb_pair_ws.second;
+        if (!IS_OK(ws_st)) {
+            res.error_msg = "GetWorkspace failed";
+            return res;
+        }
         ws_ptr = ws;
     }
+
     atb_s = op.get()->Execute(vp, ws_ptr, ws_size, ctx);
-    REQUIRE(atb_s == atb::NO_ERROR);
+    if (atb_s != atb::NO_ERROR) {
+        res.atb_error = static_cast<int32_t>(atb_s);
+        res.error_msg = "Execute failed (error " + std::to_string(res.atb_error) + ")";
+        return res;
+    }
     runtime->Synchronize();
 
-    // ── Copy back and compare ──────────────────────────────────────
-    std::vector<uint16_t> out_host(cs.S * cs.nh * cs.hd);
+    // ── Copy back and compare ─────────────────────────────────────
+    std::vector<uint16_t> out_host(static_cast<size_t>(S) * nh * hd);
     REQUIRE(IS_OK(alloc->CopyToHost(out_host.data(), out_t,
                                     out_host.size() * sizeof(uint16_t))));
 
@@ -189,49 +250,117 @@ void RunSaCase(const std::string& name, const SaCase& cs) {
     auto out_ref_f32 = Fp16Decode(out_ref.data);
 
     REQUIRE(out_f32.size() == out_ref_f32.size());
-    float cs_score = CosineSim(out_f32.data(), out_ref_f32.data(), out_f32.size());
-    LOG_INFO("  cosine = %.6f", cs_score);
-    CHECK(cs_score >= 0.99f);
+    res.cosine = CosineSim(out_f32.data(), out_ref_f32.data(), out_f32.size());
+    res.ok = true;
+    return res;
 }
 
-SaCase LoadMeta(const std::string& name) {
+// ── Test case descriptor ───────────────────────────────────────────
+struct TestCase {
+    std::string name;
+    int32_t S, nh, kvh, hd;
+    bool use_mask;
+    bool skip_on_910b;  // if true, only run on 310P
+};
+
+void RunTestCase(const TestCase& tc) {
+    std::string skip_reason;
+    if (tc.skip_on_910b && !atb_llm::Is310P()) {
+        MESSAGE("Skipping ", tc.name, " (310P-only test)");
+        return;
+    }
+    // GQA cases: skip on 310P
+    if (tc.kvh < tc.nh && atb_llm::Is310P()) {
+        MESSAGE("Skipping ", tc.name, " (GQA not supported on 310P)");
+        return;
+    }
+
+    INFO("=== SA precision: ", tc.name,
+         " (S=", tc.S, " nh=", tc.nh, " kvh=", tc.kvh,
+         " hd=", tc.hd, " mask=", tc.use_mask ? "causal" : "none", ") ===");
+    CAPTURE(tc.name);
+    CAPTURE(tc.S);
+    CAPTURE(tc.nh);
+    CAPTURE(tc.kvh);
+    CAPTURE(tc.hd);
+
+    auto res = RunOneCase(tc.name, tc.S, tc.nh, tc.kvh, tc.hd, tc.use_mask);
+
+    if (!res.ok) {
+        if (res.atb_error != 0) {
+            FAIL_CHECK(tc.name << " ATB error " << res.atb_error
+                       << ": " << res.error_msg);
+        } else {
+            FAIL_CHECK(tc.name << ": " << res.error_msg);
+        }
+        return;
+    }
+
+    INFO(tc.name, " cosine = ", res.cosine);
+    CHECK(res.cosine >= 0.99f);
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// Helper to load meta and create test case
+// ═════════════════════════════════════════════════════════════════════
+TestCase LoadMeta(const std::string& name, bool skip_on_910b = false) {
     I32Vec meta;
     REQUIRE(meta.Load("/tmp/cpu_op_sa_" + name + "_meta.bin"));
     REQUIRE(meta.data.size() == 5);
-    return SaCase{
+    return TestCase{
+        name,
         meta.data[0], meta.data[1], meta.data[2], meta.data[3],
-        meta.data[4] != 0
+        meta.data[4] != 0,
+        skip_on_910b
     };
 }
 
 }  // namespace
 
-// ═════════════════════════════════════════════════════════════════
-// Case 1: MHA without mask  (nh = kvh = 4, hd = 32)
-// ═════════════════════════════════════════════════════════════════
-TEST_CASE("SelfAttentionOp precision: MHA no mask") {
-    auto cs = LoadMeta("mha_nomask");
-    RunSaCase("mha_nomask", cs);
+// ═════════════════════════════════════════════════════════════════════
+// Group 1: Basic (works on both platforms)
+// ═════════════════════════════════════════════════════════════════════
+
+TEST_CASE("SelfAttentionOp: MHA no mask (S=8, nh=4, hd=32)") {
+    RunTestCase(LoadMeta("mha_nomask"));
 }
 
-// ═════════════════════════════════════════════════════════════════
-// Case 2: GQA without mask  (nh = 12, kvh = 4, hd = 64)
-// SKIP on 310P: SelfAttention GQA is not supported on 310P hardware.
-// Production inference uses GQA→MHA weight expansion instead.
-// ═════════════════════════════════════════════════════════════════
-TEST_CASE("SelfAttentionOp precision: GQA no mask") {
-    if (atb_llm::Is310P()) {
-        MESSAGE("Skipping SelfAttentionOp GQA precision test on 310P (GQA→MHA expansion handles this at engine layer)");
-        return;
-    }
-    auto cs = LoadMeta("gqa_nomask");
-    RunSaCase("gqa_nomask", cs);
+TEST_CASE("SelfAttentionOp: GQA no mask (S=8, nh=12, kvh=4, hd=64)") {
+    RunTestCase(LoadMeta("gqa_nomask"));
 }
 
-// ═════════════════════════════════════════════════════════════════
-// Case 3: MHA with causal mask  (upper triangle = -65504 in fp16)
-// ═════════════════════════════════════════════════════════════════
-TEST_CASE("SelfAttentionOp precision: MHA causal mask") {
-    auto cs = LoadMeta("mha_causal");
-    RunSaCase("mha_causal", cs);
+TEST_CASE("SelfAttentionOp: MHA causal mask (S=8, nh=4, hd=32)") {
+    RunTestCase(LoadMeta("mha_causal"));
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// Group 2: NZ mask — different S values (critical for 310P)
+// ═════════════════════════════════════════════════════════════════════
+
+TEST_CASE("SelfAttentionOp: MHA causal S=4 (not 16-aligned)") {
+    RunTestCase(LoadMeta("mha_causal_s4"));
+}
+
+TEST_CASE("SelfAttentionOp: MHA causal S=16 (16-aligned)") {
+    RunTestCase(LoadMeta("mha_causal_s16"));
+}
+
+TEST_CASE("SelfAttentionOp: MHA causal S=32 (16-aligned)") {
+    RunTestCase(LoadMeta("mha_causal_s32"));
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// Group 3: NZ mask — real model params (nh=16, hd=128)
+// ═════════════════════════════════════════════════════════════════════
+
+TEST_CASE("SelfAttentionOp: MHA causal hd=128 S=4 (real model)") {
+    RunTestCase(LoadMeta("mha_causal_hd128_s4"));
+}
+
+TEST_CASE("SelfAttentionOp: MHA causal hd=128 S=16 (real model)") {
+    RunTestCase(LoadMeta("mha_causal_hd128_s16"));
+}
+
+TEST_CASE("SelfAttentionOp: MHA no mask hd=128 S=16 (sanity)") {
+    RunTestCase(LoadMeta("mha_nomask_hd128_s16"));
 }
