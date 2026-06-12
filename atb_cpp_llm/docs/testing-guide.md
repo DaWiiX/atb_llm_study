@@ -2,30 +2,42 @@
 
 ## 概述
 
-本文档记录 310P 平台适配的完整测试策略，覆盖从原子算子到端到端的三个测试阶段。
+本文档记录 310P 平台适配的完整测试策略。三个问题已在 commit `a23d173` 中修复：
 
-**核心改动**：310P 上 mask 在模型层直接转 NZ 格式（CPU 侧 ND→NZ 布局转换），不再在 graph 中插入 TransdataOp。
+| 问题 | 修复 | 状态 |
+|------|------|------|
+| Device ID 硬编码 | `ASCEND_DEVICE_ID` 环境变量 | ✅ |
+| GQA 错误跳过 | 移除所有 `Is310P()` GQA guard | ✅ |
+| Graph 层 mask ND 格式 | 共享 `test::UploadMask()` helper | ⏳ **待 310P 验证** |
 
-## 前置准备
+**上次 310P 实测结果（6/12）**：原子级 9/9 通过 (cos=1.0)，但 graph 层因 ND mask 全部失败。
+**本次测试目标**：验证修复后的 graph 层 + E2E 在 310P 上全部通过。
+
+---
+
+## 第一步：拉取最新代码
+
+```bash
+cd /path/to/atb_llm
+git checkout feat/310p-support
+git pull origin feat/310p-support
+# 确认 HEAD 是 a23d173
+git log --oneline -1
+```
+
+## 第二步：环境准备
 
 ```bash
 export ASCEND_PLATFORM=310P
+# 多卡环境可额外指定 device（默认卡0）：
+# export ASCEND_DEVICE_ID=0
+
 source ~/Ascend/ascend-toolkit/set_env.sh
 source ~/Ascend/cann/set_env.sh
 source ~/Ascend/nnal/atb/latest/atb/set_env.sh --cxx_abi=1
 source ~/Ascend/nnal/atb/set_env.sh --cxx_abi=1
 export ATB_BUILD_DEPENDENCY_PATH=~/Ascend/nnal/atb/latest/atb/cxx_abi_1
 ```
-
-## ✅ 关于 GQA：310P 实测已确认支持
-
-**310P 上 GQA 完全支持，cos=1.0（2026-06-12 实测验证）。**
-
-文档 0268（约束说明）中 PA_ENCODER 下 **没有** 平台限制 GQA：
-
-> "若想使用GQA模式，需满足：headNum > kvHeadNum"
-
-之前代码中 `Is310P()` skip guard 是基于 910B 模拟的误判，现已全部移除。
 
 ---
 
@@ -172,39 +184,43 @@ ASCEND_PLATFORM=310P python tests/test_e2e_full_pipeline.py 2>&1 | tee /tmp/310p
 
 ## 测试结果记录表
 
-### 阶段 1 结果（待填写）
+### 阶段 1 结果
 
-| # | CASE | 状态 | cos | 错误信息 |
-|---|------|------|-----|---------|
-| 1 | mha_nomask | ⬜ | | |
-| 2 | gqa_nomask | ⬜ SKIP | | |
-| 3 | mha_causal | ⬜ | | |
-| 4 | mha_causal_s4 | ⬜ | | |
-| 5 | mha_causal_s16 | ⬜ | | |
-| 6 | mha_causal_s32 | ⬜ | | |
-| 7 | mha_causal_hd128_s4 | ⬜ | | |
-| 8 | mha_causal_hd128_s16 | ⬜ | | |
-| 9 | mha_nomask_hd128_s16 | ⬜ | | |
+| # | CASE | 上次 (6/12) | 本次 |
+|---|------|------------|------|
+| 1 | mha_nomask | cos=1.0 ✅ | ⬜ |
+| 2 | gqa_nomask | cos=1.0 ✅ | ⬜ |
+| 3 | mha_causal | cos=1.0 ✅ | ⬜ |
+| 4 | mha_causal_s4 | cos=1.0 ✅ | ⬜ |
+| 5 | mha_causal_s16 | cos=1.0 ✅ | ⬜ |
+| 6 | mha_causal_s32 | cos=1.0 ✅ | ⬜ |
+| 7 | mha_causal_hd128_s4 | cos=1.0 ✅ | ⬜ |
+| 8 | mha_causal_hd128_s16 | cos=1.0 ✅ | ⬜ |
+| 9 | mha_nomask_hd128_s16 | cos=1.0 ✅ | ⬜ |
+| 10 | **gqa_causal (新增)** | — | ⬜ |
 
-### 阶段 2 结果（待填写）
+### 阶段 2 结果
 
-| 二进制 | # | CASE | 状态 | cos |
-|--------|---|------|------|-----|
-| test_text_ops | 5 | SA Graph MHA | ⬜ | — |
-| test_text_ops | 7 | DecoderLayer MHA | ⬜ | — |
-| test_text_ops | 9 | Execute on NPU | ⬜ | — |
-| test_decoder_layer | 1 | small no-mask | ⬜ | |
-| test_text_model | 3 | Execute | ⬜ | |
+| 二进制 | # | CASE | 上次 (6/12) | 本次 |
+|--------|---|------|------------|------|
+| test_text_ops | all | Graph 构建 | 7/7 passed ✅ | ⬜ |
+| test_text_ops | — | GQA cases | ❌ SKIP (已修复) | ⬜ |
+| test_decoder_layer | 1 | small no-mask | ✅ | ⬜ |
+| test_decoder_layer | 2 | GQA with mask | ❌ SKIP (已修复) | ⬜ |
+| test_text_model | 1-3 | Build/Mask/Execute | ❌ Setup 失败 | ⬜ |
+| test_text_model | 4 | TextModel GQA | ❌ SKIP (已修复) | ⬜ |
+| test_text_runner_full | 1 | MHA pipeline | ❌ Setup 失败 | ⬜ |
+| test_text_runner_full | 2 | GQA pipeline | ❌ SKIP (已修复) | ⬜ |
 
-### 阶段 3 结果（待填写）
+### 阶段 3 结果
 
-| 测试 | 状态 | cos |
-|------|------|-----|
-| C++ test_e2e | ⬜ | |
-| Python test_engine (text-only) | ⬜ | |
-| Python test_engine (image-only) | ⬜ | |
-| Python test_engine (image+text) | ⬜ | |
-| Python test_e2e_full_pipeline | ⬜ | |
+| 测试 | 上次 (6/12) | 本次 |
+|------|------------|------|
+| C++ test_e2e | ❌ Graph Setup 失败 | ⬜ |
+| Python test_engine (text-only) | ❌ | ⬜ |
+| Python test_engine (image-only) | ✅ | ⬜ |
+| Python test_engine (image+text) | ❌ | ⬜ |
+| Python test_e2e_full_pipeline | ❌ | ⬜ |
 
 ---
 
@@ -233,20 +249,103 @@ strings ~/Ascend/nnal/atb/latest/atb/cxx_abi_1/lib/libatb.so \
 
 ## 回退计划
 
-| 情况 | 方案 | 改动量 |
-|------|------|--------|
-| 仅非16对齐 S 失败 | pad S 到 16 对齐再传给 SA | ~10 行 |
-| 全部 NZ mask 失败 | 手动 attention（MatMul+Softmax+Elewise） | ~150 行 |
-| GQA 在 310P 上可用 | 移除 GQA→MHA 展开，简化代码 | -200 行 |
+| 情况 | 方案 |
+|------|------|
+| Graph 层 mask Setup 仍失败 | 反馈 ATB 日志，分析具体哪个 runner 失败 |
+| E2E 精度不达标 (cos < 0.99) | 逐层对比，定位精度丢失点 |
 
 ---
 
-## 关键待验证问题
+## 如何反馈结果
+
+按以下模板整理结果，**附带原始日志文件**，发给我：
+
+### 反馈模板
+
+```
+【环境】
+- 芯片型号: (npu-smi info -t board -i 0 的输出)
+- ATB 版本: (strings ~/Ascend/nnal/atb/latest/atb/cxx_abi_1/lib/libatb.so | grep -i version | head -3)
+- ASCEND_PLATFORM=310P
+
+【阶段 1 — 原子算子】全部/部分 通过
+- 如果全部通过，贴一行: "10/10 passed, all cos=1.0" 即可
+- 如果有失败，贴完整输出:
+  grep -E "cosine|FAILED|ERROR|test cases" /tmp/310p_phase1.log
+
+【阶段 2a — Graph 构建】全部/部分 通过
+- 贴: grep "test cases" /tmp/310p_phase2a.log
+
+【阶段 2b — DecoderLayer 精度】全部/部分 通过
+- 贴: grep -E "cosine|test cases" /tmp/310p_phase2b.log
+
+【阶段 2c — TextModel 精度】全部/部分 通过
+- 贴: grep "test cases" /tmp/310p_phase2c.log
+
+【阶段 3 — E2E】全部/部分 通过
+- 贴: grep -E "cosine|test cases" /tmp/310p_phase3a.log (C++)
+- 贴: grep -E "cosine|PASS|FAIL" /tmp/310p_phase3b_*.log (Python)
+
+【ATB 日志】（如果任何阶段失败，必须提供）
+- 附件: /home/developer/ascend/log/atb/<最新日志文件>
+```
+
+### 快速收集脚本
+
+把以下脚本保存为 `collect_results.sh`，运行后把生成的 `310p_results.tar.gz` 发给我：
+
+```bash
+#!/bin/bash
+OUTDIR=/tmp/310p_feedback
+mkdir -p $OUTDIR
+
+# 环境信息
+npu-smi info -t board -i 0 > $OUTDIR/env.txt 2>&1
+echo "ASCEND_PLATFORM=$ASCEND_PLATFORM" >> $OUTDIR/env.txt
+strings ~/Ascend/nnal/atb/latest/atb/cxx_abi_1/lib/libatb.so | grep -iE "version|build" | head -5 >> $OUTDIR/env.txt 2>/dev/null
+
+# 测试日志
+cp /tmp/310p_phase1.log $OUTDIR/ 2>/dev/null
+cp /tmp/310p_phase2a.log $OUTDIR/ 2>/dev/null
+cp /tmp/310p_phase2b.log $OUTDIR/ 2>/dev/null
+cp /tmp/310p_phase2c.log $OUTDIR/ 2>/dev/null
+cp /tmp/310p_phase3a.log $OUTDIR/ 2>/dev/null
+cp /tmp/310p_phase3b_*.log $OUTDIR/ 2>/dev/null
+
+# ATB 日志
+ATBLOG=$(ls -rt /home/developer/ascend/log/atb/ 2>/dev/null | tail -n 1)
+if [ -n "$ATBLOG" ]; then
+    cp /home/developer/ascend/log/atb/$ATBLOG $OUTDIR/atb_latest.log 2>/dev/null
+fi
+
+# 摘要
+echo "=== Test Summary ===" > $OUTDIR/summary.txt
+for f in $OUTDIR/*.log; do
+    echo "--- $(basename $f) ---" >> $OUTDIR/summary.txt
+    grep -E "cosine|FAILED|ERROR|test cases|PASSED" "$f" 2>/dev/null | head -30 >> $OUTDIR/summary.txt
+done
+
+cd /tmp && tar czf 310p_results.tar.gz 310p_feedback/
+echo "Done: /tmp/310p_results.tar.gz"
+```
+
+---
+
+## 已知已验证项（无需重新测试）
+
+| 已验证 | 结果 | 时间 |
+|--------|------|------|
+| NZ mask 原子级 SelfAttentionOp | cos=1.0 (9/9) | 6/12 |
+| GQA 在 310P 上支持 | cos=1.0 | 6/12 |
+| S 非16对齐可用 | cos=1.0 (S=4,8) | 6/12 |
+| isTriuMask 不需要 | B4/B5 对比验证 | 6/12 |
+
+## 本次待验证项（优先级排序）
 
 | # | 问题 | 验证方式 | 优先级 |
 |---|------|---------|--------|
-| 1 | NZ mask 能否被 310P SA 接受？ | 阶段 1 case #5/#8 | **最高** |
-| 2 | 非16对齐 S 是否可用？ | 阶段 1 case #3/#4/#7 | 高 |
-| 3 | GQA 在 310P 上是否真实可用？ | 临时去掉 skip guard 跑 case #2 | 中 |
-| 4 | NZ mask 在 graph 中正确传播？ | 阶段 2a case #5/#7 | 高 |
-| 5 | 28 层全流程 NZ mask 精度？ | 阶段 2c case #3 | 高 |
+| 1 | **NZ mask 在 graph 中正确传播？** | 阶段 2a test_text_ops case #5/#7 | **最高** |
+| 2 | **DecoderLayer + NZ mask 精度？** | 阶段 2b GQA with mask | **最高** |
+| 3 | **28 层全流程 NZ mask 精度？** | 阶段 2c test_text_model | 高 |
+| 4 | **TextRunner GQA Full Pipeline** | 阶段 2 末尾 | 高 |
+| 5 | E2E 精度 | 阶段 3 | 中 |
