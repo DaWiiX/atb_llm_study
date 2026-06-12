@@ -63,12 +63,13 @@ ATB LLM 项目支持 **Ascend 310P** (Atlas推理系列产品) 和 **Ascend 910B
 
 | 特性 | 910B | 310P |
 |------|------|------|
-| SelfAttention GQA (`kv_head_num < head_num`) | ✅ 支持 | ❌ 不支持 |
+| SelfAttention GQA (`kv_head_num < head_num`) | ✅ 支持 | ✅ 支持（实测 cos=1.0）|
 | RopeOperation | ✅ 支持 | ✅ 支持 |
 | Linear / RMSNorm / LayerNorm | ✅ 支持 | ✅ 支持 |
 | 所有 Vision 路径算子 | ✅ 支持 | ✅ 支持 |
 | SelfAttention PA_ENCODER mask=ND | ✅ 支持 | ❌ 不支持（需 NZ 格式）|
-| SelfAttention PA_ENCODER mask=NZ | ❓ 未测试 | ✅ 文档声称支持 |
+| SelfAttention PA_ENCODER mask=NZ | ❓ 未测试 | ✅ 实测通过 (cos=1.0) |
+| S 非16对齐 (NZ mask) | — | ✅ 实测通过 (S=4/8 cos=1.0) |
 
 ### Mask 格式需求（基于文档 0265）
 
@@ -446,22 +447,13 @@ ASCEND_PLATFORM=310P
 |------|-----------|------|
 | Level 0 框架 | 全部通过 | 无 NPU 依赖 |
 | Level 1 CPU 纯函数 | 全部通过 | 无 NPU 依赖 |
-| Level 2 算子精度 | MHA 测试通过，GQA 测试跳过 | 见下方清单 |
-| Level 3 集成 | MHA 测试通过，GQA 测试跳过 | 见下方清单 |
+| Level 2 算子精度 | 全部通过（含 GQA）| GQA 实测 cos=1.0 |
+| Level 3 集成 | 全部通过（含 GQA）| GQA 实测通过 |
 | Level 4 E2E | 全部通过（走 GQA→MHA 展开路径） | engine 层自动处理 |
 
-### 310P 上跳过的测试
+### 310P 上无跳过的测试
 
-以下测试在 310P 上自动跳过（检测到 `ASCEND_PLATFORM=310P` 时输出 `MESSAGE` 并 `return`）：
-
-| 测试二进制 | 跳过的 Case | 原因 |
-|-----------|------------|------|
-| `test_text_ops` | SelfAttentionGraph GQA build | GQA builder 在 310P 上不可用 |
-| `test_text_ops` | TextDecoderLayerGraph GQA build | 同上 |
-| `test_text_model` | TextModel GQA | 同上 |
-| `test_text_runner_full` | TextRunner GQA Full Pipeline | 同上 |
-| `test_self_attention_precision` | SelfAttentionOp GQA no mask | 同上 |
-| `test_text_decoder_layer_precision` | TextDecoderLayerGraph GQA with mask | 同上 |
+2026-06-12 实测确认 GQA 在 310P 上完全支持（cos=1.0），所有 GQA skip guard 已移除。
 
 ## 精度保证
 

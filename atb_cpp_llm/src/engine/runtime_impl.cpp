@@ -70,6 +70,15 @@ WeightLoader* RuntimeImpl::GetWeightLoader() {
 }
 
 std::unique_ptr<IRuntime> CreateRuntime(int device_id, int64_t buffer_size) {
+    // Allow ASCEND_DEVICE_ID env var to override device_id when
+    // the caller passes the default (0).  Explicit non-zero values
+    // always take precedence over the environment variable.
+    if (device_id == 0) {
+        const char* env = std::getenv("ASCEND_DEVICE_ID");
+        if (env != nullptr && env[0] != '\0') {
+            device_id = std::atoi(env);
+        }
+    }
     std::unique_ptr<IRuntime> rt;
     Status s = RuntimeImpl::Create(device_id, buffer_size, rt);
     if (s != STATUS_OK) {

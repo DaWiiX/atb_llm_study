@@ -243,22 +243,13 @@ TEST_CASE("SelfAttentionGraph") {
         CHECK(op.get()->GetInputNum() == expected);
     }
 
-    // GQA: num_kv_heads < num_heads
-    // SKIP on 310P: SelfAttention GQA is not supported on 310P hardware.
-    // The engine layer handles this via GQA→MHA weight expansion at load time,
-    // so production inference is unaffected. This test exists purely to verify
-    // GQA builder plumbing.
-    if (!atb_llm::Is310P())
+    // GQA: num_kv_heads < num_heads (verified on 310P, cos=1.0)
     {
         atb_llm::OperationHandle op;
         atb_llm::Status s = atb_llm::components::SelfAttentionGraph::Build(
             "TestAttn_GQA", 12, 2, 64, 16, 1e-6f, false, op);
         CHECK(IS_OK(s));
         CHECK(op.get() != nullptr);
-    }
-    else
-    {
-        MESSAGE("Skipping GQA SelfAttentionGraph build test on 310P (GQA→MHA expansion handles this at engine layer)");
     }
 
     LOG_INFO("SelfAttentionGraph test done");
@@ -295,8 +286,7 @@ TEST_CASE("TextDecoderLayerGraph") {
         CHECK(op.get()->GetInputNum() == expected);
     }
 
-    // GQA (skipped on 310P — SelfAttention GQA is unsupported)
-    if (!atb_llm::Is310P())
+    // GQA (verified on 310P, cos=1.0)
     {
         atb_llm::OperationHandle op;
         atb_llm::Status s = atb_llm::components::text::TextDecoderLayerGraph::Build(

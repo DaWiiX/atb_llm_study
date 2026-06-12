@@ -34,6 +34,7 @@
 #include "core/raii.h"
 #include "core/tensor_allocator.h"
 #include "components/text/decoder_layer_graph.h"
+#include "test_mask_helper.h"
 #include "engine/runtime_impl.h"
 #include "utils/float_utils.h"
 #include "log/logger.h"
@@ -131,7 +132,7 @@ float RunDecoderLayer(atb_llm::IRuntime* runtime, const Case& c) {
     REQUIRE(plnw.Load(pfx + "pln_w.bin"));
     REQUIRE(cos_a.Load(pfx + "cos.bin"));
     REQUIRE(sin_a.Load(pfx + "sin.bin"));
-    if (use_mask && !atb_llm::Is310P()) REQUIRE(mask_a.Load(pfx + "mask.bin"));
+    if (use_mask) REQUIRE(mask_a.Load(pfx + "mask.bin"));
     REQUIRE(ref.Load (pfx + "out_ref.bin"));
 
     // Build the decoder layer
@@ -141,7 +142,7 @@ float RunDecoderLayer(atb_llm::IRuntime* runtime, const Case& c) {
         nh, kvh, hd, S, 1e-6f, use_mask, op);
     REQUIRE(IS_OK(s));
     REQUIRE(op.get() != nullptr);
-    REQUIRE(op.get()->GetInputNum() == static_cast<uint32_t>((use_mask && !atb_llm::Is310P()) ? 16 : 15));
+    REQUIRE(op.get()->GetInputNum() == static_cast<uint32_t>(use_mask ? 16 : 15));
 
     auto* alloc = runtime->GetAllocator();
     auto* ctx   = runtime->GetContext();
@@ -165,8 +166,8 @@ float RunDecoderLayer(atb_llm::IRuntime* runtime, const Case& c) {
     REQUIRE(IS_OK(alloc->AllocFloat16(in_pln, {H})));
     REQUIRE(IS_OK(alloc->AllocFloat16(in_cos, {S, hd})));
     REQUIRE(IS_OK(alloc->AllocFloat16(in_sin, {S, hd})));
-    if (use_mask && !atb_llm::Is310P()) {
-        REQUIRE(IS_OK(alloc->AllocFloat16(in_mask, {S, S})));
+    if (use_mask) {
+        atb_llm::test::UploadMask(alloc, mask_a.data.data(), S, in_mask);
     }
     REQUIRE(IS_OK(alloc->AllocFloat16(out_t, {S, H})));
 
@@ -180,7 +181,7 @@ float RunDecoderLayer(atb_llm::IRuntime* runtime, const Case& c) {
     upload(in_gw,  gw);  upload(in_uw,  uw);  upload(in_dw, dw);
     upload(in_iln, ilnw); upload(in_pln, plnw);
     upload(in_cos, cos_a); upload(in_sin, sin_a);
-    if (use_mask && !atb_llm::Is310P()) upload(in_mask, mask_a);
+    // mask already uploaded via test::UploadMask above
 
     // seqlen: single int32 = S (batch=1)
     int32_t seqlen_val = S;
@@ -192,8 +193,7 @@ float RunDecoderLayer(atb_llm::IRuntime* runtime, const Case& c) {
     in_seqlen.hostData = &seqlen_val;
 
     atb::VariantPack vp;
-    // On 310P, MASK_TYPE_CAUSAL generates mask internally — no external mask tensor.
-    if (use_mask && !atb_llm::Is310P()) {
+    if (use_mask) {
         vp.inTensors = {
             in_x, in_qw, in_kw, in_vw, in_ow, in_qnw, in_knw,
             in_gw, in_uw, in_dw, in_iln, in_pln,
@@ -260,14 +260,9 @@ TEST_CASE("TextDecoderLayerGraph precision: small no-mask") {
 
 // ═════════════════════════════════════════════════════════════════
 // Case 2: GQA with causal mask (nh=12, kvh=4, hd=64, I=256, S=8)
-// SKIP on 310P: internally uses SelfAttention GQA, not supported.
-// Production inference uses GQA→MHA weight expansion instead.
+// Verified on 310P (GQA supported, NZ mask works — cos=1.0)
 // ═════════════════════════════════════════════════════════════════
 TEST_CASE("TextDecoderLayerGraph precision: GQA with mask") {
-    if (atb_llm::Is310P()) {
-        MESSAGE("Skipping TextDecoderLayerGraph GQA precision test on 310P (GQA→MHA expansion handles this at engine layer)");
-        return;
-    }
     LOG_INFO("=== TextDecoderLayerGraph precision: GQA + mask ===");
 
     ArrayI32 meta;

@@ -1287,6 +1287,10 @@ def gen_op_self_attention():
     _make("mha_nomask_hd128_s16", S=16, nh=16, kvh=16, hd=128, seed=4105,
           use_mask=False, causal=False)
 
+    # ── GQA causal mask test (310P verified cos=1.0) ──
+    _make("gqa_causal", S=8, nh=12, kvh=4, hd=64, seed=4106,
+          use_mask=True, causal=True)
+
 
 # ═══════════════════════════════════════════════════════════════════
 # Stage: SwiGluMlpGraph — fp16 ground truth vs PyTorch reference

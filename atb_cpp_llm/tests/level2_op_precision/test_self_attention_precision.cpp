@@ -30,6 +30,7 @@
 #include "utils/float_utils.h"
 #include "log/logger.h"
 #include "util/cpp11_compat.h"
+#include "test_mask_helper.h"
 
 #include <cstdio>
 #include <cstdint>
@@ -92,27 +93,6 @@ std::vector<float> Fp16Decode(const std::vector<uint16_t>& src) {
     std::vector<float> dst(src.size());
     for (size_t i = 0; i < src.size(); i++) dst[i] = atb_llm::Fp16ToF32(src[i]);
     return dst;
-}
-
-// ── NZ mask helper for 310P ──────────────────────────────────────────
-// On 310P, MASK_TYPE_NORM expects NZ (FRACTAL_NZ) format.
-// Convert ND causal mask to NZ and allocate the NZ tensor.
-void PrepareMask310P(atb_llm::TensorAllocator* alloc,
-                     const std::vector<uint16_t>& mask_nd_data,
-                     int64_t S,
-                     atb::Tensor& mask_nz_t) {
-    int64_t s_pad = ((S + 15) / 16) * 16;
-    int64_t n1    = (S + 15) / 16;
-    int64_t nz_elems = n1 * s_pad * 16;
-
-    REQUIRE(IS_OK(alloc->AllocFloat16(mask_nz_t, {1, n1, s_pad, 16})));
-    mask_nz_t.desc.format = ACL_FORMAT_FRACTAL_NZ;
-
-    std::vector<uint16_t> mask_nz_data(static_cast<size_t>(nz_elems));
-    atb_llm::ConvertNdToNzFp16(mask_nd_data.data(), S, S, mask_nz_data.data());
-
-    REQUIRE(IS_OK(alloc->CopyToDevice(mask_nz_t, mask_nz_data.data(),
-                                      static_cast<size_t>(nz_elems) * sizeof(uint16_t))));
 }
 
 // ── Run one SelfAttention case ──────────────────────────────────────
@@ -178,15 +158,9 @@ SaResult RunOneCase(const std::string& name, int32_t S, int32_t nh,
                                       v_in.data.size() * sizeof(uint16_t))));
 
     // ── Prepare mask ──────────────────────────────────────────────
-    // 310P: NZ format mask  910B: ND format mask
+    // Platform format handled automatically by test::UploadMask
     if (use_mask) {
-        if (atb_llm::Is310P()) {
-            PrepareMask310P(alloc, mask_in.data, S, mask_t);
-        } else {
-            REQUIRE(IS_OK(alloc->AllocFloat16(mask_t, {S, S})));
-            REQUIRE(IS_OK(alloc->CopyToDevice(mask_t, mask_in.data.data(),
-                                              mask_in.data.size() * sizeof(uint16_t))));
-        }
+        atb_llm::test::UploadMask(alloc, mask_in.data.data(), S, mask_t);
     }
 
     // ── Seqlen tensor ─────────────────────────────────────────────
@@ -269,12 +243,6 @@ void RunTestCase(const TestCase& tc) {
         MESSAGE("Skipping ", tc.name, " (310P-only test)");
         return;
     }
-    // GQA cases: skip on 310P
-    if (tc.kvh < tc.nh && atb_llm::Is310P()) {
-        MESSAGE("Skipping ", tc.name, " (GQA not supported on 310P)");
-        return;
-    }
-
     INFO("=== SA precision: ", tc.name,
          " (S=", tc.S, " nh=", tc.nh, " kvh=", tc.kvh,
          " hd=", tc.hd, " mask=", tc.use_mask ? "causal" : "none", ") ===");
@@ -363,4 +331,12 @@ TEST_CASE("SelfAttentionOp: MHA causal hd=128 S=16 (real model)") {
 
 TEST_CASE("SelfAttentionOp: MHA no mask hd=128 S=16 (sanity)") {
     RunTestCase(LoadMeta("mha_nomask_hd128_s16"));
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// Group 4: GQA with causal mask (verified on 310P, cos=1.0)
+// ═════════════════════════════════════════════════════════════════════
+
+TEST_CASE("SelfAttentionOp: GQA causal mask (S=8, nh=12, kvh=4, hd=64)") {
+    RunTestCase(LoadMeta("gqa_causal"));
 }
