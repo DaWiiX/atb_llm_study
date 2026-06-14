@@ -9,8 +9,8 @@
 //   #include "utils/cpp11_compat.h"
 //   auto p = atb_llm::make_unique<Foo>(a, b);
 //
-// 将来若升级到 C++14+，可以全局把 atb_llm::make_unique 替换回
-// std::make_unique，无其他副作用。
+// Provides C++14/17 backports for C++11 compatibility. Used project-wide
+// instead of std::make_unique for consistency.
 
 #pragma once
 

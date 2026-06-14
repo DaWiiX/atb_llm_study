@@ -462,8 +462,9 @@ TEST_CASE("WeightLoader - GetReader accessor") {
     std::remove(tmpdir.c_str());
 }
 
-TEST_CASE("WeightLoader - CopyToNPU on nonexistent key") {
-    // CopyToNPU requires TensorAllocator (NPU), so we test error path only
+TEST_CASE("WeightLoader - error path on nonexistent key") {
+    // Note: CopyToNPU was removed in Phase 1 audit fix (dead code).
+    // This test verifies the error path through GetTensor.
     std::string tmpdir = TmpDir();
     Mkdir(tmpdir);
     std::string path = tmpdir + "/test.safetensors";
@@ -472,8 +473,7 @@ TEST_CASE("WeightLoader - CopyToNPU on nonexistent key") {
     atb_llm::WeightLoader loader;
     loader.LoadFromFile(path);
 
-    // We can't test CopyToNPU without NPU, but we can verify
-    // GetTensor returns proper error for missing keys
+    // Verify GetTensor returns proper error for missing keys
     atb_llm::WeightInfo info;
     CHECK(loader.GetTensor("nonexistent_tensor", info) == atb_llm::ERROR_WEIGHT_LOAD);
 

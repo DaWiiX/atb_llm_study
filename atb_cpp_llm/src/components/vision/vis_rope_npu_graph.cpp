@@ -139,6 +139,14 @@ void BuildVisRopeFreqTable(int32_t max_hw, int32_t half,
 }
 
 int32_t MaxGridHW(const int64_t* grid_thw, int64_t num_images) {
+    constexpr int64_t kMaxImages = 256;
+    if (num_images <= 0 || num_images > kMaxImages) {
+        LOG_ERROR("MaxGridHW: invalid num_images=%lld (max=%lld)",
+                  static_cast<long long>(num_images),
+                  static_cast<long long>(kMaxImages));
+        return 0;
+    }
+
     int32_t m = 0;
     for (int64_t img = 0; img < num_images; img++) {
         m = std::max<int32_t>(m, static_cast<int32_t>(grid_thw[img * 3 + 1]));

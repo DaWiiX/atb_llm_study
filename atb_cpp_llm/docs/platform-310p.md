@@ -194,13 +194,14 @@ SelfAttention: 接收 NZ 格式 mask
 
 **思路**（用户建议）：在 `qwen3vl_model.cpp` 的 `cached_mask_npu_` 创建时直接指定 NZ format，数据按 NZ 物理布局写入。这样 SelfAttention 收到的就是 NZ 格式 mask，无需 TransdataOp。
 
-**状态**：⏳ 待实施
+**状态**：✅ 已实施（C++ + Python 双端均已实现）
 
-**关键问题**：
-1. `AllocNpuFloat16({seq_len, seq_len})` 默认创建 ND 格式 tensor
-2. 要创建 NZ 格式：需要分配 NZ 物理 shape `{1, ceil(S/16), ceil(S/16)*16, 16}` 并设置 `format = ACL_FORMAT_FRACTAL_NZ`
-3. **数据必须按 NZ 布局写入**：FRACTAL_NZ 将矩阵按 16×16 块重排，不能直接写入 ND 布局数据
-4. 需要实现 CPU 侧 ND→NZ 数据重排，或在 NPU 上用 TransdataOp 做一次性转换后保存 NZ 格式的 mask 复用
+**实施细节**：
+1. ✅ C++ 侧：`float_utils.h:MakeCausalMaskNzFp16()` 在 CPU 生成 NZ 布局数据，`qwen3vl_model.cpp` 中 `AllocNpuFloat16({nz_shape})` 并显式设置 `format = ACL_FORMAT_FRACTAL_NZ`
+2. ✅ Python 侧：`utils.py:make_causal_mask_nz_npu()` 使用 `torch_npu.empty_with_format(..., acl_format=29)` 一步到位
+3. ✅ NZ 物理 shape 计算：`{1, ceil(S/16), ceil(S/16)*16, 16}`（fp16）
+4. ✅ 数据按 NZ 布局写入：CPU 侧直接按 NZ block-column-major 顺序填充，输入给 NPU 的字节序列与 NZ format 期望的物理布局一致
+5. ✅ 无需 TransdataOp：SelfAttention 收到 NZ format mask，fusion runner 跳过内部 ND→NZ 转换，直接运行
 
 ## 310P 实测指南
 
@@ -519,6 +520,66 @@ S=8 的 causal mask：
 - NZ: `[1, ceil(8/16), ceil(8/16)*16, 16]` = `[1, 1, 16, 16]`，256 个 fp16 元素
 - NZ 数据：用 padding 填充到 16×16 后在 block 内连续存储
 
+## Python 侧 NZ mask 生成
+
+### 函数层次
+
+Python 侧提供三层 NZ mask 生成函数（`atb_python_qwen3vl_embedding/utils.py:198-282`）：
+
+| 函数 | 角色 | 推荐度 |
+|------|------|--------|
+| `make_causal_mask_nz_npu(S)` | 推荐函数 — 生成 NZ 布局数据 + FRACTAL_NZ format tag，一步到位 | **推荐** |
+| `make_causal_mask_nz(S, device)` | 中间层 — 纯数据生成（fp32 CPU），不含 format tag | 内部使用 |
+| `nd_to_nz_fp16(mask_nd)` | 底层转换 — ND→NZ 布局转换（遗留辅助函数） | 已废弃 |
+
+### `make_causal_mask_nz_npu()` — 推荐生产路径
+
+```python
+import torch_npu
+
+
+def make_causal_mask_nz_npu(S: int) -> torch.Tensor:
+    # NZ 物理 shape 计算（float16）
+    n1 = (S + 15) // 16
+    s_pad = n1 * 16
+    shape = (1, n1, s_pad, 16)
+    # 1. 在 CPU 上生成 NZ 布局的 causal mask (fp16)
+    cpu_data = make_causal_mask_nz(S, device="cpu").half()
+    # 2. 在 NPU 上分配 NZ format tensor
+    nz_tensor = torch_npu.empty_with_format(shape, dtype=torch.float16,
+                                             device=torch.device("npu:0"),
+                                             acl_format=29)  # ACL_FORMAT_FRACTAL_NZ
+    # 3. 拷贝数据（两边的布局都是 NZ，逐字节一致）
+    nz_tensor.copy_(cpu_data)
+    return nz_tensor
+```
+
+### format tag 是关键
+
+`acl_format=29` (ACL_FORMAT_FRACTAL_NZ) 是**必选项**。如果没有这个 format tag：
+1. ATB SelfAttention 收到 ND format 标记的 tensor（即使数据是 NZ 布局）
+2. Fusion runner 内部尝试 ND→NZ TransdataOperation 转换
+3. 310P 上 TransdataOperation 不支持 → `TransdataOperation mki node infer shape fail`
+4. 结果：Setup 失败（ERROR_RT_FAIL）
+
+**对应关系**：
+- Python `torch_npu.empty_with_format(..., acl_format=29)` ↔ C++ `ACL_FORMAT_FRACTAL_NZ`
+- C++ 侧等价实现见 `float_utils.h:MakeCausalMaskNzFp16()`
+
+### 调用点
+
+`engine.py:_ensure_text_graph()`（第 197-228 行）：
+```python
+def _ensure_text_graph(self, S: int):
+    # ...
+    if is_310p():
+        mask = make_causal_mask_nz_npu(S)   # NZ layout + FRACTAL_NZ format
+    # ...
+    self._cached_mask = mask
+```
+
+mask 缓存在 `self._cached_mask` 中，后续 `_run_text()` 直接通过 `causal_mask=self._cached_mask` 传入 decoder layer graph。
+
 ## 310P 实测经验（2026-06-14 更新）
 
 ### 已验证事实
@@ -556,7 +617,7 @@ S=8 的 causal mask：
 | C++ Graph 精度测试 | ✅ 23/23 | NZ mask 正确传播 |
 | Python ATB mask | ✅ 已修复 | `engine.py` + `text_model.py` NZ 支持 |
 | Python E2E | ⏳ 待 310P 验证 | |
-| GQA→MHA 展开 | ⏳ 可移除 | GQA 原生支持，不再需要展开 |
+| GQA→MHA 展开 | ✅ 已确认 | GQA 在 310P 上原生支持（cos=1.0）；展开代码仍保留但不再触发（`is_310p() && nkv_t < nh_t` 条件已通过 GQA 原生支持满足，展开路径仅作为向后兼容保留）|
 
 ## 相关文件索引
 
@@ -564,12 +625,15 @@ S=8 的 causal mask：
 |------|------|
 | `atb_python_qwen3vl_embedding/utils.py:22-29` | Python 平台检测 |
 | `atb_python_qwen3vl_embedding/utils.py:132-176` | make_self_attention() 参数灵活化 |
+| `atb_python_qwen3vl_embedding/utils.py:198-282` | NZ mask 生成函数（nd_to_nz_fp16, make_causal_mask_nz, make_causal_mask_nz_npu）|
 | `atb_python_qwen3vl_embedding/text_attention.py:19-49` | build_attention/add_attention_graph |
+| `atb_python_qwen3vl_embedding/engine.py:197-228` | _ensure_text_graph() — 310P mask 创建（调用 make_causal_mask_nz_npu）|
 | `atb_python_qwen3vl_embedding/engine.py:105-194` | Python GQA→MHA 展开 |
 | `atb_python_qwen3vl_embedding/tests/test_310p_diag.py` | 310P 快速诊断 |
 | `atb_python_qwen3vl_embedding/tests/test_310p_combinations.py` | 310P 参数深度扫描 |
 | `atb_cpp_llm/docs/platform-310p.md` | 本文档 |
 | `atb_cpp_llm/src/utils/cpp11_compat.h:74-89` | C++ 平台检测 |
+| `atb_cpp_llm/src/utils/float_utils.h:47-48` | C++ MakeCausalMaskNzFp16() — FRACTAL_NZ mask 创建 |
 | `atb_cpp_llm/src/adapters/qwen3vl_embedding/qwen3vl_model.cpp:78-176` | C++ GQA→MHA 展开 |
 | `atb_cpp_llm/src/ops/self_attention_op.cpp` | C++ SelfAttentionOp 创建 |
 | `atb_cpp_llm/src/components/common/self_attention_graph.cpp` | GQA graph builder（含临时 TransdataOp）|

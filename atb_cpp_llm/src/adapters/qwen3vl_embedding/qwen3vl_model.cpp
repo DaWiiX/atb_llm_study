@@ -31,6 +31,60 @@ bool SkipTimingSyncs() {
     const char* env = getenv("ATB_SKIP_TIMING_SYNCS");
     return env != nullptr;
 }
+
+// ═════════════════════════════════════════════════════════════════════
+// Debug dump helpers — consolidated call sites for readability.
+// All are no-ops when ATB_DEBUG_VISION env var is unset.
+// ═════════════════════════════════════════════════════════════════════
+
+void DebugDumpVisionRoPE(IRuntime* rt,
+                         const atb::Tensor& cos, const atb::Tensor& sin,
+                         int64_t count) {
+    debug::DumpNpuFp16(rt, cos, count, "/tmp/cpp_rope_cos.bin");
+    debug::DumpNpuFp16(rt, sin, count, "/tmp/cpp_rope_sin.bin");
+}
+
+void DebugDumpFirstLayer(IRuntime* rt, const atb::Tensor& h,
+                         int64_t count) {
+    debug::DumpNpuFp16(rt, h, count, "/tmp/cpp_first_layer_out.bin");
+}
+
+void DebugMaybeFeedFirstLayer(IRuntime* rt, atb::Tensor& h,
+                              int64_t count) {
+    debug::MaybeFeedNpuFp16(rt, h, count, "/tmp/diag_first_layer_out.bin");
+}
+
+void DebugDumpBlock1(IRuntime* rt, const atb::Tensor& h,
+                     int64_t count) {
+    debug::DumpNpuFp16(rt, h, count, "/tmp/cpp_block_1_out.bin");
+}
+
+void DebugDumpBlockOutputs(IRuntime* rt, const atb::Tensor& h,
+                           int32_t li, int64_t count,
+                           int32_t vis_depth,
+                           const std::vector<int32_t>& deepstack_indices) {
+    if (!debug::VisionDumpEnabled()) return;
+    bool is_ds = false;
+    for (auto di : deepstack_indices) {
+        if (li == di) { is_ds = true; break; }
+    }
+    if (is_ds || li == vis_depth - 1) {
+        char path[256];
+        std::snprintf(path, sizeof(path), "/tmp/cpp_block_%d_out.bin", li);
+        debug::DumpNpuFp16(rt, h, count, path);
+    }
+}
+
+void DebugDumpTextInputs(const uint16_t* embeds, int64_t embed_count,
+                         const int64_t* pos_ids, int64_t pos_count) {
+    debug::DumpHostFp16(embeds, embed_count, "/tmp/cpp_inputs_embeds.bin");
+    debug::DumpHostInt64(pos_ids, pos_count, "/tmp/cpp_position_ids.bin");
+}
+
+void DebugDumpMerged(const uint16_t* data, int64_t count) {
+    debug::DumpHostFp16(data, count, "/tmp/cpp_vision_merged.bin");
+}
+
 }  // namespace
 
 Qwen3VLModel::Qwen3VLModel() = default;
@@ -392,10 +446,8 @@ Status Qwen3VLModel::ForwardWithTiming(const InferRequest& request,
         }
 
         // DEBUG: Save RoPE cos/sin for comparison with Python
-        debug::DumpNpuFp16(runtime_, *cos_npu.Get(), total_tokens * vis_hd,
-                           "/tmp/cpp_rope_cos.bin");
-        debug::DumpNpuFp16(runtime_, *sin_npu.Get(), total_tokens * vis_hd,
-                           "/tmp/cpp_rope_sin.bin");
+        DebugDumpVisionRoPE(runtime_, *cos_npu.Get(), *sin_npu.Get(),
+                            total_tokens * vis_hd);
 
         // Synchronize to capture true GPU time for pos_embed + RoPE.
         // Without this, the NPU time leaks into vision_model_ms.
@@ -451,8 +503,7 @@ Status Qwen3VLModel::ForwardWithTiming(const InferRequest& request,
         }
 
         // DEBUG: Save first layer output
-        debug::DumpNpuFp16(runtime_, *h_npu.Get(), total_tokens * vis_hs,
-                           "/tmp/cpp_first_layer_out.bin");
+        DebugDumpFirstLayer(runtime_, *h_npu.Get(), total_tokens * vis_hs);
 
         // ── Vision sub-stage: Blocks 1..(depth-1) + Deepstack extraction ──
         auto t_v_blocks = std::chrono::high_resolution_clock::now();
@@ -480,18 +531,10 @@ Status Qwen3VLModel::ForwardWithTiming(const InferRequest& request,
             h_npu = std::move(h_out);
 
             // DEBUG: Save block output at deepstack layers and last block
-            if (debug::VisionDumpEnabled()) {
-                bool is_ds = false;
-                for (auto di : config_.vis_deepstack_visual_indexes) {
-                    if (li == di) { is_ds = true; break; }
-                }
-                if (is_ds || li == config_.vis_depth - 1) {
-                    char path[256];
-                    std::snprintf(path, sizeof(path), "/tmp/cpp_block_%d_out.bin", li);
-                    debug::DumpNpuFp16(runtime_, *h_npu.Get(),
-                                       total_tokens * vis_hs, path);
-                }
-            }
+            DebugDumpBlockOutputs(runtime_, *h_npu.Get(), li,
+                                  total_tokens * vis_hs,
+                                  config_.vis_depth,
+                                  config_.vis_deepstack_visual_indexes);
 
             size_t fusion_idx = 0;
             if (deepstack_fusion_->IsDeepstackLayer(li, fusion_idx)) {
@@ -539,7 +582,7 @@ Status Qwen3VLModel::ForwardWithTiming(const InferRequest& request,
             t_vis_model - t_prev).count();
         t_prev = t_vis_model;
 
-        LOG_INFO("  [Vision detail] FirstLayer: %.2f ms | Blocks(1..%d): %.2f ms | Merger+D2H: %.2f ms",
+        LOG_DEBUG("  [Vision detail] FirstLayer: %.2f ms | Blocks(1..%d): %.2f ms | Merger+D2H: %.2f ms",
                  v_first_ms, config_.vis_depth - 1, v_blocks_ms, v_merger_ms);
 
         // Inject vision tokens into text embeddings
@@ -569,10 +612,8 @@ Status Qwen3VLModel::ForwardWithTiming(const InferRequest& request,
                              config_.vis_spatial_merge_size, position_ids.data());
 
     // DEBUG: Save inputs_embeds and position_ids for comparison with Python
-    debug::DumpHostFp16(inputs_embeds.data(), seq_len * hidden_size,
-                        "/tmp/cpp_inputs_embeds.bin");
-    debug::DumpHostInt64(position_ids.data(), 3 * seq_len,
-                         "/tmp/cpp_position_ids.bin");
+    DebugDumpTextInputs(inputs_embeds.data(), seq_len * hidden_size,
+                        position_ids.data(), 3 * seq_len);
     // ── P0: MRoPE cos/sin + Causal mask — direct fp16 + NPU cache ──
     // When seq_len is unchanged across calls, reuse the cached NPU tensors
     // to avoid regeneration + H2D upload (saves ~212ms at S=4096).
@@ -721,7 +762,7 @@ Status Qwen3VLModel::ForwardWithTiming(const InferRequest& request,
         t_text_model - t_prev).count();
     t_prev = t_text_model;
 
-    LOG_INFO("  [Text detail] H2D prep: %.2f ms | %d layers: %.2f ms (avg %.3f/layer) | Norm+D2H: %.2f ms",
+    LOG_DEBUG("  [Text detail] H2D prep: %.2f ms | %d layers: %.2f ms (avg %.3f/layer) | Norm+D2H: %.2f ms",
              t_h2d_ms, config_.text_num_layers, t_layers_ms,
              t_layers_ms / config_.text_num_layers, t_norm_ms);
 
@@ -795,10 +836,8 @@ Status Qwen3VLModel::RunVision(const uint16_t* pixel_values, int64_t num_patches
     }
 
     // DEBUG: Save RoPE cos/sin for comparison with Python
-    debug::DumpNpuFp16(runtime_, *cos_npu.Get(), total_tokens * vis_hd,
-                       "/tmp/cpp_rope_cos.bin");
-    debug::DumpNpuFp16(runtime_, *sin_npu.Get(), total_tokens * vis_hd,
-                       "/tmp/cpp_rope_sin.bin");
+    DebugDumpVisionRoPE(runtime_, *cos_npu.Get(), *sin_npu.Get(),
+                        total_tokens * vis_hd);
 
     // 3. Copy vision inputs to NPU (pos_npu/cos_npu/sin_npu already done)
     int64_t patch_dim = static_cast<int64_t>(config_.vis_in_channels) *
@@ -853,14 +892,12 @@ Status Qwen3VLModel::RunVision(const uint16_t* pixel_values, int64_t num_patches
     }
 
     // DEBUG: Save first layer output
-    debug::DumpNpuFp16(runtime_, *h_npu.Get(), total_tokens * vis_hs,
-                       "/tmp/cpp_first_layer_out.bin");
+    DebugDumpFirstLayer(runtime_, *h_npu.Get(), total_tokens * vis_hs);
 
     // CONTROLLED FEED: When ATB_DEBUG_VISION=2, overwrite C++ first_layer
     // output with Python's first_layer output to isolate whether block
     // computation differs or error is amplified from input difference.
-    debug::MaybeFeedNpuFp16(runtime_, *h_npu.Get(), total_tokens * vis_hs,
-                            "/tmp/diag_first_layer_out.bin");
+    DebugMaybeFeedFirstLayer(runtime_, *h_npu.Get(), total_tokens * vis_hs);
 
     // 5. Run blocks 1..depth-1, collect deepstack features
     ds_features.resize(config_.vis_deepstack_visual_indexes.size());
@@ -894,23 +931,14 @@ Status Qwen3VLModel::RunVision(const uint16_t* pixel_values, int64_t num_patches
 
         // DEBUG: Save block 1 output for early-divergence diagnosis
         if (li == 1) {
-            debug::DumpNpuFp16(runtime_, *h_npu.Get(), total_tokens * vis_hs,
-                               "/tmp/cpp_block_1_out.bin");
+            DebugDumpBlock1(runtime_, *h_npu.Get(), total_tokens * vis_hs);
         }
 
         // DEBUG: Save block output at deepstack layers and last block
-        if (debug::VisionDumpEnabled()) {
-            bool is_ds = false;
-            for (auto di : config_.vis_deepstack_visual_indexes) {
-                if (li == di) { is_ds = true; break; }
-            }
-            if (is_ds || li == config_.vis_depth - 1) {
-                char path[256];
-                std::snprintf(path, sizeof(path), "/tmp/cpp_block_%d_out.bin", li);
-                debug::DumpNpuFp16(runtime_, *h_npu.Get(),
-                                   total_tokens * vis_hs, path);
-            }
-        }
+        DebugDumpBlockOutputs(runtime_, *h_npu.Get(), li,
+                              total_tokens * vis_hs,
+                              config_.vis_depth,
+                              config_.vis_deepstack_visual_indexes);
 
         // Check if this layer produces deepstack features
         size_t fusion_idx = 0;
@@ -954,9 +982,8 @@ Status Qwen3VLModel::RunVision(const uint16_t* pixel_values, int64_t num_patches
         alloc->CopyToHost(vis_embeds_out, *merged_out.Get(), merged_bytes);
 
         // DEBUG: Save merged vision output for comparison with Python
-        debug::DumpHostFp16(vis_embeds_out,
-                            merged_tokens * config_.vis_out_hidden_size,
-                            "/tmp/cpp_vision_merged.bin");
+        DebugDumpMerged(vis_embeds_out,
+                        merged_tokens * config_.vis_out_hidden_size);
         // merged_out auto-freed at end of block
     }
 

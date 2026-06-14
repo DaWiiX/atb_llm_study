@@ -255,7 +255,7 @@
 - **优先级**: 🟢 低（P8-A/B 已解决最痛的点）
 
 #### 🟡 P6: Vision Merger → image token 注入端到端 NPU 化
-- **位置**: `qwen3vl_model.cpp:453-469` (ForwardWithTiming) 和 `qwen3vl_model.cpp:641-647` (PrepareInputs)
+- **位置**: `qwen3vl_model.cpp:453-469` (ForwardWithTiming)（PrepareInputs 已在 Phase 17 删除，其逻辑已内联到 ForwardWithTiming）
 - **当前路径**: merger 输出 `CopyToHost` → `vis_embeds_host` → CPU memcpy scatter → `inputs_embeds` → `CopyToDevice`
 - **数据量**: 896×896 下 vis_embeds (~3.2 MB) + inputs_embeds (~3.6 MB) = 6.8 MB 往返
 - **方案**: 需要 NPU **ScatterUpdate / IndexPut**（写入而非累加）算子
@@ -282,7 +282,7 @@
 
 #### Positions 复用
 - **位置**: `deepstack_fusion.cpp:InjectFeatures` 每次都把 positions 上传一次（28 decoder 层 × 3 deepstack = 84 次小拷贝，每次 ~kb）
-- **方案**: 在 PrepareInputs 时一次上传 positions 到 NPU，DeepstackFusion 直接消费
+- **方案**: 在 ForwardWithTiming 中 early stage 一次上传 positions 到 NPU，DeepstackFusion 直接消费（PrepareInputs 已在 Phase 17 删除）
 - **预期收益**: 微小（< 0.5 ms）
 - **优先级**: 极低
 

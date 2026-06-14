@@ -69,7 +69,12 @@ def _compute_text_only_transformers(model_dir: str, input_ids: torch.Tensor):
     """Compute TEXT_ONLY encoding via transformers (CPU, no ATB/NPU).
 
     This is the fallback when ATB engine.encode() fails on 310P.
-    Uses the same Qwen3VLForConditionalGeneration as the E2E reference.
+    Uses the same architecture as Qwen3VLForEmbedding:
+      Qwen3VLForConditionalGeneration.model → Qwen3VLModel → last_hidden_state
+    last_hidden_state is POST-NORM (after language_model.norm), matching
+    the ATB engine which applies FinalNorm before pooling.
+    Previous bug: hidden_states[-1] from Qwen3VLForConditionalGeneration
+    gave pre-norm output → cos ~0.665 vs ATB.
 
     Returns: (embedding: np.ndarray, method: str)
     """
@@ -80,13 +85,11 @@ def _compute_text_only_transformers(model_dir: str, input_ids: torch.Tensor):
     model.eval()
 
     with torch.no_grad():
-        outputs = model(
-            input_ids=input_ids,
-            output_hidden_states=True,
-        )
-        # Last hidden state, pool last token
-        hidden = outputs.hidden_states[-1]  # (B, S, D)
-        # Pooling: last non-padding token (same as _pooling_last)
+        # model.model is Qwen3VLModel — same as Qwen3VLForEmbedding.model
+        # last_hidden_state = post-norm (after language_model.norm)
+        outputs = model.model(input_ids=input_ids)
+        hidden = outputs.last_hidden_state  # (B, S, D)
+        # Pooling: last non-padding token (same as Qwen3VLEmbedder._pooling_last)
         # Assume no padding for these reference inputs
         emb = hidden[:, -1, :]  # (B, D)
         emb = F.normalize(emb, p=2, dim=-1)

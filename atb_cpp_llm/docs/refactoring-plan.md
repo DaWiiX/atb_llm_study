@@ -24,16 +24,16 @@
 
 | 项目 | 当前状态 | 目标 | 原因 |
 |------|----------|------|------|
-| 适配器行数 | 588 行 (.h 96 + .cpp 492) | 300-400 行 | Qwen3VL 独有的权重编排逻辑（RunVision 155行 / PrepareInputs 80行 / RunTextDecoder 73行），提取到 Runner 会增加耦合；Phase 17 后已删除 PrepareInputs 和 RunTextDecoder |
+| 适配器行数 | 588 行 (.h 96 + .cpp 492) | 300-400 行 | Qwen3VL 独有的权重编排逻辑（RunVision 155行），提取到 Runner 会增加耦合；Phase 17 已删除 PrepareInputs 和 RunTextDecoder |
 | InjectFeatures 纯 NPU 实现 | CPU 侧加法 + partial-copy | 纯 NPU scatter-add | ATB SetValue/Gather 是否支持任意索引 scatter-add 需查文档验证 |
 
-### 1.3 待解决问题
+### 1.3 待解决问题 & 已解决问题
 
-| 问题 | 优先级 | 描述 |
-|------|--------|------|
-| InjectFeatures 纯 NPU 实现 | 中 | 消除最后一段 NPU↔Host 传输 |
-| Debug 模式 -DDEBUG 与 LogLevel::DEBUG 冲突 | 低 | CMakeLists `-DDEBUG` 宏与 logger.h 枚举冲突 |
-| 测试加固 P2（18 项） | 低 | 见 [archive/test-hardening-log.md](./archive/test-hardening-log.md) H12-H29 |
+| 问题 | 优先级 | 状态 | 描述 |
+|------|--------|------|------|
+| InjectFeatures 纯 NPU 实现 | 中 | ✅ 已解决 | 已替换为 IndexAddOp 纯 NPU 实现（`deepstack_fusion.cpp`）|
+| Debug 模式 -DDEBUG 与 LogLevel::DEBUG 冲突 | 低 | ⚠️ 仍存在 | CMakeLists Debug 构建下 `-DDEBUG` 宏与 `LogLevel::DEBUG = 0` 枚举冲突；Release 构建不受影响 |
+| 测试加固 P2（18 项） | 低 | — | 见 [archive/test-hardening-log.md](./archive/test-hardening-log.md) H12-H29 |
 
 ---
 

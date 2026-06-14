@@ -20,6 +20,9 @@
  * Run: ./build/test_index_add_npu
  */
 
+#define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+#include "doctest.h"
+
 #include "atb_llm/types.h"
 #include "atb_llm/runtime.h"
 #include "ops/index_add_op.h"
@@ -39,7 +42,9 @@
 
 #define IS_OK(s) ((s) == atb_llm::STATUS_OK)
 
-static double CosineSim(const std::vector<float>& a, const std::vector<float>& b) {
+namespace {
+
+double CosineSim(const std::vector<float>& a, const std::vector<float>& b) {
     if (a.size() != b.size() || a.empty()) return 0.0;
     double dot = 0, na = 0, nb = 0;
     for (size_t i = 0; i < a.size(); i++) {
@@ -50,7 +55,7 @@ static double CosineSim(const std::vector<float>& a, const std::vector<float>& b
     return dot / (std::sqrt(na) * std::sqrt(nb) + 1e-12);
 }
 
-static float MaxAbsDiff(const std::vector<float>& a, const std::vector<float>& b) {
+float MaxAbsDiff(const std::vector<float>& a, const std::vector<float>& b) {
     float m = 0;
     for (size_t i = 0; i < a.size(); i++) {
         float d = std::fabs(a[i] - b[i]);
@@ -59,21 +64,10 @@ static float MaxAbsDiff(const std::vector<float>& a, const std::vector<float>& b
     return m;
 }
 
-struct CaseResult {
-    std::string tag;
-    bool ok = false;
-    double cosine = 0.0;
-    float max_abs = 0.0f;
-    int64_t mismatch_unindexed = 0;
-    std::string reason;
-};
-
-static CaseResult RunCase(const std::string& tag,
-                          int64_t M, int64_t D,
-                          const std::vector<int32_t>& indices,
-                          atb_llm::IRuntime* runtime,
-                          uint32_t seed = 42) {
-    CaseResult res; res.tag = tag;
+void RunCase(const std::string& tag,
+             int64_t M, int64_t D,
+             const std::vector<int32_t>& indices,
+             uint32_t seed = 42) {
     int64_t N = static_cast<int64_t>(indices.size());
 
     // ── Generate var, updates fp16 ──
@@ -96,37 +90,39 @@ static CaseResult RunCase(const std::string& tag,
     std::vector<float> expected = var_f32;          // copy
     for (int64_t i = 0; i < N; i++) {
         int32_t idx = indices[i];
-        if (idx < 0 || idx >= M) {
-            res.reason = "index out of range";
-            return res;
-        }
+        REQUIRE((idx >= 0));
+        REQUIRE((idx < M));
         for (int64_t d = 0; d < D; d++) {
             expected[idx * D + d] += upd_f32[i * D + d];
         }
     }
+
+    // ── Create runtime ──
+    auto runtime = atb_llm::CreateRuntime(0, 1LL * 1024 * 1024 * 1024);
+    REQUIRE(runtime);
 
     // ── NPU run ──
     auto* alloc = runtime->GetAllocator();
     auto* ctx   = runtime->GetContext();
 
     atb::Tensor var_npu, idx_npu, upd_npu;
-    if (!IS_OK(alloc->AllocFloat16(var_npu, {M, D}))) { res.reason = "alloc var"; return res; }
-    if (!IS_OK(alloc->AllocInt32(idx_npu, {N}))) { res.reason = "alloc idx"; return res; }
-    if (!IS_OK(alloc->AllocFloat16(upd_npu, {N, D}))) { res.reason = "alloc upd"; return res; }
+    REQUIRE(IS_OK(alloc->AllocFloat16(var_npu, {M, D})));
+    REQUIRE(IS_OK(alloc->AllocInt32(idx_npu, {N})));
+    REQUIRE(IS_OK(alloc->AllocFloat16(upd_npu, {N, D})));
 
     alloc->CopyToDevice(var_npu, var_fp16.data(), var_fp16.size() * sizeof(uint16_t));
     alloc->CopyToDevice(idx_npu, indices.data(), indices.size() * sizeof(int32_t));
     alloc->CopyToDevice(upd_npu, upd_fp16.data(), upd_fp16.size() * sizeof(uint16_t));
 
     atb_llm::OperationHandle op = atb_llm::ops::IndexAddOp::Create(0);
-    if (!op) { res.reason = "op create failed"; return res; }
+    REQUIRE(op);
 
     // ATB IndexAdd needs 4 inTensors. Based on common ATB convention,
     // the 4th is an alpha scalar (broadcast multiplier on `updates`).
     // We pass alpha=1.0 as a fp16 scalar tensor of shape (1,).
     uint16_t alpha_fp16 = atb_llm::Fp32ToFp16(1.0f);
     atb::Tensor alpha_npu;
-    if (!IS_OK(alloc->AllocFloat16(alpha_npu, {1}))) { res.reason = "alloc alpha"; return res; }
+    REQUIRE(IS_OK(alloc->AllocFloat16(alpha_npu, {1})));
     alloc->CopyToDevice(alpha_npu, &alpha_fp16, sizeof(uint16_t));
 
     atb::VariantPack vp;
@@ -134,12 +130,12 @@ static CaseResult RunCase(const std::string& tag,
     vp.outTensors = {var_npu};                     // in-place: alias output to var
     uint64_t ws_size = 0;
     atb::Status s = op.get()->Setup(vp, ws_size, ctx);
-    if (s != atb::NO_ERROR) { res.reason = "Setup failed: " + std::to_string(s); return res; }
+    REQUIRE(s == atb::NO_ERROR);
     uint8_t* ws_ptr = nullptr;
     auto __atb_pair_ws = runtime->GetWorkspace(ws_size > 0 ? ws_size : 1); auto& ws = __atb_pair_ws.first; auto& ws_st = __atb_pair_ws.second;
     if (ws_st == atb_llm::STATUS_OK) ws_ptr = ws;
     s = op.get()->Execute(vp, ws_ptr, ws_size, ctx);
-    if (s != atb::NO_ERROR) { res.reason = "Execute failed: " + std::to_string(s); return res; }
+    REQUIRE(s == atb::NO_ERROR);
     runtime->Synchronize();
 
     // ── Read back ──
@@ -148,75 +144,51 @@ static CaseResult RunCase(const std::string& tag,
     std::vector<float> got(M * D);
     for (int64_t i = 0; i < M * D; i++) got[i] = atb_llm::Fp16ToF32(out_fp16[i]);
 
-    res.cosine  = CosineSim(got, expected);
-    res.max_abs = MaxAbsDiff(got, expected);
+    double cosine  = CosineSim(got, expected);
+    float max_abs = MaxAbsDiff(got, expected);
+
+    LOG_INFO("  [%s] M=%ld N=%ld D=%ld cosine=%.6f max_abs=%.5f",
+             tag.c_str(),
+             static_cast<long>(M), static_cast<long>(N), static_cast<long>(D),
+             cosine, max_abs);
+
+    CHECK(cosine >= 0.9999);
 
     // Check unindexed rows are bit-exact preserved.
     std::vector<bool> touched(M, false);
     for (auto i : indices) touched[i] = true;
+    int64_t mismatch_unindexed = 0;
     for (int64_t r = 0; r < M; r++) {
         if (touched[r]) continue;
         for (int64_t d = 0; d < D; d++) {
-            if (out_fp16[r * D + d] != var_fp16[r * D + d]) res.mismatch_unindexed++;
+            if (out_fp16[r * D + d] != var_fp16[r * D + d]) mismatch_unindexed++;
         }
     }
 
-    res.ok = (res.cosine >= 0.9999) && (res.mismatch_unindexed == 0);
-    LOG_INFO("  [%s] M=%ld N=%ld D=%ld cosine=%.6f max_abs=%.5f unindexed_mismatch=%ld %s",
-             tag.c_str(),
-             static_cast<long>(M), static_cast<long>(N), static_cast<long>(D),
-             res.cosine, res.max_abs,
-             static_cast<long>(res.mismatch_unindexed),
-             res.ok ? "PASS" : "FAIL");
-    return res;
+    CAPTURE(mismatch_unindexed);
+    CHECK(mismatch_unindexed == 0);
 }
 
-int main() {
-    LOG_INFO("=== IndexAdd NPU Op Test ===");
+}  // namespace
 
-    std::unique_ptr<atb_llm::IRuntime> runtime;
-    auto rt_st = atb_llm::RuntimeImpl::Create(0, 1LL * 1024 * 1024 * 1024, runtime);
-    if (rt_st != atb_llm::STATUS_OK || !runtime) {
-        LOG_ERROR("Runtime create failed");
-        return 1;
-    }
+// ═════════════════════════════════════════════════════════════════════
+TEST_CASE("IndexAddOp: small (M=10, N=4, D=8)") {
+    std::vector<int32_t> idx = {3, 7, 1, 9};
+    RunCase("small", /*M=*/10, /*D=*/8, idx, 42);
+}
 
-    int passed = 0, total = 0;
+TEST_CASE("IndexAddOp: medium (M=900, N=200, D=2048)") {
+    std::vector<int32_t> idx(200);
+    for (int i = 0; i < 200; i++) idx[i] = i * 4 + 1;  // spread across var
+    RunCase("medium", /*M=*/900, /*D=*/2048, idx, 1234);
+}
 
-    // Case 1: small
-    {
-        std::vector<int32_t> idx = {3, 7, 1, 9};
-        auto r = RunCase("small", /*M=*/10, /*D=*/8, idx, runtime.get(), 42);
-        total++;
-        if (r.ok) passed++;
-    }
+TEST_CASE("IndexAddOp: edge single index (M=1, N=1, D=4)") {
+    std::vector<int32_t> idx = {0};
+    RunCase("edge_single", /*M=*/1, /*D=*/4, idx, 7);
+}
 
-    // Case 2: medium (typical IMAGE_ONLY: ~880 tokens, hidden_size=2048)
-    {
-        std::vector<int32_t> idx(200);
-        for (int i = 0; i < 200; i++) idx[i] = i * 4 + 1;  // spread across var
-        auto r = RunCase("medium", /*M=*/900, /*D=*/2048, idx, runtime.get(), 1234);
-        total++;
-        if (r.ok) passed++;
-    }
-
-    // Case 3: single index (degenerate edge)
-    {
-        std::vector<int32_t> idx = {0};
-        auto r = RunCase("edge_single", /*M=*/1, /*D=*/4, idx, runtime.get(), 7);
-        total++;
-        if (r.ok) passed++;
-    }
-
-    // Case 4: repeated index — both writes must accumulate
-    {
-        std::vector<int32_t> idx = {5, 5, 5, 2};
-        auto r = RunCase("edge_repeated_idx", /*M=*/8, /*D=*/16, idx, runtime.get(), 99);
-        total++;
-        if (r.ok) passed++;
-    }
-
-    LOG_INFO("──────────────────────────────────────────────");
-    LOG_INFO("IndexAdd op: %d/%d passed", passed, total);
-    return (passed == total) ? 0 : 1;
+TEST_CASE("IndexAddOp: edge repeated index (M=8, N=4, D=16)") {
+    std::vector<int32_t> idx = {5, 5, 5, 2};
+    RunCase("edge_repeated_idx", /*M=*/8, /*D=*/16, idx, 99);
 }

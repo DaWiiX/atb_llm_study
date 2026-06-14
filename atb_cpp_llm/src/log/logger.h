@@ -4,7 +4,6 @@
 #include <cstring>
 #include <cstdarg>
 #include <ctime>
-#include <acl/acl.h>
 
 namespace atb_llm {
 
@@ -18,16 +17,24 @@ enum class LogLevel {
 
 namespace detail {
 
-inline LogLevel GetLogLevel() {
+inline LogLevel& MutableLogLevel() {
     static LogLevel level = []() {
         const char* env = std::getenv("LOG_LEVEL");
-        if (!env) return LogLevel::INFO;
+        if (!env) return LogLevel::WARN;
         int val = std::atoi(env);
         if (val < 0) return LogLevel::DEBUG;
         if (val > 3) return LogLevel::NONE;
         return static_cast<LogLevel>(val);
     }();
     return level;
+}
+
+inline LogLevel GetLogLevel() {
+    return MutableLogLevel();
+}
+
+inline void SetLogLevel(LogLevel level) {
+    MutableLogLevel() = level;
 }
 
 inline const char* LogLevelStr(LogLevel level) {

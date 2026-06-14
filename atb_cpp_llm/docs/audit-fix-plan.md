@@ -729,11 +729,172 @@ D4. platform-310p.md 缺少 Python 侧的同步说明
 
 ---
 
-## 第三阶段：技术债务清理（持续）
+## 第三阶段：技术债务清理
 
-### 设计文档更新
-### LOW 级别项目批量处理
-### 统一代码风格和命名规范
+> **第三阶段完成时间**: 2026-06-14
+
+Phase 3 共修复 12 个项目（5 MEDIUM + 4 设计文档 + 3 潜在 bug），派出 8 个开发代理 + 3 个独立测试代理 + 3 个重做修复代理 + 1 个全量测试代理 = 15 个 subagent。
+
+**教训**: 第一轮开发代理中 3/8（WP1、WP2、WP5）报告了修改但未实际写入文件（agent 行为异常）。重做后所有修改均已验证生效。WP6 的 L04 修复引入了 CRITICAL bug（构造函数 public 破坏工厂模式），已通过 WP6-FIX 还原。
+
+---
+
+### Fix 3.1: M5 — `StageTimings` 提取到独立 `timing.h` 头文件
+
+**严重级别**: MEDIUM  
+**文件**: `include/atb_llm/timing.h` (NEW), `include/atb_llm/types.h`
+
+**问题**: `StageTimings` 结构体（8 个 timing 字段）定义在 `types.h` 中，污染公共 API 表面。
+
+**修复方案**: 创建 `include/atb_llm/timing.h`，将 `StageTimings` 移动过去，`types.h` 通过 `#include "atb_llm/timing.h"` 保持向后兼容。
+
+**实现**: 
+1. 新建 `include/atb_llm/timing.h` — 含 `StageTimings` 结构体（8 个 double 字段）
+2. `types.h`: 删除 `StageTimings` 定义（12 行），新增 `#include "atb_llm/timing.h"`
+3. 零消费者变更 — `timing.h` 通过 cmake `install(DIRECTORY include/atb_llm ...)` 自动安装
+
+**测试验证**: 
+- ✅ Test 1: 100% 编译成功，零错误
+- ✅ Test 2: 所有消费者正常（benchmark.cpp, test_embedder_utils.cpp, llm_engine.cpp, embedder.cpp）
+- ✅ Test 3: 全量 CTest 51/51 PASS
+
+**验证代理**: Agent `a287de83` (开发), Agent `a754fd1a` (独立测试)  
+**完成时间**: 2026-06-14 (第三阶段)
+
+---
+
+### Fix 3.2: M6+M11+M12+M15 — 批量 MEDIUM 项目修复
+
+**M6: 死代码 cpp11_compat.h include**
+- `src/ops/self_attention_op.cpp:3` — 删除 `#include "utils/cpp11_compat.h"`（零符号使用）
+- `src/components/text/decoder_layer_graph.cpp:8` — 同上
+- `src/log/logger.h:7` — 删除孤儿 `#include <acl/acl.h>`（Phase 1 已删除 ATB_LLM_CHECK 宏）
+
+**M11: 生产路径调试代码整理**
+- `qwen3vl_model.cpp`: 新增 7 个匿名命名空间辅助函数（DebugDumpVisionRoPE, DebugDumpFirstLayer, DebugDumpBlock1 等），收拢 13 处 inline `debug::Dump*` 调用
+- 所有 `ATB_DEBUG_VISION` env var 门控保持不变，零运行时开销
+
+**M12: 默认日志级别 + SetLogLevel API**
+- `logger.h`: 默认级别 `INFO` → `WARN`；新增 `SetLogLevel(LogLevel)` API（优先级：SetLogLevel > LOG_LEVEL env var > WARN 默认）
+- `qwen3vl_model.cpp`: 2 处 per-inference timing LOG_INFO 降级为 LOG_DEBUG
+- `debug_dump.cpp`: 2 处 debug dump LOG_INFO 降级为 LOG_DEBUG
+
+**M15: 测试文件 doctest 化**
+- 3 个文件从自定义 `int main()` 转换为 `DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN`：`test_index_add_npu.cpp` (4 TEST_CASE)、`test_pos_embed_npu_graph.cpp` (10 TEST_CASE)、`test_vis_rope_npu_graph.cpp` (10 TEST_CASE)
+- 移除手动 `CaseResult` 结构体和 pass/fail 计数，替换为 `CHECK()`/`REQUIRE()`/`CAPTURE()` 宏
+
+**测试验证**: 
+- ✅ Test: 全量编译 100% 成功
+- ✅ Test: 全量 CTest 51/51 PASS
+- ✅ Test (M11): 7 个辅助函数参数与原 inline 调用完全一致
+- ✅ Test (M12): `SetLogLevel()` API 存在，默认 WARN 生效
+- ✅ Test (M15): 24 个 TEST_CASE 全部编译成功
+
+**验证代理**: Agent `a87a1707`/`a6de2799`/`a060a217`/`ab23d96f` (开发), Agent `a9235baf`/`a754fd1a`/`a7f79eda` (独立测试)  
+**完成时间**: 2026-06-14 (第三阶段)
+
+---
+
+### Fix 3.3: D1-D4 — 设计文档更新
+
+**D1+D2: `docs/design.md`**
+- Section 5.1: 组件目录从旧 `attention/mlp/norm/position/fusion` 更新为实际 `common/text/vision`
+- Section 8: 目录树完全重写匹配实际结构（adapters 移到 src/、移除 src/preprocess/、添加 src/families/runners/utils、tests 从 unit/benchmark 改为 level0-4、include 数从 4 更新为 10）
+- 项目名 `atb_cpp_llm_engine` → `atb_cpp_llm`
+- 修复 stale 路径 `components/mlp/moe_mlp_graph.h` → `components/common/moe_mlp_graph.h`
+
+**D3: `docs/refactoring-plan.md`**
+- Section 1.2: 移除 `PrepareInputs`/`RunTextDecoder` 自矛盾（标注已删除）
+- Section 1.3: 待解决问题表添加状态列（InjectFeatures=已解决，Debug冲突=仍存在）
+
+**D4: `docs/platform-310p.md`**
+- 相关文件索引表添加 Python 侧 3 个入口（utils.py, engine.py, float_utils.h）
+- 新增 "Python 侧 NZ mask 生成" 子章节（含 `make_causal_mask_nz_npu()` 代码示例）
+- 更新状态标记："方案 6" 待实施→已实施，GQA→MHA 已确认
+
+**测试验证**: 
+- ✅ Test: 交叉验证无 stale 引用残留
+- ✅ Test: `make_causal_mask_nz_npu()` 代码示例补全（import torch_npu + shape 定义）
+
+**验证代理**: Agent `a6bdadff` (开发), Agent `a754fd1a` (独立测试), Agent `acb7187e` (小 bug 修复)  
+**完成时间**: 2026-06-14 (第三阶段)
+
+---
+
+### Fix 3.4: L07+L11+L03 — 潜在 bug 修复
+
+**L07: `set_value_op.cpp` — starts/ends 长度验证**
+- 在 `Create()` 顶部添加 `if (starts.size() != ends.size())` 检查
+- 不匹配时返回空 `OperationHandle` 并记录 `LOG_ERROR`
+
+**L11: `vis_rope_npu_graph.cpp` — MaxGridHW 边界检查**
+- 添加 `kMaxImages = 256` 上限和 `num_images <= 0` 检查
+- 无效输入返回 0 并记录 `LOG_ERROR`，防止 OOB 读
+
+**L03: `npu_tensor.h` — Release() 标记 deprecated**
+- 添加 `[[deprecated("Use Get() for read access...")]]` 属性
+- 警告调用者 Release() 转移裸 NPU 指针所有权，需手动 `aclrtFree()`
+
+**测试验证**: 
+- ✅ Test: 全量编译 100% 成功
+- ✅ Test: 全量 CTest 51/51 PASS
+- ✅ Test: 验证代码确实存在于文件中
+
+**验证代理**: Agent `aa19a4cc` (开发), Agent `a7f79eda` (独立测试)  
+**完成时间**: 2026-06-14 (第三阶段)
+
+---
+
+### Fix 3.5: L02+L18+L23 — 死代码清理 + 风格统一
+
+**L02: 删除死代码 `nd_to_nz_fp16()`**
+- `atb_python_qwen3vl_embedding/utils.py`: 删除 `nd_to_nz_fp16()` 函数（零调用者，活跃路径使用 `make_causal_mask_nz_npu()`）
+
+**L04: 保持 `new` + `unique_ptr`（未引入 make_unique）**
+- 审计分类为 "truly LOW (cosmetic)"
+- 第一轮尝试 `make_unique` 导致构造函数必须 public（CRITICAL bug）
+- WP6-FIX 还原：构造函数保持 private，使用原始 `new` + `std::unique_ptr`
+
+**L18: 清理 stale CopyToNPU 注释**
+- `test_io_adapters.cpp:465-476`: 测试名和注释更新，标注 CopyToNPU 已在 Phase 1 删除
+
+**L23: 更新 cpp11_compat.h 注释**
+- 过期 "将来升级到 C++14" 注释改为 "Provides C++14/17 backports for C++11 compatibility"
+
+**测试验证**: 
+- ✅ Test: 全量编译 100% 成功
+- ✅ Test: 构造函数为 private（工厂模式安全）
+- ✅ Test: `nd_to_nz_fp16` 零引用残留
+
+**验证代理**: Agent `a3845fe3` (开发), Agent `a7edb364` (L04 修复), Agent `a9235baf` (独立测试)  
+**完成时间**: 2026-06-14 (第三阶段)
+
+---
+
+## 第三阶段全量测试
+
+**全量测试代理**: Agent `a27a846e`
+
+| 指标 | 结果 |
+|------|------|
+| 编译警告 | **0** |
+| 测试总数 | **51** |
+| 通过 | **51** (100%) |
+| 失败 | **0** |
+| 跳过 | **0** |
+
+**Phase 3 修改验证（12/12 确认）**:
+
+| 工作包 | 检查项 | 结果 |
+|--------|--------|------|
+| WP1 | `cpp11_compat.h` 从 2 文件移除, `acl.h` 从 logger.h 移除 | ✅ |
+| WP2 | 默认 WARN, `SetLogLevel()` API 存在 | ✅ |
+| WP3 | 3 文件 24 TEST_CASE doctest 化 | ✅ |
+| WP4 | 3 设计文档更新, 无 stale 引用 | ✅ |
+| WP5 | `set_value_op` 验证, `MaxGridHW` 边界, `Release()` deprecated | ✅ |
+| WP6 | 构造函数 private, `nd_to_nz_fp16` 删除, 注释更新 | ✅ |
+| WP7 | `timing.h` 存在, `StageTimings` 提取 | ✅ |
+| WP8 | 7 辅助函数收拢 13 处 debug 调用 | ✅ |
 
 ---
 
@@ -760,3 +921,9 @@ D4. platform-310p.md 缺少 Python 侧的同步说明
 | 2.11 | 模型缓存字段线程安全文档 | MEDIUM | ✅ 已完成 | 2026-06-14 | 3/3 PASS |
 | 2.12 | buffer_size 可配置化 | MEDIUM | ✅ 已完成 | 2026-06-14 | 3/3 PASS |
 | 2.13 | 删除孤儿生成器 gen_python_reference.py | MEDIUM | ✅ 已完成 | 2026-06-14 | 3/3 PASS |
+| 3.1 | StageTimings 提取到 timing.h (M5) | MEDIUM | ✅ 已完成 | 2026-06-14 | 3/3 PASS |
+| 3.2 | M6/M11/M12/M15 批量修复 | MEDIUM | ✅ 已完成 | 2026-06-14 | 51/51 PASS |
+| 3.3 | D1-D4 设计文档更新 | MEDIUM | ✅ 已完成 | 2026-06-14 | 4/4 PASS |
+| 3.4 | L07+L11+L03 潜在 bug 修复 | LOW→MEDIUM | ✅ 已完成 | 2026-06-14 | 3/3 PASS |
+| 3.5 | L02+L18+L23 死代码+风格统一 | LOW | ✅ 已完成 | 2026-06-14 | 3/3 PASS |
+| — | **全量回归测试** | — | ✅ 已完成 | 2026-06-14 | **51/51 PASS** |

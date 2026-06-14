@@ -6,6 +6,12 @@ namespace ops {
 
 OperationHandle SetValueOp::Create(const std::vector<int64_t>& starts,
                                     const std::vector<int64_t>& ends) {
+    if (starts.size() != ends.size()) {
+        LOG_ERROR("SetValueOp::Create: starts.size()=%zu != ends.size()=%zu",
+                  starts.size(), ends.size());
+        return OperationHandle(nullptr);
+    }
+
     atb::infer::SetValueParam param;
     for (auto v : starts) param.starts.push_back(v);
     for (auto v : ends)   param.ends.push_back(v);

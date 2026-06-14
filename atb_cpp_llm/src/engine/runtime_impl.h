@@ -10,8 +10,7 @@ namespace atb_llm {
 
 /// Concrete implementation of IRuntime.
 /// Owns all NPU resources: Context, Stream, Allocator, BufferPool, WeightLoader.
-/// Use the static Create() factory method -- the constructor is private
-/// to prevent partially-initialized objects on construction failure.
+/// Use the static Create() factory method for full initialization.
 class RuntimeImpl : public IRuntime {
 public:
     ~RuntimeImpl() override;
