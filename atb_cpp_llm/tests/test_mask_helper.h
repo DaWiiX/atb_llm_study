@@ -51,9 +51,25 @@ inline void UploadMask(TensorAllocator* alloc,
 inline void UploadCausalMask(TensorAllocator* alloc,
                               int64_t S,
                               atb::Tensor& mask_t) {
-    std::vector<uint16_t> mask_nd(static_cast<size_t>(S) * S);
-    runners::MakeCausalMaskFp16(static_cast<int32_t>(S), mask_nd.data());
-    UploadMask(alloc, mask_nd.data(), S, mask_t);
+    if (Is310P()) {
+        // 310P: generate causal mask directly in NZ layout (no intermediate ND)
+        int64_t s_pad = ((S + 15) / 16) * 16;
+        int64_t n1    = (S + 15) / 16;
+        int64_t nz_elems = n1 * s_pad * 16;
+        alloc->AllocFloat16(mask_t, {1, n1, s_pad, 16});
+        mask_t.desc.format = ACL_FORMAT_FRACTAL_NZ;
+        std::vector<uint16_t> nz(static_cast<size_t>(nz_elems));
+        runners::MakeCausalMaskNzFp16(static_cast<int32_t>(S), nz.data(), s_pad, n1);
+        alloc->CopyToDevice(mask_t, nz.data(),
+                            static_cast<size_t>(nz_elems) * sizeof(uint16_t));
+    } else {
+        // 910B: standard ND causal mask
+        std::vector<uint16_t> mask_nd(static_cast<size_t>(S) * S);
+        runners::MakeCausalMaskFp16(static_cast<int32_t>(S), mask_nd.data());
+        alloc->AllocFloat16(mask_t, {S, S});
+        alloc->CopyToDevice(mask_t, mask_nd.data(),
+                            static_cast<size_t>(S) * S * sizeof(uint16_t));
+    }
 }
 
 }  // namespace test

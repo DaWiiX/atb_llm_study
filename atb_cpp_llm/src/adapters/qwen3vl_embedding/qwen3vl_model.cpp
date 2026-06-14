@@ -564,22 +564,23 @@ Status Qwen3VLModel::ForwardWithTiming(const InferRequest& request,
         cached_sin_npu_ = AllocNpuFloat16({seq_len, hd});
         alloc->CopyToDevice(*cached_sin_npu_.Get(), sin16.data(),
                             static_cast<size_t>(seq_len) * hd * sizeof(uint16_t));
-        // Generate causal mask directly in fp16 (skip fp32 intermediate)
-        std::vector<uint16_t> m16(static_cast<size_t>(seq_len) * seq_len);
-        runners::MakeCausalMaskFp16(seq_len, m16.data());
+        // Generate causal mask in platform-correct format
         if (Is310P()) {
             // 310P PA_ENCODER requires NZ (FRACTAL_NZ) format mask.
-            // Pre-convert on CPU so the graph receives a correctly-formatted tensor.
+            // Generate directly in NZ layout — no intermediate ND array.
             int64_t s_pad = ((seq_len + 15) / 16) * 16;
             int64_t n1    = (seq_len + 15) / 16;
             int64_t nz_elems = n1 * s_pad * 16;
             std::vector<uint16_t> m16_nz(static_cast<size_t>(nz_elems));
-            ConvertNdToNzFp16(m16.data(), seq_len, seq_len, m16_nz.data());
+            runners::MakeCausalMaskNzFp16(seq_len, m16_nz.data(), s_pad, n1);
             cached_mask_npu_ = AllocNpuFloat16({1, n1, s_pad, 16});
             cached_mask_npu_.Get()->desc.format = ACL_FORMAT_FRACTAL_NZ;
             alloc->CopyToDevice(*cached_mask_npu_.Get(), m16_nz.data(),
                                 static_cast<size_t>(nz_elems) * sizeof(uint16_t));
         } else {
+            // 910B: standard ND causal mask
+            std::vector<uint16_t> m16(static_cast<size_t>(seq_len) * seq_len);
+            runners::MakeCausalMaskFp16(seq_len, m16.data());
             cached_mask_npu_ = AllocNpuFloat16({seq_len, seq_len});
             alloc->CopyToDevice(*cached_mask_npu_.Get(), m16.data(),
                                 static_cast<size_t>(seq_len) * seq_len * sizeof(uint16_t));
