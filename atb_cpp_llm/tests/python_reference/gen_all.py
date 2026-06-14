@@ -73,11 +73,19 @@ def main():
         rc = run_one(script)
         if rc != 0:
             failures.append(script)
+            # Continue running remaining generators — one failure
+            # shouldn't block others (e.g. stage refdata can be
+            # regenerated later; op-level refdata is independent).
 
     if failures:
-        print("\n[gen_all] ❌ Generators that failed:")
+        print(f"\n[gen_all] ❌ {len(failures)}/{len(GENERATORS)} generators failed:")
         for s in failures:
             print(f"           - {s}")
+        print("\n[gen_all] 💡 Recover by re-running the failed generator directly:")
+        for s in failures:
+            print(f"           python tests/python_reference/{s}")
+        print("[gen_all] 💡 For 310P Python ATB issues, the generator may need")
+        print("[gen_all]    to fall back to torch_npu or CPU (see refdata_fallback.py).")
         sys.exit(1)
     print("\n[gen_all] ✅ All reference data generated.")
 

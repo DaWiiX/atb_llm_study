@@ -519,6 +519,45 @@ S=8 的 causal mask：
 - NZ: `[1, ceil(8/16), ceil(8/16)*16, 16]` = `[1, 1, 16, 16]`，256 个 fp16 元素
 - NZ 数据：用 padding 填充到 16×16 后在 block 内连续存储
 
+## 310P 实测经验（2026-06-14 更新）
+
+### 已验证事实
+
+| 事实 | 来源 | 结论 |
+|------|------|------|
+| NZ mask 是唯一可行的 mask 方案 | 6/12 实测 | MASK_TYPE_NORM + NZ mask, cos=1.0 |
+| GQA 在 310P 上完全支持 | 6/12 实测 | `gqa_nomask` / `gqa_causal` cos=1.0 |
+| S 不需要 16 对齐 | 6/12 实测 | S=4/8 在 NZ mask 下也通过 |
+| MASK_TYPE_CAUSAL 不可用 | 6/12 前实验 | 需要 PREFIX_ENCODER + KV Cache |
+| MASK_TYPE_NORM_COMPRESS 不可用 | 6/12 前实验 | CreateOp 失败 |
+| isTriuMask 无效果 | 6/12 前实验 | 310P 上 TransdataOperation 仍然失败 |
+| BNSD 布局不可用 | 6/12 前实验 | CreateOp 失败 |
+
+### 310P 开发注意事项
+
+1. **910B 模拟不可信** — GQA 在 910B 模拟 310P 模式下失败，但真实 310P 上完全正常。必须在真实硬件上验证。
+2. **C++ 和 Python 必须同步更新** — C++ 侧 `qwen3vl_model.cpp` 做了 NZ mask 转换后，Python `engine.py` 也必须做。两边不一致会导致一方通过一方失败。
+3. **`AllocNpuFloat16` 默认 ND 格式** — 310P 上创建 mask tensor 时必须显式设置 `format = ACL_FORMAT_FRACTAL_NZ`，否则 SelfAttention fusion runner 内部 ND→NZ Transdata 会失败。
+4. **mask 创建时机** — mask 只创建一次（缓存复用），所以 CPU 侧 NZ 转换的一次性开销可忽略。
+5. **Graph builder 层不创建 mask** — 经代码审计确认，C++ graph builder（`self_attention_graph.cpp` 等）只传递 mask 输入，不分配 mask tensor。ND mask 的来源全在 model 层或测试层。
+
+### 经典错误模式
+
+**症状**: `TransdataOperation mki node infer shape fail, inDims is not support`
+**原因**: SelfAttention 收到 ND 格式 mask → fusion runner 内部尝试 ND→NZ 转换 → 310P 上 Transdata 不支持
+**修复**: 在 mask 创建处（model 层/测试层）直接生成 NZ 格式 mask，让 SelfAttention 跳过内部转换
+
+### 当前状态 (6/14)
+
+| 组件 | 状态 | 备注 |
+|------|------|------|
+| C++ 原子级测试 | ✅ 10/10 | cos=1.0 |
+| C++ Graph 构建测试 | ✅ 7/7 | 含 GQA |
+| C++ Graph 精度测试 | ✅ 23/23 | NZ mask 正确传播 |
+| Python ATB mask | ✅ 已修复 | `engine.py` + `text_model.py` NZ 支持 |
+| Python E2E | ⏳ 待 310P 验证 | |
+| GQA→MHA 展开 | ⏳ 可移除 | GQA 原生支持，不再需要展开 |
+
 ## 相关文件索引
 
 | 文件 | 角色 |

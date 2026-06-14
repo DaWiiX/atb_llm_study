@@ -6,12 +6,18 @@
 
 | 问题 | 修复 | 状态 |
 |------|------|------|
-| Device ID 硬编码 | `ASCEND_DEVICE_ID` 环境变量 | ✅ |
-| GQA 错误跳过 | 移除所有 `Is310P()` GQA guard | ✅ |
-| Graph 层 mask ND 格式 | 共享 `test::UploadMask()` helper | ⏳ **待 310P 验证** |
+| Device ID 硬编码 | `ASCEND_DEVICE_ID` 环境变量 | ✅ 已修复 |
+| GQA 错误跳过 | 移除所有 `Is310P()` GQA guard | ✅ 已修复 |
+| Graph 层 mask ND 格式 | 共享 `test::UploadMask()` helper | ✅ **6/14 实测 23/23 通过** |
+| Python ATB mask | `nd_to_nz_fp16()` + engine.py | ✅ 已修复 |
+| C++ mask 直接 NZ 生成 | `MakeCausalMaskNzFp16()` | ✅ 已优化 |
 
-**上次 310P 实测结果（6/12）**：原子级 9/9 通过 (cos=1.0)，但 graph 层因 ND mask 全部失败。
-**本次测试目标**：验证修复后的 graph 层 + E2E 在 310P 上全部通过。
+**最新 310P 实测结果（6/14）**：
+- 阶段 1: 10/10 通过 (cos=1.0) ✅
+- 阶段 2 (无参考数据): 23/23 通过 ✅
+- Python 侧: ⏳ 待 310P 重新验证（本次修复后）
+
+**下一步**：在 310P 上重新跑 Python E2E 测试。
 
 ---
 
