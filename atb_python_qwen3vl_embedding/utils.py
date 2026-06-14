@@ -249,6 +249,38 @@ def make_causal_mask_nz(S: int, device: str = "cpu") -> torch.Tensor:
     return mask_nz
 
 
+def make_causal_mask_nz_npu(S: int) -> torch.Tensor:
+    """Generate causal mask and place on NPU with FRACTAL_NZ format.
+
+    This is the 310P production path — matches C++ qwen3vl_model.cpp:569-581:
+      1. Generate causal mask in NZ layout on CPU (fp16)
+      2. Allocate NPU tensor with ACL_FORMAT_FRACTAL_NZ (format=29)
+      3. Copy CPU data to NPU
+
+    The format tag is CRITICAL: without it, ATB SelfAttention sees ND format,
+    tries internal ND→NZ TransdataOperation, and fails on 310P with
+    "call operation setup fail".
+
+    Args:
+        S: sequence length
+    Returns:
+        (1, n1, s_pad, 16) fp16 tensor on NPU, format=FRACTAL_NZ
+    """
+    import torch_npu  # noqa: F401 — required for empty_with_format
+    n1 = (S + 15) // 16
+    s_pad = n1 * 16
+    shape = (1, n1, s_pad, 16)
+    # 1. Generate NZ-layout data on CPU (fp16)
+    cpu_data = make_causal_mask_nz(S, device="cpu").half()
+    # 2. Allocate NPU tensor with FRACTAL_NZ format
+    nz_tensor = torch_npu.empty_with_format(
+        shape, dtype=torch.float16, device=torch.device("npu:0"),
+        acl_format=29)  # 29 = ACL_FORMAT_FRACTAL_NZ
+    # 3. Copy data — memory layouts must match (both NZ)
+    nz_tensor.copy_(cpu_data)
+    return nz_tensor
+
+
 # ── Comparison utility ──────────────────────────────────────────────
 
 def compare_tensors(ref: torch.Tensor, atb: torch.Tensor,

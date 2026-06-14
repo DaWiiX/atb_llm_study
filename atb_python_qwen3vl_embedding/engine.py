@@ -39,7 +39,7 @@ from .text_model import (
 
 from .utils import (
     to_cpu_float, to_npu_half, make_seqlen_tensor, is_310p,
-    make_causal_mask_nz,
+    make_causal_mask_nz_npu,
 )
 
 
@@ -203,8 +203,11 @@ class Qwen3VLEngine:
             self.nh_t, self.nkv_t, self.hd_t, self.interm_t,
             B=1, S=S, use_mask=True)
         if is_310p():
-            # 310P: generate causal mask directly in NZ (FRACTAL_NZ) layout
-            mask = to_npu_half(make_causal_mask_nz(S))
+            # 310P: causal mask in NZ layout with FRACTAL_NZ format tag.
+            # The format tag is critical — without it, ATB SelfAttention
+            # sees ND format, tries internal TransdataOperation, and
+            # fails on 310P with "call operation setup fail".
+            mask = make_causal_mask_nz_npu(S)
         else:
             mask = to_npu_half(make_causal_mask(S))
         self._cached_mask = mask

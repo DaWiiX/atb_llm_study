@@ -2,22 +2,36 @@
 
 ## 概述
 
-本文档记录 310P 平台适配的完整测试策略。三个问题已在 commit `a23d173` 中修复：
+本文档记录 310P 平台适配的完整测试策略。
+
+### 已修复问题
 
 | 问题 | 修复 | 状态 |
 |------|------|------|
 | Device ID 硬编码 | `ASCEND_DEVICE_ID` 环境变量 | ✅ 已修复 |
 | GQA 错误跳过 | 移除所有 `Is310P()` GQA guard | ✅ 已修复 |
 | Graph 层 mask ND 格式 | 共享 `test::UploadMask()` helper | ✅ **6/14 实测 23/23 通过** |
-| Python ATB mask | `nd_to_nz_fp16()` + engine.py | ✅ 已修复 |
+| Python ATB mask layout | `make_causal_mask_nz()` — NZ layout data | ✅ 已修复 |
+| Python ATB mask **format tag** | `make_causal_mask_nz_npu()` — FRACTAL_NZ format | ✅ **6/14 修复** |
 | C++ mask 直接 NZ 生成 | `MakeCausalMaskNzFp16()` | ✅ 已优化 |
+| 参考数据生成 fallback | test_stage_reference.py transformers 回退 | ✅ **6/14 新增** |
+
+### Python NZ mask 的关键教训
+
+之前 Python 侧虽然生成了 NZ-layout 的数据，但 NPU tensor 的 format tag 仍然是
+**ND**（默认值）。C++ 侧通过 `desc.format = ACL_FORMAT_FRACTAL_NZ` 显式设置了
+format。Python 侧缺少这一步，导致 ATB SelfAttention 看到 ND format 后尝试内部
+TransdataOperation（ND→NZ），在 310P 上失败："call operation setup fail"。
+
+**修复**：`utils.py:make_causal_mask_nz_npu()` 使用 `torch_npu.empty_with_format(acl_format=29)` 
+创建 FRACTAL_NZ format 的 NPU tensor，然后 `copy_()` 填充 NZ layout 数据。
+匹配 C++ 的逻辑：data layout = NZ, format tag = FRACTAL_NZ。
 
 **最新 310P 实测结果（6/14）**：
 - 阶段 1: 10/10 通过 (cos=1.0) ✅
 - 阶段 2 (无参考数据): 23/23 通过 ✅
-- Python 侧: ⏳ 待 310P 重新验证（本次修复后）
-
-**下一步**：在 310P 上重新跑 Python E2E 测试。
+- Python 侧: ⏳ 待 310P 重新验证（本次 format tag 修复后）
+- 参考数据生成: ⏳ 待 310P 重新验证
 
 ---
 
@@ -185,6 +199,41 @@ ASCEND_PLATFORM=310P python tests/test_e2e_full_pipeline.py 2>&1 | tee /tmp/310p
 |------|------|------|
 | `test_engine.py` | Engine 级别：text-only, image-only, image+text | GQA→MHA 展开 |
 | `test_e2e_full_pipeline.py` | 全流程 vs transformers 参考 | GQA→MHA 展开 |
+
+### 3c. Python NZ mask format 验证
+
+在 310P 上，mask 必须同时满足：(1) 数据在 NZ layout, (2) NPU tensor format tag = FRACTAL_NZ。
+可以用以下脚本快速验证：
+
+```bash
+cd atb_python_qwen3vl_embedding
+ASCEND_PLATFORM=310P python tests/test_nz_quick_verify.py
+# 预期: 5/5 shape=..., format=FRACTAL_NZ ✅
+```
+
+### 3d. 参考数据生成 + fallback
+
+`gen_all.py` 负责生成 C++ 测试所需的所有 `.bin` 参考数据文件。
+
+```bash
+cd atb_cpp_llm
+ASCEND_PLATFORM=310P python3 tests/python_reference/gen_all.py 2>&1 | tee /tmp/310p_gen_all.log
+```
+
+**Fallback 机制**：
+- `gen_cpu_reference.py`: 纯 CPU，不依赖 ATB/NPU ✅ 始终可用
+- `gen_stage_reference.py`: vision 路径 graph（无 mask SelfAttention），310P 上应通过
+- `test_stage_reference.py`:
+  - TEXT_ONLY: ATB → 失败时自动 fallback 到 transformers CPU
+  - IMAGE_ONLY/IMAGE_AND_TEXT: ATB 失败时跳过，不写入异常数据
+  - 失败时不写 `.bin` 文件，C++ 测试通过 build_and_test.sh 自动排除
+- `gen_pos_embed_npu_reference.py`: 纯 CPU 预计算 ✅
+- `gen_vis_rope_npu_reference.py`: 纯 CPU 预计算 ✅
+
+**如果 gen_all.py 失败**：
+1. 310P 专用诊断信息会自动打印（mask format 检查、ATB 日志路径等）
+2. 单个 generator 失败不会阻塞其余 generator
+3. `build_and_test.sh` 会自动排除缺失 refdata 的测试（`ctest -LE needs_refdata`）
 
 ---
 

@@ -25,7 +25,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 from atb_python_qwen3vl_embedding import data_utils, utils
 from atb_python_qwen3vl_embedding.text_attention import build_attention
 from atb_python_qwen3vl_embedding.text_model import make_causal_mask
-from atb_python_qwen3vl_embedding.utils import is_310p, make_causal_mask_nz
+from atb_python_qwen3vl_embedding.utils import is_310p, make_causal_mask_nz_npu
 from atb_python_qwen3vl_embedding.transformers_runner import run_attention
 
 
@@ -72,7 +72,7 @@ def _run_attention_test(name, num_heads, num_kv_heads, head_dim, use_mask, B=1, 
         ]
         if use_mask:
             if is_310p():
-                mask = make_causal_mask_nz(S, device="cpu").half().npu()
+                mask = make_causal_mask_nz_npu(S)
             else:
                 mask = make_causal_mask(S).half().npu()
             inputs.append(mask)

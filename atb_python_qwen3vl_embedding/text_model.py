@@ -10,7 +10,7 @@ import torch
 from .utils import (
     make_rms_norm, get_atb_builder,
     make_seqlen_tensor, prepare_npu_weights, to_cpu_float, to_npu_half,
-    is_310p, make_causal_mask_nz,
+    is_310p, make_causal_mask_nz_npu,
 )
 from .text_decoder_layer import build_decoder_layer
 
@@ -160,10 +160,9 @@ def run_text_model(text_model, hidden_states, cos, sin, seqlen,
     seqlen_t = make_seqlen_tensor(S)
     if use_mask:
         if is_310p():
-            mask = to_npu_half(make_causal_mask_nz(S))
+            causal_mask = make_causal_mask_nz_npu(S)
         else:
-            mask = to_npu_half(make_causal_mask(S))
-        causal_mask = mask
+            causal_mask = to_npu_half(make_causal_mask(S))
     else:
         causal_mask = None
 
