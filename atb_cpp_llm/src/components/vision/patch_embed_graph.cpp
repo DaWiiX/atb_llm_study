@@ -22,14 +22,13 @@ Status PatchEmbedGraph::Build(const std::string& name,
     s = builder->Init(name, nullptr, in_names, out_names);
     if (s != STATUS_OK) return s;
 
-    auto add_op = [&](OperationHandle&& op_h,
-                      const atb::SVector<std::string>& ins,
-                      const atb::SVector<std::string>& outs) -> Status {
-        if (!op_h) return ERROR_GRAPH_BUILD;
-        return builder->AddOperation(op_h.release(), ins, outs);
-    };
-
     int32_t kernel_size = in_channels * temporal_patch_size * patch_size * patch_size;
+    if (kernel_size <= 0) {
+        LOG_ERROR("PatchEmbedGraph: kernel_size=%d is not positive "
+                  "(in_channels=%d, temporal_patch_size=%d, patch_size=%d)",
+                  kernel_size, in_channels, temporal_patch_size, patch_size);
+        return ERROR_INVALID_PARAM;
+    }
 
     // ── Reshape: (N*C*tp*p*p,) -> (N, C*tp*p*p) ──
     builder->Reshape("pixels",
@@ -40,7 +39,7 @@ Status PatchEmbedGraph::Build(const std::string& name,
         }, "flat");
 
     // ── Linear: (N, kernel_size) -> (N, embed_dim) ──
-    s = add_op(ops::LinearOp::Create(true),
+    s = builder->AddOp(ops::LinearOp::Create(true),
                {"flat", "w", "b"}, {"output"});
     if (s != STATUS_OK) return s;
 

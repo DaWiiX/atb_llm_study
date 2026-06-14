@@ -18,7 +18,7 @@
 #include "core/raii.h"
 #include "core/graph_builder.h"
 #include "core/context_manager.h"
-#include "util/cpp11_compat.h"
+#include "utils/cpp11_compat.h"
 #include "core/tensor_allocator.h"
 #include "runners/text_runner.h"
 #include "test_mask_helper.h"

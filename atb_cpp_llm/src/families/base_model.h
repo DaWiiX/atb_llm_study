@@ -3,6 +3,7 @@
 #include "atb_llm/runtime.h"
 #include "core/raii.h"
 #include "core/npu_tensor.h"
+#include "log/logger.h"
 #include <cstdint>
 #include <vector>
 
@@ -70,4 +71,80 @@ public:
 };
 
 }  // namespace families
+
+/**
+ * @brief Execute an ATB operation with Setup→GetWorkspace→Execute lifecycle.
+ *
+ * Encapsulates the repeated pattern of calling Setup to query workspace size,
+ * allocating workspace via the runtime, then calling Execute. Optional
+ * Synchronize after Execute for ordering guarantees across streams.
+ *
+ * @param op       The ATB operation (graph or single op) to execute
+ * @param vp       Input/output tensor VariantPack
+ * @param runtime  Runtime for workspace allocation, context, and sync
+ * @param ws_size  (in/out) Workspace size in bytes. Pass 0 on first call;
+ *                 updated to the actual size allocated. Reuse across calls
+ *                 to the same op to avoid redundant Setup queries.
+ * @param sync     If true, call runtime->Synchronize() after Execute
+ * @return Status  STATUS_OK on success, or an error code on failure
+ */
+inline Status ExecuteOperation(atb::Operation* op,
+                               atb::VariantPack& vp,
+                               IRuntime* runtime,
+                               uint64_t& ws_size,
+                               bool sync = false) {
+    auto* ctx = runtime->GetContext();
+
+    atb::Status atb_s = op->Setup(vp, ws_size, ctx);
+    if (atb_s != atb::NO_ERROR) {
+        LOG_ERROR("ExecuteOperation: Setup failed with status %d",
+                  static_cast<int>(atb_s));
+        return ERROR_GRAPH_BUILD;
+    }
+
+    uint8_t* ws_ptr = nullptr;
+    if (ws_size > 0) {
+        auto __atb_pair_ws = runtime->GetWorkspace(ws_size);
+        auto& ws = __atb_pair_ws.first;
+        auto& ws_s = __atb_pair_ws.second;
+        ws_ptr = ws;
+        if (ws_s != STATUS_OK) {
+            LOG_ERROR("ExecuteOperation: GetWorkspace(%lu) failed", ws_size);
+            return ws_s;
+        }
+        if (ws_ptr == nullptr) {
+            LOG_ERROR("ExecuteOperation: workspace pointer is null despite size=%lu",
+                      ws_size);
+            return ERROR_NPU_MEMORY;
+        }
+    } else {
+        // GRAPH_LAUNCH_MODE requires a non-null workspace device pointer.
+        auto __atb_pair_ws = runtime->GetWorkspace(1);
+        auto& ws = __atb_pair_ws.first;
+        auto& ws_s = __atb_pair_ws.second;
+        if (ws_s == STATUS_OK && ws != nullptr) {
+            ws_ptr = ws;
+            ws_size = 1;
+        }
+    }
+
+    atb_s = op->Execute(vp, ws_ptr, ws_size, ctx);
+    if (atb_s != atb::NO_ERROR) {
+        LOG_ERROR("ExecuteOperation: Execute failed with status %d",
+                  static_cast<int>(atb_s));
+        return ERROR_INFERENCE;
+    }
+
+    if (sync && runtime) {
+        Status sync_s = runtime->Synchronize();
+        if (sync_s != STATUS_OK) {
+            LOG_ERROR("ExecuteOperation: Synchronize failed with status %d",
+                      static_cast<int>(sync_s));
+            return sync_s;
+        }
+    }
+
+    return STATUS_OK;
+}
+
 }  // namespace atb_llm

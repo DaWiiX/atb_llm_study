@@ -215,6 +215,7 @@ enable_testing()
 add_atb_test(test_core                  tests/level0_framework/test_core.cpp)
 add_atb_test(test_config_wiring        tests/level0_framework/test_config_wiring.cpp)
 add_atb_test(test_weight_precision     tests/level0_framework/test_weight_precision.cpp)
+add_atb_test(test_model_registry       tests/level0_framework/test_model_registry.cpp)
 add_atb_test(test_text_ops             tests/level2_op_precision/test_text_ops.cpp)
 add_atb_test(test_vision_ops           tests/level2_op_precision/test_vision_ops.cpp)
 add_atb_test(test_text_model           tests/level3_integration/test_text_model.cpp)
@@ -324,7 +325,7 @@ set_tests_properties(
 )
 
 # ── Reference-data dependency labels ──────────────────────
-# Tests that fopen() /tmp/{cpu_,stage_,posembed_npu_,visrope_npu_}*.bin
+# Tests that fopen() /tmp/{cpu_,preprocess_,stage_,posembed_npu_,visrope_npu_}*.bin
 # files produced by tests/python_reference/gen_all.py. When those .bin
 # files are absent the tests silently skip (LOG_ERROR + return), which
 # looks like PASS from ctest's perspective — a real footgun.
@@ -335,9 +336,11 @@ set_tests_properties(
 # --no-refresh-refdata when sentinel files are missing).
 #
 # Maintenance contract: when a new test reads a /tmp/*.bin file, list it
-# here. Discovered via: grep -lE '/tmp/(cpu_|stage_|posembed_npu_|visrope_npu_)' \
+# here. Discovered via: grep -lE '/tmp/(cpu_|preprocess_|stage_|posembed_npu_|visrope_npu_)' \
 #                          tests/level*/*.cpp
 set(REFDATA_DEPENDENT_TESTS
+    # Level 0 framework tests
+    test_io_adapters
     # Level 1 CPU pure-function tests
     test_float_utils
     test_mrope_cpu

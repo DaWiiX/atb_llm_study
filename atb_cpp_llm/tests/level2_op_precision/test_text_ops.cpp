@@ -20,7 +20,7 @@
 #include "core/graph_builder.h"
 #include "core/context_manager.h"
 #include "core/tensor_allocator.h"
-#include "util/cpp11_compat.h"
+#include "utils/cpp11_compat.h"
 #include "ops/linear_op.h"
 #include "ops/rms_norm_op.h"
 #include "ops/elewise_op.h"

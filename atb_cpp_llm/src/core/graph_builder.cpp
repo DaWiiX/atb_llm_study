@@ -1,6 +1,6 @@
 #include "core/graph_builder.h"
 #include "log/logger.h"
-#include "util/cpp11_compat.h"
+#include "utils/cpp11_compat.h"
 
 namespace atb_llm {
 
@@ -42,6 +42,13 @@ Status GraphBuilder::AddOperation(atb::Operation* op,
         return ERROR_GRAPH_BUILD;
     }
     return STATUS_OK;
+}
+
+Status GraphBuilder::AddOp(OperationHandle&& op_h,
+                           const atb::SVector<std::string>& in_names,
+                           const atb::SVector<std::string>& out_names) {
+    if (!op_h) return ERROR_GRAPH_BUILD;
+    return AddOperation(op_h.release(), in_names, out_names);
 }
 
 Status GraphBuilder::Reshape(const std::string& src_name,

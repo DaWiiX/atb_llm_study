@@ -11,6 +11,7 @@ import torch_npu  # noqa: needed for .npu()
 from atb_python_qwen3vl_embedding import data_utils, utils
 from atb_python_qwen3vl_embedding.text_decoder_layer import build_decoder_layer
 from atb_python_qwen3vl_embedding.text_model import make_causal_mask
+from atb_python_qwen3vl_embedding.utils import is_310p, make_causal_mask_nz_npu
 from atb_python_qwen3vl_embedding.transformers_runner import run_decoder_layer
 
 
@@ -48,7 +49,10 @@ def _run_once(B, S, use_mask, seed=42):
         gen_data["sin"].reshape(ntoken, d).half().npu(),
     ]
     if use_mask:
-        inputs.append(make_causal_mask(S).half().npu())
+        if is_310p():
+            inputs.append(make_causal_mask_nz_npu(S))
+        else:
+            inputs.append(make_causal_mask(S).half().npu())
     inputs.append(torch.tensor([ntoken], dtype=torch.int32))  # CPU, required by SA
 
     atb_out = graph_op.forward(inputs)[0].cpu().float()

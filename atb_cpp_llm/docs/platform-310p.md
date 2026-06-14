@@ -436,8 +436,8 @@ ASCEND_PLATFORM=310P
 |------|------|------|
 | Python | `is_310p()` → `bool` | `atb_python_qwen3vl_embedding/utils.py:27` |
 | Python | `get_platform()` → `str` | `atb_python_qwen3vl_embedding/utils.py:22` |
-| C++ | `Is310P()` → `bool` | `atb_cpp_llm/src/util/cpp11_compat.h:82` |
-| C++ | `Is910B()` → `bool` | `atb_cpp_llm/src/util/cpp11_compat.h:87` |
+| C++ | `Is310P()` → `bool` | `atb_cpp_llm/src/utils/cpp11_compat.h:82` |
+| C++ | `Is910B()` → `bool` | `atb_cpp_llm/src/utils/cpp11_compat.h:87` |
 
 ## 测试策略
 
@@ -486,7 +486,7 @@ cat /root/atb/log/$(ls -rt /root/atb/log/ | tail -n 1)
 ## 新增 310P 相关代码时注意事项
 
 1. **Python**：使用 `from .utils import is_310p` 检测平台
-2. **C++**：使用 `#include "util/cpp11_compat.h"` 然后 `atb_llm::Is310P()` 检测平台
+2. **C++**：使用 `#include "utils/cpp11_compat.h"` 然后 `atb_llm::Is310P()` 检测平台
 3. **平台差异收敛**：Graph builder 和 Model 层不应包含 `Is310P()` 判断。所有平台差异仅在对应的 Op 创建函数（如 `self_attention_op.cpp`）中处理。确保两个平台使用相同的输入输出布局（tensor 数量和 shape）。
 4. **新增 GQA 测试**：必须加上 `Is310P()` 守卫，避免在 310P 上失败
 5. **新增 ATB 算子**：先在 310P 诊断脚本中验证可用性
@@ -569,7 +569,7 @@ S=8 的 causal mask：
 | `atb_python_qwen3vl_embedding/tests/test_310p_diag.py` | 310P 快速诊断 |
 | `atb_python_qwen3vl_embedding/tests/test_310p_combinations.py` | 310P 参数深度扫描 |
 | `atb_cpp_llm/docs/platform-310p.md` | 本文档 |
-| `atb_cpp_llm/src/util/cpp11_compat.h:74-89` | C++ 平台检测 |
+| `atb_cpp_llm/src/utils/cpp11_compat.h:74-89` | C++ 平台检测 |
 | `atb_cpp_llm/src/adapters/qwen3vl_embedding/qwen3vl_model.cpp:78-176` | C++ GQA→MHA 展开 |
 | `atb_cpp_llm/src/ops/self_attention_op.cpp` | C++ SelfAttentionOp 创建 |
 | `atb_cpp_llm/src/components/common/self_attention_graph.cpp` | GQA graph builder（含临时 TransdataOp）|

@@ -8,7 +8,7 @@
 
 #include "core/tensor_allocator.h"
 #include "utils/float_utils.h"
-#include "util/cpp11_compat.h"
+#include "utils/cpp11_compat.h"
 #include "runners/text_runner.h"   // MakeCausalMaskFp16
 #include <vector>
 #include <cstdint>

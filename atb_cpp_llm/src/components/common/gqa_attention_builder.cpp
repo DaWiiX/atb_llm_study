@@ -5,7 +5,7 @@
 #include "ops/rope_op.h"
 #include "ops/self_attention_op.h"
 #include "log/logger.h"
-#include "util/cpp11_compat.h"
+#include "utils/cpp11_compat.h"
 
 namespace atb_llm {
 namespace components {
@@ -47,17 +47,8 @@ Status GqaAttentionBuilder::Build(const std::string& name,
     s = builder->Init(name, nullptr, in_names, out_names);
     if (s != STATUS_OK) return s;
 
-    // Helper: create op, add to graph, release ownership
-    auto add_op = [&](OperationHandle&& op_h,
-                      const atb::SVector<std::string>& ins,
-                      const atb::SVector<std::string>& outs) -> Status {
-        if (!op_h) return ERROR_GRAPH_BUILD;
-        atb::Operation* raw = op_h.release();
-        return builder->AddOperation(raw, ins, outs);
-    };
-
     // ── Q path: Linear -> [optional: Reshape(3D) -> RMSNorm -> Reshape(2D)] ──
-    s = add_op(ops::LinearOp::Create(),
+    s = builder->AddOp(ops::LinearOp::Create(),
                {"hidden_states", "q_weight"}, {"q_lin_out"});
     if (s != STATUS_OK) return s;
 
@@ -72,7 +63,7 @@ Status GqaAttentionBuilder::Build(const std::string& name,
             },
             "q_3d");
 
-        s = add_op(ops::RmsNormOp::Create(eps),
+        s = builder->AddOp(ops::RmsNormOp::Create(eps),
                    {"q_3d", "q_norm_weight"}, {"q_normed"});
         if (s != STATUS_OK) return s;
 
@@ -87,7 +78,7 @@ Status GqaAttentionBuilder::Build(const std::string& name,
     }
 
     // ── K path: Linear -> [optional: Reshape(3D) -> RMSNorm -> Reshape(2D)] ──
-    s = add_op(ops::LinearOp::Create(),
+    s = builder->AddOp(ops::LinearOp::Create(),
                {"hidden_states", "k_weight"}, {"k_lin_out"});
     if (s != STATUS_OK) return s;
 
@@ -102,7 +93,7 @@ Status GqaAttentionBuilder::Build(const std::string& name,
             },
             "k_3d");
 
-        s = add_op(ops::RmsNormOp::Create(eps),
+        s = builder->AddOp(ops::RmsNormOp::Create(eps),
                    {"k_3d", "k_norm_weight"}, {"k_normed"});
         if (s != STATUS_OK) return s;
 
@@ -117,7 +108,7 @@ Status GqaAttentionBuilder::Build(const std::string& name,
     }
 
     // ── V path: Linear -> Reshape(3D) ──
-    s = add_op(ops::LinearOp::Create(),
+    s = builder->AddOp(ops::LinearOp::Create(),
                {"hidden_states", "v_weight"}, {"v_lin_out"});
     if (s != STATUS_OK) return s;
 
@@ -131,7 +122,7 @@ Status GqaAttentionBuilder::Build(const std::string& name,
         "v_3d");
 
     // ── RoPE: (q_pre_rope, k_pre_rope, cos, sin, seqlen) -> (q_rope, k_rope) ──
-    s = add_op(ops::RopeOp::Create(rotary_dim),
+    s = builder->AddOp(ops::RopeOp::Create(rotary_dim),
                {q_pre_rope, k_pre_rope, "cos", "sin", "seqlen"},
                {"q_rope_flat", "k_rope_flat"});
     if (s != STATUS_OK) return s;
@@ -184,7 +175,7 @@ Status GqaAttentionBuilder::Build(const std::string& name,
         "sa_flat");
 
     // ── O projection: Linear ──
-    s = add_op(ops::LinearOp::Create(),
+    s = builder->AddOp(ops::LinearOp::Create(),
                {"sa_flat", "o_weight"}, {"output"});
     if (s != STATUS_OK) return s;
 

@@ -25,18 +25,11 @@ Status VisionAttentionGraph::Build(const std::string& name,
     s = builder->Init(name, nullptr, in_names, out_names);
     if (s != STATUS_OK) return s;
 
-    auto add_op = [&](OperationHandle&& op_h,
-                      const atb::SVector<std::string>& ins,
-                      const atb::SVector<std::string>& outs) -> Status {
-        if (!op_h) return ERROR_GRAPH_BUILD;
-        return builder->AddOperation(op_h.release(), ins, outs);
-    };
-
     int32_t nh = num_heads;
     int32_t hd = head_dim;
 
     // ── QKV Linear: hidden + qkv_w + qkv_b -> qkv_out (N, 3*nh*hd) ──
-    s = add_op(ops::LinearOp::Create(true),
+    s = builder->AddOp(ops::LinearOp::Create(true),
                {"hidden", "qkv_w", "qkv_b"}, {"qkv_out"});
     if (s != STATUS_OK) return s;
 
@@ -75,7 +68,7 @@ Status VisionAttentionGraph::Build(const std::string& name,
         }, "k_flat");
 
     // ── RoPE: (q_flat, k_flat, cos, sin, seq) -> (q_rope_flat, k_rope_flat) ──
-    s = add_op(ops::RopeOp::Create(),
+    s = builder->AddOp(ops::RopeOp::Create(),
                {"q_flat", "k_flat", "c", "s", "seq"},
                {"q_rope_flat", "k_rope_flat"});
     if (s != STATUS_OK) return s;
@@ -124,7 +117,7 @@ Status VisionAttentionGraph::Build(const std::string& name,
         }, "sa_flat");
 
     // ── Output projection: proj Linear with bias ──
-    s = add_op(ops::LinearOp::Create(true),
+    s = builder->AddOp(ops::LinearOp::Create(true),
                {"sa_flat", "proj_w", "proj_b"}, {"output"});
     if (s != STATUS_OK) return s;
 

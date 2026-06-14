@@ -19,25 +19,18 @@ Status VisionMlpGraph::Build(const std::string& name, OperationHandle& out) {
     s = builder->Init(name, nullptr, in_names, out_names);
     if (s != STATUS_OK) return s;
 
-    auto add_op = [&](OperationHandle&& op_h,
-                      const atb::SVector<std::string>& ins,
-                      const atb::SVector<std::string>& outs) -> Status {
-        if (!op_h) return ERROR_GRAPH_BUILD;
-        return builder->AddOperation(op_h.release(), ins, outs);
-    };
-
     // fc1 Linear (with bias)
-    s = add_op(ops::LinearOp::Create(true),
+    s = builder->AddOp(ops::LinearOp::Create(true),
                {"hidden", "fc1_w", "fc1_b"}, {"fc1_out"});
     if (s != STATUS_OK) return s;
 
     // GELU activation (not SiLU -- Vision uses GELU)
-    s = add_op(ops::ActivationOp::MakeGELU(),
+    s = builder->AddOp(ops::ActivationOp::MakeGELU(),
                {"fc1_out"}, {"act_out"});
     if (s != STATUS_OK) return s;
 
     // fc2 Linear (with bias)
-    s = add_op(ops::LinearOp::Create(true),
+    s = builder->AddOp(ops::LinearOp::Create(true),
                {"act_out", "fc2_w", "fc2_b"}, {"output"});
     if (s != STATUS_OK) return s;
 

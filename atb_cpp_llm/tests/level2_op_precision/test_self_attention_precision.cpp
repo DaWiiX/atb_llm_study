@@ -29,7 +29,7 @@
 #include "engine/runtime_impl.h"
 #include "utils/float_utils.h"
 #include "log/logger.h"
-#include "util/cpp11_compat.h"
+#include "utils/cpp11_compat.h"
 #include "test_mask_helper.h"
 
 #include <cstdio>

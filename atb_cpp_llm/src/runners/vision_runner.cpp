@@ -73,13 +73,6 @@ Status BuildVisionFirstLayer(const VisionRunner::Config& cfg, OperationHandle& o
     s = builder->Init("VisFirstLayer", nullptr, in_names, out_names);
     if (s != STATUS_OK) return s;
 
-    auto add_op = [&](OperationHandle&& op_h,
-                      const atb::SVector<std::string>& ins,
-                      const atb::SVector<std::string>& outs) -> Status {
-        if (!op_h) return ERROR_GRAPH_BUILD;
-        return builder->AddOperation(op_h.release(), ins, outs);
-    };
-
     // ── Patch Embed: pixels -> flat -> Linear -> patched ──
     OperationHandle pe_graph;
     s = components::PatchEmbedGraph::Build(
@@ -93,7 +86,7 @@ Status BuildVisionFirstLayer(const VisionRunner::Config& cfg, OperationHandle& o
     if (s != STATUS_OK) return s;
 
     // ── Add position embedding: patched + pos -> h0 ──
-    s = add_op(ops::ElewiseOp::MakeAdd(),
+    s = builder->AddOp(ops::ElewiseOp::MakeAdd(),
                {"patched", "pos"}, {"h0"});
     if (s != STATUS_OK) return s;
 

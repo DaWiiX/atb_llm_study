@@ -27,7 +27,7 @@ from atb_python_qwen3vl_embedding.env import QWEN3VL_EMB_MODEL_DIR
 from atb_python_qwen3vl_embedding.engine import Qwen3VLEngine
 from atb_python_qwen3vl_embedding.engine_utils import get_rope_index
 from atb_python_qwen3vl_embedding.text_model import run_text_layer_npu, run_text_norm_npu, make_causal_mask
-from atb_python_qwen3vl_embedding.utils import to_npu_half, to_cpu_float, make_seqlen_tensor
+from atb_python_qwen3vl_embedding.utils import to_npu_half, to_cpu_float, make_seqlen_tensor, is_310p, make_causal_mask_nz_npu
 
 
 def cosine(a, b):
@@ -159,6 +159,10 @@ def main():
 
     engine._ensure_text_graph(S)
     causal_mask = make_causal_mask(S).half().npu()
+    if is_310p():
+        causal_mask_atb = make_causal_mask_nz_npu(S)
+    else:
+        causal_mask_atb = causal_mask
 
     # Move everything to NPU for the loop
     hidden_atb = ie_atb                                                # already NPU
@@ -179,7 +183,7 @@ def main():
             engine.g_t_layer, hidden_atb,
             engine.t_layer_weights[li],
             cos_npu, sin_npu, seqlen_t,
-            causal_mask=causal_mask)
+            causal_mask=causal_mask_atb)
 
         # TF layer
         with torch.no_grad():

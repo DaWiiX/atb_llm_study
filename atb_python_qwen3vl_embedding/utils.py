@@ -11,17 +11,18 @@ Also provides:
     - Cosine similarity comparison utility for testing
     - Platform detection (910B vs 310P) for operator compatibility
 """
-import os
 import torch
 import torch_atb
 import torch.nn.functional as F
+
+from .env import ASCEND_PLATFORM
 
 
 # ── Platform detection ────────────────────────────────────────────────
 
 def get_platform() -> str:
     """Return the current Ascend NPU platform: '910B' or '310P'."""
-    return os.getenv("ASCEND_PLATFORM", "910B")
+    return ASCEND_PLATFORM
 
 
 def is_310p() -> bool:

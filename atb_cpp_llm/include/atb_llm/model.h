@@ -29,6 +29,10 @@ public:
     // ── 推理 ─────────────────────────────────────────────
     /// 推理入口：接受 InferRequest，输出 InferResult
     /// 模型自行决定内部流程
+    ///
+    /// @note Implementations may not be thread-safe. Unless the concrete
+    /// model documents otherwise, assume Forward() must be called from a
+    /// single thread or externally serialized.
     virtual Status Forward(const InferRequest& request, InferResult& result) = 0;
 
     /// Forward with per-stage timing breakdown.

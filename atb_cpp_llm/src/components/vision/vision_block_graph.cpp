@@ -30,15 +30,8 @@ Status VisionBlockGraph::Build(const std::string& name,
     s = builder->Init(name, nullptr, in_names, out_names);
     if (s != STATUS_OK) return s;
 
-    auto add_op = [&](OperationHandle&& op_h,
-                      const atb::SVector<std::string>& ins,
-                      const atb::SVector<std::string>& outs) -> Status {
-        if (!op_h) return ERROR_GRAPH_BUILD;
-        return builder->AddOperation(op_h.release(), ins, outs);
-    };
-
     // ── 1. LayerNorm1: hidden + n1_w + n1_b -> normed1 ──
-    s = add_op(ops::LayerNormOp::Create(epsilon),
+    s = builder->AddOp(ops::LayerNormOp::Create(epsilon),
                {"hidden", "n1_w", "n1_b"}, {"normed1"});
     if (s != STATUS_OK) return s;
 
@@ -56,12 +49,12 @@ Status VisionBlockGraph::Build(const std::string& name,
     if (s != STATUS_OK) return s;
 
     // ── 3. Residual add: hidden + attn_out -> h1 ──
-    s = add_op(ops::ElewiseOp::MakeAdd(),
+    s = builder->AddOp(ops::ElewiseOp::MakeAdd(),
                {"hidden", "attn_out"}, {"h1"});
     if (s != STATUS_OK) return s;
 
     // ── 4. LayerNorm2: h1 + n2_w + n2_b -> normed2 ──
-    s = add_op(ops::LayerNormOp::Create(epsilon),
+    s = builder->AddOp(ops::LayerNormOp::Create(epsilon),
                {"h1", "n2_w", "n2_b"}, {"normed2"});
     if (s != STATUS_OK) return s;
 
@@ -76,7 +69,7 @@ Status VisionBlockGraph::Build(const std::string& name,
     if (s != STATUS_OK) return s;
 
     // ── 6. Residual add: h1 + mlp_out -> output ──
-    s = add_op(ops::ElewiseOp::MakeAdd(),
+    s = builder->AddOp(ops::ElewiseOp::MakeAdd(),
                {"h1", "mlp_out"}, {"output"});
     if (s != STATUS_OK) return s;
 

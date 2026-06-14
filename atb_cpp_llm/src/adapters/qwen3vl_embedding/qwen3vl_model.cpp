@@ -7,7 +7,7 @@
 #include "core/debug_dump.h"
 #include "io/weight_helpers.h"
 #include "log/logger.h"
-#include "util/cpp11_compat.h"
+#include "utils/cpp11_compat.h"
 #include <chrono>
 #include <cstring>
 #include <cmath>
@@ -363,6 +363,10 @@ Status Qwen3VLModel::ForwardWithTiming(const InferRequest& request,
         // ── Stage: Vision Pos Embed + RoPE ─────────────────────
         // PosEmbed: computed directly on NPU via the interp graph.
         NpuTensor pos_npu = AllocNpuFloat16({np, vis_hs});
+        if (!pos_npu) {
+            LOG_ERROR("ForwardWithTiming: alloc vision pos NPU tensor failed");
+            return ERROR_NPU_MEMORY;
+        }
         Status pe_s = ComputePosEmbedNpu(grid_thw_host.data(), num_images,
                                           np, *pos_npu.Get());
         if (pe_s != STATUS_OK) return pe_s;
@@ -370,7 +374,15 @@ Status Qwen3VLModel::ForwardWithTiming(const InferRequest& request,
         // VisionRoPE cos/sin: computed on NPU.
         // total_tokens = np (= sum over images of T*H*W)
         NpuTensor cos_npu = AllocNpuFloat16({np, static_cast<int64_t>(vis_hd)});
+        if (!cos_npu) {
+            LOG_ERROR("ForwardWithTiming: alloc vision cos NPU tensor failed");
+            return ERROR_NPU_MEMORY;
+        }
         NpuTensor sin_npu = AllocNpuFloat16({np, static_cast<int64_t>(vis_hd)});
+        if (!sin_npu) {
+            LOG_ERROR("ForwardWithTiming: alloc vision sin NPU tensor failed");
+            return ERROR_NPU_MEMORY;
+        }
         int64_t total_tokens = ComputeVisionRopeNpu(
             grid_thw_host.data(), num_images, *cos_npu.Get(), *sin_npu.Get());
         if (total_tokens < 0 || total_tokens != np) {
@@ -401,6 +413,10 @@ Status Qwen3VLModel::ForwardWithTiming(const InferRequest& request,
         size_t pixel_bytes = static_cast<size_t>(flat_elements) * sizeof(uint16_t);
 
         NpuTensor pixels_npu = AllocNpuFloat16({flat_elements});
+        if (!pixels_npu) {
+            LOG_ERROR("ForwardWithTiming: alloc vision pixels NPU tensor failed");
+            return ERROR_NPU_MEMORY;
+        }
         alloc->CopyToDevice(*pixels_npu.Get(), pv, pixel_bytes);
 
         atb::Tensor vis_seqlen;
@@ -415,6 +431,10 @@ Status Qwen3VLModel::ForwardWithTiming(const InferRequest& request,
         // ── Vision sub-stage: FirstLayer (patch_embed + pos_embed + block 0) ──
         auto t_v_first = std::chrono::high_resolution_clock::now();
         NpuTensor h_npu = AllocNpuFloat16({total_tokens, vis_hs});
+        if (!h_npu) {
+            LOG_ERROR("ForwardWithTiming: alloc vision first layer out NPU tensor failed");
+            return ERROR_NPU_MEMORY;
+        }
         {
             const auto& bw = weights_.vis_blocks[0];
             atb::VariantPack vp;
@@ -443,6 +463,10 @@ Status Qwen3VLModel::ForwardWithTiming(const InferRequest& request,
         for (int32_t li = 1; li < config_.vis_depth; li++) {
             const auto& bw = weights_.vis_blocks[li];
             NpuTensor h_out = AllocNpuFloat16({total_tokens, vis_hs});
+            if (!h_out) {
+                LOG_ERROR("ForwardWithTiming: alloc vision block %d out NPU tensor failed", li);
+                return ERROR_NPU_MEMORY;
+            }
             atb::VariantPack vp;
             vp.inTensors = {
                 *h_npu.Get(),
@@ -488,6 +512,10 @@ Status Qwen3VLModel::ForwardWithTiming(const InferRequest& request,
         {
             const auto& mw = weights_.merger;
             NpuTensor merged_out = AllocNpuFloat16({merged_tokens, vis_embed_dim});
+            if (!merged_out) {
+                LOG_ERROR("ForwardWithTiming: alloc vision merger out NPU tensor failed");
+                return ERROR_NPU_MEMORY;
+            }
             atb::VariantPack vp;
             vp.inTensors = {
                 *h_npu.Get(),
@@ -559,9 +587,17 @@ Status Qwen3VLModel::ForwardWithTiming(const InferRequest& request,
                             cos16.data(), sin16.data());
         // Upload to NPU and cache
         cached_cos_npu_ = AllocNpuFloat16({seq_len, hd});
+        if (!cached_cos_npu_) {
+            LOG_ERROR("ForwardWithTiming: alloc cached cos NPU tensor failed");
+            return ERROR_NPU_MEMORY;
+        }
         alloc->CopyToDevice(*cached_cos_npu_.Get(), cos16.data(),
                             static_cast<size_t>(seq_len) * hd * sizeof(uint16_t));
         cached_sin_npu_ = AllocNpuFloat16({seq_len, hd});
+        if (!cached_sin_npu_) {
+            LOG_ERROR("ForwardWithTiming: alloc cached sin NPU tensor failed");
+            return ERROR_NPU_MEMORY;
+        }
         alloc->CopyToDevice(*cached_sin_npu_.Get(), sin16.data(),
                             static_cast<size_t>(seq_len) * hd * sizeof(uint16_t));
         // Generate causal mask in platform-correct format
@@ -574,6 +610,10 @@ Status Qwen3VLModel::ForwardWithTiming(const InferRequest& request,
             std::vector<uint16_t> m16_nz(static_cast<size_t>(nz_elems));
             runners::MakeCausalMaskNzFp16(seq_len, m16_nz.data(), s_pad, n1);
             cached_mask_npu_ = AllocNpuFloat16({1, n1, s_pad, 16});
+            if (!cached_mask_npu_) {
+                LOG_ERROR("ForwardWithTiming: alloc cached mask NPU tensor (NZ) failed");
+                return ERROR_NPU_MEMORY;
+            }
             cached_mask_npu_.Get()->desc.format = ACL_FORMAT_FRACTAL_NZ;
             alloc->CopyToDevice(*cached_mask_npu_.Get(), m16_nz.data(),
                                 static_cast<size_t>(nz_elems) * sizeof(uint16_t));
@@ -582,6 +622,10 @@ Status Qwen3VLModel::ForwardWithTiming(const InferRequest& request,
             std::vector<uint16_t> m16(static_cast<size_t>(seq_len) * seq_len);
             runners::MakeCausalMaskFp16(seq_len, m16.data());
             cached_mask_npu_ = AllocNpuFloat16({seq_len, seq_len});
+            if (!cached_mask_npu_) {
+                LOG_ERROR("ForwardWithTiming: alloc cached mask NPU tensor (ND) failed");
+                return ERROR_NPU_MEMORY;
+            }
             alloc->CopyToDevice(*cached_mask_npu_.Get(), m16.data(),
                                 static_cast<size_t>(seq_len) * seq_len * sizeof(uint16_t));
         }
@@ -599,6 +643,10 @@ Status Qwen3VLModel::ForwardWithTiming(const InferRequest& request,
     {
         int64_t n = seq_len;
         NpuTensor h_npu = AllocNpuFloat16({n, hidden_size});
+        if (!h_npu) {
+            LOG_ERROR("ForwardWithTiming: alloc text hidden NPU tensor failed");
+            return ERROR_NPU_MEMORY;
+        }
         alloc->CopyToDevice(*h_npu.Get(), inputs_embeds.data(),
                             static_cast<size_t>(n) * hidden_size * sizeof(uint16_t));
         atb::Tensor seqlen;
@@ -620,6 +668,10 @@ Status Qwen3VLModel::ForwardWithTiming(const InferRequest& request,
         for (int32_t li = 0; li < config_.text_num_layers; li++) {
             const auto& lw = weights_.text_layers[li];
             NpuTensor h_out = AllocNpuFloat16({n, hidden_size});
+            if (!h_out) {
+                LOG_ERROR("ForwardWithTiming: alloc text layer %d out NPU tensor failed", li);
+                return ERROR_NPU_MEMORY;
+            }
             atb::VariantPack vp;
             // All platforms use MASK_TYPE_NORM with external mask tensor.
             // 310P additionally sets isTriuMask=1 inside SelfAttentionOp::Create().
@@ -648,6 +700,10 @@ Status Qwen3VLModel::ForwardWithTiming(const InferRequest& request,
             t_t_norm - t_t_layers).count();
 
         NpuTensor norm_out = AllocNpuFloat16({n, hidden_size});
+        if (!norm_out) {
+            LOG_ERROR("ForwardWithTiming: alloc text norm out NPU tensor failed");
+            return ERROR_NPU_MEMORY;
+        }
         atb::VariantPack nvp;
         nvp.inTensors = {*h_npu.Get(), weights_.text_norm_weight};
         nvp.outTensors = {*norm_out.Get()};
@@ -710,6 +766,10 @@ Status Qwen3VLModel::RunVision(const uint16_t* pixel_values, int64_t num_patches
 
     // 1. Compute position embeddings on NPU via the interp graph.
     NpuTensor pos_npu = AllocNpuFloat16({num_patches, vis_hs});
+    if (!pos_npu) {
+        LOG_ERROR("RunVision: alloc vision pos NPU tensor failed");
+        return ERROR_NPU_MEMORY;
+    }
     Status pe_s = ComputePosEmbedNpu(grid_thw, num_images,
                                       num_patches, *pos_npu.Get());
     if (pe_s != STATUS_OK) return pe_s;
@@ -717,7 +777,15 @@ Status Qwen3VLModel::RunVision(const uint16_t* pixel_values, int64_t num_patches
     // 2. Compute vision RoPE cos/sin on NPU.
     // VisionRoPE outputs (total_tokens, vis_hd) — dim*2 = half*4 = vis_hd
     NpuTensor cos_npu = AllocNpuFloat16({num_patches, static_cast<int64_t>(vis_hd)});
+    if (!cos_npu) {
+        LOG_ERROR("RunVision: alloc vision cos NPU tensor failed");
+        return ERROR_NPU_MEMORY;
+    }
     NpuTensor sin_npu = AllocNpuFloat16({num_patches, static_cast<int64_t>(vis_hd)});
+    if (!sin_npu) {
+        LOG_ERROR("RunVision: alloc vision sin NPU tensor failed");
+        return ERROR_NPU_MEMORY;
+    }
     int64_t total_tokens = ComputeVisionRopeNpu(
         grid_thw, num_images, *cos_npu.Get(), *sin_npu.Get());
     if (total_tokens < 0 || total_tokens != num_patches) {
@@ -742,6 +810,10 @@ Status Qwen3VLModel::RunVision(const uint16_t* pixel_values, int64_t num_patches
     // PatchEmbed graph expects 1D flat input: (N * patch_dim,)
     // Its Reshape divides by kernel_size to recover N
     NpuTensor pixels_npu = AllocNpuFloat16({flat_elements});
+    if (!pixels_npu) {
+        LOG_ERROR("RunVision: alloc vision pixels NPU tensor failed");
+        return ERROR_NPU_MEMORY;
+    }
     alloc->CopyToDevice(*pixels_npu.Get(), pixel_values, pixel_bytes);
 
     // Seqlen for vision (host-side int32, not NPU-allocated)
@@ -756,6 +828,10 @@ Status Qwen3VLModel::RunVision(const uint16_t* pixel_values, int64_t num_patches
 
     // 4. Run FirstLayer (patch_embed + pos_embed + block 0)
     NpuTensor h_npu = AllocNpuFloat16({total_tokens, vis_hs});
+    if (!h_npu) {
+        LOG_ERROR("RunVision: alloc vision first layer out NPU tensor failed");
+        return ERROR_NPU_MEMORY;
+    }
 
     {
         const auto& bw = weights_.vis_blocks[0];
@@ -793,6 +869,10 @@ Status Qwen3VLModel::RunVision(const uint16_t* pixel_values, int64_t num_patches
 
         // Allocate fresh output tensor (ATB does NOT support in-place: input==output)
         NpuTensor h_out = AllocNpuFloat16({total_tokens, vis_hs});
+        if (!h_out) {
+            LOG_ERROR("RunVision: alloc vision block %d out NPU tensor failed", li);
+            return ERROR_NPU_MEMORY;
+        }
 
         atb::VariantPack vp;
         vp.inTensors = {
@@ -849,6 +929,10 @@ Status Qwen3VLModel::RunVision(const uint16_t* pixel_values, int64_t num_patches
         const auto& mw = weights_.merger;
         int64_t merged_tokens = total_tokens / (merge_size * merge_size);
         NpuTensor merged_out = AllocNpuFloat16({merged_tokens, config_.vis_out_hidden_size});
+        if (!merged_out) {
+            LOG_ERROR("RunVision: alloc vision merger out NPU tensor failed");
+            return ERROR_NPU_MEMORY;
+        }
 
         atb::VariantPack vp;
         vp.inTensors = {

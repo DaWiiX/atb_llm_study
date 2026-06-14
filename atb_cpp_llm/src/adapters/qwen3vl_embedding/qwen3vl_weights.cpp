@@ -125,10 +125,24 @@ Status LoadQwen3VLWeights(const std::string& model_dir,
             return ERROR_WEIGHT_LOAD;
         }
 
-        weights.embed_vocab_size = 1;
-        for (auto d : emb_info.shape)
-            weights.embed_vocab_size *= static_cast<int64_t>(d);
-        weights.embed_vocab_size /= config.text_hidden_size;
+        // Validate embedding shape and compute vocab size
+        if (config.text_hidden_size <= 0) {
+            LOG_ERROR("Embed vocab size: text_hidden_size=%ld is not positive",
+                      static_cast<long>(config.text_hidden_size));
+            return ERROR_WEIGHT_LOAD;
+        }
+        if (emb_info.shape.size() != 2) {
+            LOG_ERROR("Embed vocab size: expected rank-2 embedding tensor, got rank=%zu",
+                      emb_info.shape.size());
+            return ERROR_WEIGHT_LOAD;
+        }
+        int64_t total_elems = static_cast<int64_t>(emb_info.shape[0]) * static_cast<int64_t>(emb_info.shape[1]);
+        if (total_elems % config.text_hidden_size != 0) {
+            LOG_ERROR("Embed vocab size: total_elems=%ld not divisible by text_hidden_size=%ld",
+                      static_cast<long>(total_elems), static_cast<long>(config.text_hidden_size));
+            return ERROR_WEIGHT_LOAD;
+        }
+        weights.embed_vocab_size = total_elems / config.text_hidden_size;
         weights.embed_hidden_size = config.text_hidden_size;
 
         size_t num_elements = static_cast<size_t>(weights.embed_vocab_size) * config.text_hidden_size;

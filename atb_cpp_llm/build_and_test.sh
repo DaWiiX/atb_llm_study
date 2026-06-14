@@ -26,7 +26,7 @@
 #   (default)                regenerate ALL /tmp/*.bin reference data
 #   --no-refresh-refdata     reuse existing /tmp/*.bin (faster); auto-fallback
 #                            to --no-refdata if any sentinel files are missing
-#   --no-refdata             skip generation AND exclude the 27 tests that
+#   --no-refdata             skip generation AND exclude the 28 tests that
 #                            read /tmp/*.bin (ctest -LE needs_refdata),
 #                            printing exactly which tests get skipped
 #   --refresh-refdata        explicit alias for the default (legacy compat)
@@ -317,7 +317,7 @@ fi
 # ── 5a. Handle Python reference data (refresh / reuse / none) ───────
 # Three-state semantics — see testing-guide.md § 一·五 #8 for the why.
 # All paths may end up setting CTEST_EXCLUDE_LABEL=needs_refdata so the
-# 27 tests that fopen() /tmp/*.bin don't silently SKIP-and-pass when
+# 28 tests that fopen() /tmp/*.bin don't silently SKIP-and-pass when
 # their data is absent.
 
 count_missing_refdata() {
@@ -345,7 +345,7 @@ case "$REFDATA_MODE" in
         missing=$(count_missing_refdata)
         if [ "$missing" -gt 0 ]; then
             log "WARN: --no-refresh-refdata requested, but $missing/${#REFDATA_SENTINELS[@]} sentinel files are missing under /tmp/."
-            log "      Falling back to --no-refdata behaviour: excluding the 27 tests that need reference data."
+            log "      Falling back to --no-refdata behaviour: excluding the 28 tests that need reference data."
             log "      Re-run without --no-refresh-refdata (default behaviour regenerates) to test those tests."
             REFDATA_MODE="none"
         else

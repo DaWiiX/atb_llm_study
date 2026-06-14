@@ -295,6 +295,319 @@ static bool TestMultiImage() {
 }
 
 // ═══════════════════════════════════════════════════════════════
+// Test 4: h=1 edge case — grid [1, 1, 4], merge=1
+// Exercises the divide-by-zero guard (h<=1 → fy=0.0f).
+// ═══════════════════════════════════════════════════════════════
+static bool TestH1EdgeCase() {
+    LOG_INFO("\n=== Test 4: ComputePosEmbedInterp — h=1 edge case ===");
+
+    constexpr int32_t num_grid = 4;
+    constexpr int32_t hidden = 8;
+    constexpr int32_t merge_size = 1;
+    constexpr int64_t num_grid_sq = num_grid * num_grid;
+
+    // Create synthetic fp16 source: fill with a simple ramp pattern
+    std::vector<uint16_t> src(num_grid_sq * hidden);
+    for (int64_t i = 0; i < num_grid_sq * hidden; i++) {
+        float v = static_cast<float>(i % 37) * 0.05f - 0.5f;
+        src[i] = atb_llm::Fp32ToFp16(v);
+    }
+
+    // grid_thw = [[1, 1, 4]] — single image, h=1, w=4
+    std::vector<int64_t> grid = {1, 1, 4};
+    int64_t num_images = 1;
+    int64_t total_patches = TotalPatches(grid.data(), num_images);  // 1*1*4 = 4
+
+    std::vector<uint16_t> out(total_patches * hidden, 0xFFFF);  // fill with NaN sentinel
+    atb_llm::components::ComputePosEmbedInterp(
+        src.data(), hidden, num_grid, merge_size,
+        grid.data(), num_images, out.data());
+
+    // Verify output is finite (no NaN, no inf)
+    bool ok = true;
+    for (int64_t i = 0; i < total_patches * hidden; i++) {
+        float v = atb_llm::Fp16ToF32(out[i]);
+        if (!std::isfinite(v)) {
+            LOG_ERROR("  FAIL: out[%ld] = %f (non-finite)", i, v);
+            ok = false;
+            break;
+        }
+    }
+    LOG_INFO("  patches=%ld hidden=%d all_finite=%s",
+             total_patches, hidden, ok ? "PASS" : "FAIL");
+    return ok;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Test 5: w=1 edge case — grid [1, 4, 1], merge=1
+// Exercises the divide-by-zero guard (w<=1 → fx=0.0f).
+// ═══════════════════════════════════════════════════════════════
+static bool TestW1EdgeCase() {
+    LOG_INFO("\n=== Test 5: ComputePosEmbedInterp — w=1 edge case ===");
+
+    constexpr int32_t num_grid = 4;
+    constexpr int32_t hidden = 8;
+    constexpr int32_t merge_size = 1;
+    constexpr int64_t num_grid_sq = num_grid * num_grid;
+
+    std::vector<uint16_t> src(num_grid_sq * hidden);
+    for (int64_t i = 0; i < num_grid_sq * hidden; i++) {
+        float v = static_cast<float>(i % 37) * 0.05f - 0.5f;
+        src[i] = atb_llm::Fp32ToFp16(v);
+    }
+
+    // grid_thw = [[1, 4, 1]] — single image, h=4, w=1
+    std::vector<int64_t> grid = {1, 4, 1};
+    int64_t num_images = 1;
+    int64_t total_patches = TotalPatches(grid.data(), num_images);  // 1*4*1 = 4
+
+    std::vector<uint16_t> out(total_patches * hidden, 0xFFFF);
+    atb_llm::components::ComputePosEmbedInterp(
+        src.data(), hidden, num_grid, merge_size,
+        grid.data(), num_images, out.data());
+
+    bool ok = true;
+    for (int64_t i = 0; i < total_patches * hidden; i++) {
+        float v = atb_llm::Fp16ToF32(out[i]);
+        if (!std::isfinite(v)) {
+            LOG_ERROR("  FAIL: out[%ld] = %f (non-finite)", i, v);
+            ok = false;
+            break;
+        }
+    }
+    LOG_INFO("  patches=%ld hidden=%d all_finite=%s",
+             total_patches, hidden, ok ? "PASS" : "FAIL");
+    return ok;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Test 6: single pixel — grid [1, 1, 1], merge=1
+// Minimum possible dimensions. Both h=1 and w=1 exercise both guards.
+// ═══════════════════════════════════════════════════════════════
+static bool TestSinglePixel() {
+    LOG_INFO("\n=== Test 6: ComputePosEmbedInterp — single pixel (h=1, w=1) ===");
+
+    constexpr int32_t num_grid = 4;
+    constexpr int32_t hidden = 8;
+    constexpr int32_t merge_size = 1;
+    constexpr int64_t num_grid_sq = num_grid * num_grid;
+
+    std::vector<uint16_t> src(num_grid_sq * hidden);
+    for (int64_t i = 0; i < num_grid_sq * hidden; i++) {
+        float v = static_cast<float>(i % 37) * 0.05f - 0.5f;
+        src[i] = atb_llm::Fp32ToFp16(v);
+    }
+
+    // grid_thw = [[1, 1, 1]] — single pixel
+    std::vector<int64_t> grid = {1, 1, 1};
+    int64_t num_images = 1;
+    int64_t total_patches = TotalPatches(grid.data(), num_images);  // 1
+
+    std::vector<uint16_t> out(total_patches * hidden, 0xFFFF);
+    atb_llm::components::ComputePosEmbedInterp(
+        src.data(), hidden, num_grid, merge_size,
+        grid.data(), num_images, out.data());
+
+    // Verify one output patch, all finite
+    bool ok = (total_patches == 1);
+    if (!ok) {
+        LOG_ERROR("  FAIL: expected 1 patch, got %ld", total_patches);
+    }
+    for (int64_t i = 0; i < total_patches * hidden; i++) {
+        float v = atb_llm::Fp16ToF32(out[i]);
+        if (!std::isfinite(v)) {
+            LOG_ERROR("  FAIL: out[%ld] = %f (non-finite)", i, v);
+            ok = false;
+            break;
+        }
+    }
+    LOG_INFO("  patches=%ld hidden=%d %s",
+             total_patches, hidden, ok ? "PASS" : "FAIL");
+    return ok;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Test 7: num_images=0 — empty grid_thw
+// Should handle gracefully without crash or output modification.
+// ═══════════════════════════════════════════════════════════════
+static bool TestNumImagesZero() {
+    LOG_INFO("\n=== Test 7: ComputePosEmbedInterp — num_images=0 ===");
+
+    constexpr int32_t num_grid = 4;
+    constexpr int32_t hidden = 8;
+    constexpr int32_t merge_size = 2;
+    constexpr int64_t num_grid_sq = num_grid * num_grid;
+
+    std::vector<uint16_t> src(num_grid_sq * hidden);
+    for (int64_t i = 0; i < num_grid_sq * hidden; i++) {
+        float v = static_cast<float>(i % 37) * 0.05f - 0.5f;
+        src[i] = atb_llm::Fp32ToFp16(v);
+    }
+
+    int64_t num_images = 0;
+    // Allocate a small output buffer (should not be touched)
+    std::vector<uint16_t> out(16, 0xABCD);  // sentinel
+    // grid_thw pointer is unused when num_images=0, pass a dummy
+    std::vector<int64_t> grid = {0, 0, 0};
+
+    atb_llm::components::ComputePosEmbedInterp(
+        src.data(), hidden, num_grid, merge_size,
+        grid.data(), num_images, out.data());
+
+    // Verify output was not modified (sentinels intact)
+    bool ok = true;
+    for (size_t i = 0; i < out.size(); i++) {
+        if (out[i] != 0xABCD) {
+            LOG_ERROR("  FAIL: out[%zu] modified (0x%04X != 0xABCD)",
+                      i, out[i]);
+            ok = false;
+            break;
+        }
+    }
+    LOG_INFO("  num_images=0 output_untouched=%s", ok ? "PASS" : "FAIL");
+    return ok;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Test 8: temporal > 1 — grid [2, 4, 4], merge=2
+// Tests the temporal repetition path (lines 83-87 of pos_embed_interp.cpp).
+// The first temporal frame is computed via interpolation+merge; subsequent
+// frames are memcpy'd from the first.
+// ═══════════════════════════════════════════════════════════════
+static bool TestTemporalGt1() {
+    LOG_INFO("\n=== Test 8: ComputePosEmbedInterp — temporal=2, grid [2, 4, 4] ===");
+
+    constexpr int32_t num_grid = 4;
+    constexpr int32_t hidden = 8;
+    constexpr int32_t merge_size = 2;
+    constexpr int64_t num_grid_sq = num_grid * num_grid;
+
+    std::vector<uint16_t> src(num_grid_sq * hidden);
+    for (int64_t i = 0; i < num_grid_sq * hidden; i++) {
+        float v = static_cast<float>(i % 37) * 0.05f - 0.5f;
+        src[i] = atb_llm::Fp32ToFp16(v);
+    }
+
+    // grid_thw = [[2, 4, 4]] — t=2 temporal frames, 4x4 spatial
+    std::vector<int64_t> grid = {2, 4, 4};
+    int64_t num_images = 1;
+    int64_t total_patches = TotalPatches(grid.data(), num_images);  // 2*4*4 = 32
+
+    std::vector<uint16_t> out(total_patches * hidden, 0xFFFF);
+    atb_llm::components::ComputePosEmbedInterp(
+        src.data(), hidden, num_grid, merge_size,
+        grid.data(), num_images, out.data());
+
+    // With merge_size=2, h=4 → merged_h=2, w=4 → merged_w=2
+    // Spatial merge writes 2*2*2*2 = 16 patches for frame 0
+    // Temporal repetition copies those 16 patches to frame 1
+    int64_t frame_size = 4 * 4;  // h * w = 16 patches per frame
+    bool ok = true;
+
+    // Verify all output is finite
+    for (int64_t i = 0; i < total_patches * hidden; i++) {
+        float v = atb_llm::Fp16ToF32(out[i]);
+        if (!std::isfinite(v)) {
+            LOG_ERROR("  FAIL: out[%ld] = %f (non-finite)", i, v);
+            ok = false;
+            break;
+        }
+    }
+
+    // Verify temporal copy: frame 1 (offset 16) should equal frame 0 (offset 0)
+    if (ok) {
+        for (int64_t p = 0; p < frame_size; p++) {
+            for (int32_t d = 0; d < hidden; d++) {
+                int64_t idx0 = p * hidden + d;
+                int64_t idx1 = (frame_size + p) * hidden + d;
+                if (out[idx0] != out[idx1]) {
+                    LOG_ERROR("  FAIL: temporal mismatch at patch %ld dim %d "
+                              "(frame0=0x%04X frame1=0x%04X)",
+                              p, d, out[idx0], out[idx1]);
+                    ok = false;
+                    break;
+                }
+            }
+            if (!ok) break;
+        }
+    }
+
+    LOG_INFO("  patches=%ld hidden=%d frame_size=%ld temporal_ok=%s",
+             total_patches, hidden, frame_size, ok ? "PASS" : "FAIL");
+    return ok;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Test 9: non-divisible merge_size — grid [1, 5, 5], merge=2
+// h=5 and w=5 are not divisible by merge_size=2.
+// The integer division on lines 61-62 truncates (merged_h=2, merged_w=2).
+// 2*2*2*2 = 16 patches are written from a 5*5=25 patch grid — the rightmost
+// column and bottommost row of each merge block are silently dropped.
+// ═══════════════════════════════════════════════════════════════
+static bool TestNonDivisibleMerge() {
+    LOG_INFO("\n=== Test 9: ComputePosEmbedInterp — non-divisible merge [1, 5, 5], merge=2 ===");
+
+    constexpr int32_t num_grid = 4;
+    constexpr int32_t hidden = 8;
+    constexpr int32_t merge_size = 2;
+    constexpr int64_t num_grid_sq = num_grid * num_grid;
+
+    std::vector<uint16_t> src(num_grid_sq * hidden);
+    for (int64_t i = 0; i < num_grid_sq * hidden; i++) {
+        float v = static_cast<float>(i % 37) * 0.05f - 0.5f;
+        src[i] = atb_llm::Fp32ToFp16(v);
+    }
+
+    // grid_thw = [[1, 5, 5]]
+    std::vector<int64_t> grid = {1, 5, 5};
+    int64_t num_images = 1;
+    int64_t total_patches = TotalPatches(grid.data(), num_images);  // 1*5*5 = 25
+
+    // Fill output with QNaN sentinel (0x7E00) to detect unwritten positions
+    constexpr uint16_t kSentinel = 0x7E00;
+    std::vector<uint16_t> out(total_patches * hidden, kSentinel);
+    atb_llm::components::ComputePosEmbedInterp(
+        src.data(), hidden, num_grid, merge_size,
+        grid.data(), num_images, out.data());
+
+    // Expected written patches: merged_h=2, merged_w=2, merge_size=2, merge_size=2
+    // → 2*2*2*2 = 16 patches
+    int64_t expected_written = 2 * 2 * merge_size * merge_size;  // 16
+
+    // Verify that the written region (first expected_written patches) is finite,
+    // and the remainder (expected_written..24) still has sentinel (0x7E00 = QNaN).
+    bool ok = true;
+    for (int64_t p = 0; p < total_patches; p++) {
+        for (int32_t d = 0; d < hidden; d++) {
+            int64_t idx = p * hidden + d;
+            if (p < expected_written) {
+                float v = atb_llm::Fp16ToF32(out[idx]);
+                if (!std::isfinite(v)) {
+                    LOG_ERROR("  FAIL: written patch %ld dim %d = %f (non-finite)",
+                              p, d, v);
+                    ok = false;
+                    break;
+                }
+            } else {
+                if (out[idx] != kSentinel) {
+                    LOG_ERROR("  FAIL: unwritten patch %ld dim %d raw=0x%04X "
+                              "(expected sentinel 0x%04X)",
+                              p, d, out[idx], kSentinel);
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if (!ok) break;
+    }
+
+    LOG_INFO("  total=%ld written=%ld unwritten=%ld %s",
+             total_patches, expected_written,
+             total_patches - expected_written, ok ? "PASS" : "FAIL");
+    return ok;
+}
+
+// ═══════════════════════════════════════════════════════════════
 // Main
 // ═══════════════════════════════════════════════════════════════
 
@@ -303,9 +616,15 @@ int main() {
 
     int passed = 0, total = 0;
 
-    total++; if (TestTypical())       passed++;
-    total++; if (TestBoundarySmall()) passed++;
-    total++; if (TestMultiImage())    passed++;
+    total++; if (TestTypical())          passed++;
+    total++; if (TestBoundarySmall())    passed++;
+    total++; if (TestMultiImage())       passed++;
+    total++; if (TestH1EdgeCase())       passed++;
+    total++; if (TestW1EdgeCase())       passed++;
+    total++; if (TestSinglePixel())      passed++;
+    total++; if (TestNumImagesZero())    passed++;
+    total++; if (TestTemporalGt1())      passed++;
+    total++; if (TestNonDivisibleMerge()) passed++;
 
     LOG_INFO("\n=== Summary: %d/%d tests passed ===", passed, total);
     return (passed == total) ? 0 : 1;
