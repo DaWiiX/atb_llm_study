@@ -194,6 +194,61 @@ def make_rope_operation():
     return torch_atb.Operation(torch_atb.RopeParam(rotary_coeff=2))
 
 
+# ── 310P NZ mask conversion ──────────────────────────────────────────
+
+def nd_to_nz_fp16(mask_nd: torch.Tensor) -> torch.Tensor:
+    """Convert (S, S) ND causal mask to FRACTAL_NZ layout for 310P.
+
+    310P PA_ENCODER SelfAttention requires the mask in NZ format:
+      ND:  [S, S]      row-major
+      NZ:  [1, ceil(S/16), ceil(S/16)*16, 16]  16×16 block-column-major
+
+    The conversion is: NZ[0, col/16, row, col%16] = ND[row, col].
+    Padding elements are zero-filled.
+
+    Args:
+        mask_nd: (S, S) fp16 tensor in ND (row-major) layout
+    Returns:
+        (1, n1, s_pad, 16) fp16 tensor in NZ (FRACTAL_NZ) layout
+    """
+    S = mask_nd.shape[0]
+    n1 = (S + 15) // 16          # ceil(S/16) — number of 16-column blocks
+    s_pad = n1 * 16               # ceil(S/16)*16 — padded row count
+
+    nz = torch.zeros(1, n1, s_pad, 16, dtype=mask_nd.dtype, device=mask_nd.device)
+    for r in range(S):
+        for c in range(S):
+            block_col = c // 16
+            col_in_block = c % 16
+            nz[0, block_col, r, col_in_block] = mask_nd[r, c]
+    return nz
+
+
+def make_causal_mask_nz(S: int, device: str = "cpu") -> torch.Tensor:
+    """Generate causal mask directly in NZ (FRACTAL_NZ) layout for 310P.
+
+    Combines causal mask generation and NZ conversion in one step:
+    - Upper triangle (col > row): -65504 (masked)
+    - Lower triangle + diagonal: 0 (attend)
+    - Padding: 0
+
+    Args:
+        S:      sequence length
+        device: target device ('cpu' or 'npu')
+    Returns:
+        (1, n1, s_pad, 16) fp32 tensor in NZ layout
+    """
+    n1 = (S + 15) // 16
+    s_pad = n1 * 16
+    mask_nz = torch.zeros(1, n1, s_pad, 16, device=device)
+    for r in range(S):
+        for c in range(r + 1, S):     # col > row = masked (upper triangle)
+            block_col = c // 16
+            col_in_block = c % 16
+            mask_nz[0, block_col, r, col_in_block] = -65504.0
+    return mask_nz
+
+
 # ── Comparison utility ──────────────────────────────────────────────
 
 def compare_tensors(ref: torch.Tensor, atb: torch.Tensor,

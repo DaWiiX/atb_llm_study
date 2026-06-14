@@ -70,7 +70,10 @@ def _run_attention_test(name, num_heads, num_kv_heads, head_dim, use_mask, B=1, 
             gen_data["sin"].reshape(ntoken, head_dim).half().npu(),
         ]
         if use_mask:
-            inputs.append(make_causal_mask(S).half().npu())
+            mask = make_causal_mask(S).half().npu()
+            if utils.is_310p():
+                mask = utils.nd_to_nz_fp16(mask)
+            inputs.append(mask)
         inputs.append(torch.tensor([ntoken], dtype=torch.int32))
 
         atb_out = graph_op.forward(inputs)[0].cpu().float()

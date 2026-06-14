@@ -39,6 +39,7 @@ from .text_model import (
 
 from .utils import (
     to_cpu_float, to_npu_half, make_seqlen_tensor, is_310p,
+    nd_to_nz_fp16,
 )
 
 
@@ -201,7 +202,14 @@ class Qwen3VLEngine:
         self.g_t_layer = build_text_layer_graph(
             self.nh_t, self.nkv_t, self.hd_t, self.interm_t,
             B=1, S=S, use_mask=True)
-        self._cached_mask = to_npu_half(make_causal_mask(S))
+        mask = make_causal_mask(S)
+        if is_310p():
+            # 310P PA_ENCODER requires NZ (FRACTAL_NZ) format mask.
+            # Convert to NZ layout before uploading to NPU.
+            mask = nd_to_nz_fp16(to_npu_half(mask))
+        else:
+            mask = to_npu_half(mask)
+        self._cached_mask = mask
 
     def _build_graphs(self):
         """Build all ATB graphs."""
