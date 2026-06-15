@@ -206,8 +206,8 @@ ASCEND_PLATFORM=310P python tests/test_e2e_full_pipeline.py 2>&1 | tee /tmp/310p
 
 ```bash
 cd atb_python_qwen3vl_embedding
-ASCEND_PLATFORM=310P python tests/test_nz_quick_verify.py
-# 预期: 5/5 shape=..., format=FRACTAL_NZ ✅
+ASCEND_PLATFORM=310P python tests/test_nz_format_verify.py
+# 预期: 各测试输出 ✅，验证创建、数据拷贝、值正确性、format cast、ATB 接受
 ```
 
 ### 3d. 参考数据生成 + fallback

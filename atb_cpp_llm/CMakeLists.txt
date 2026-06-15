@@ -220,7 +220,6 @@ add_atb_test(test_text_ops             tests/level2_op_precision/test_text_ops.c
 add_atb_test(test_vision_ops           tests/level2_op_precision/test_vision_ops.cpp)
 add_atb_test(test_text_model           tests/level3_integration/test_text_model.cpp)
 add_atb_test(test_e2e                  tests/level4_e2e/test_e2e.cpp)
-add_atb_test(test_consistency          tests/level4_e2e/test_consistency.cpp)
 add_atb_test(test_accuracy             tests/level4_e2e/test_accuracy.cpp)
 add_atb_test(test_stage_precision      tests/level4_e2e/test_stage_precision.cpp)
 add_atb_test(test_forward_error_paths  tests/level4_e2e/test_forward_error_paths.cpp)
@@ -315,7 +314,6 @@ add_atb_test(benchmark                 tests/benchmark.cpp)  # stays at tests/ r
 # requires the targets to already exist.
 set_tests_properties(
     test_e2e
-    test_consistency
     test_accuracy
     test_stage_precision
     test_forward_error_paths

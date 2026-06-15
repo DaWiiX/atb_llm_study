@@ -15,10 +15,10 @@
 | [P5](#p5) | 🔴 高 | Python | Deepstack 跨模态融合无自动化测试 |
 | [P6](#p6) | 🔴→🟢 已修复 | Python | test_text_model.py 只用 2 层测试（真实模型 28 层） | ✅ 2026-06-15 |
 | [P7](#p7) | 🔴 高 | C++ | BicubicResize 参考实现自证（非独立参考） |
-| [P8](#p8) | 🟡 中 | Python | test_text_attention.py 与 test_310p_diag.py 冗余 |
-| [P9](#p9) | 🟡 中 | Python | test_nz_quick_verify.py 与 test_nz_format_verify.py 冗余 |
+| [P8](#p8) | 🟡→🟢 已修复 | Python | test_text_attention.py 与 test_310p_diag.py 冗余 | ✅ 2026-06-15 |
+| [P9](#p9) | 🟡→🟢 已修复 | Python | test_nz_quick_verify.py 与 test_nz_format_verify.py 冗余 | ✅ 2026-06-15 |
 | [P10](#p10) | 🟡 中 | Python | test_embedder_e2e.py 与 test_e2e.py + benchmark.py 重叠 |
-| [P11](#p11) | 🟡 中 | C++ | test_consistency.cpp 是 test_accuracy.cpp 的子集 |
+| [P11](#p11) | 🟡→🟢 已修复 | C++ | test_consistency.cpp 是 test_accuracy.cpp 的子集 | ✅ 2026-06-15 |
 | [P12](#p12) | 🟡 中 | C++/Python | 预处理阶段在多个文件中重复测试 |
 | [P13](#p13) | 🟡 中 | Python | set_atb_buffer_size 调用位置不一致（7+9 个文件） |
 | [P14](#p14) | 🟡 中 | Python | 模型加载代码在 6 个文件中重复 |
@@ -26,7 +26,7 @@
 | [P16](#p16) | 🟡 中 | Python | 无自动化测试运行器 / 汇总脚本 |
 | [P17](#p17) | 🟡 中 | C++ | test_config_wiring.cpp 硬编码 epsilon 阈值 |
 | [P18](#p18) | 🟢 低 | Python | IMAGE_TOKEN_ID 硬编码（应从 config 读取） |
-| [P19](#p19) | 🟢 低 | Python | 死代码：VISION_START_TOKEN_ID / run_quick_tf 未使用参数 |
+| [P19](#p19) | 🟢→🟢 已修复 | Python | 死代码：VISION_START_TOKEN_ID / run_quick_tf 未使用参数 | ✅ 2026-06-15 |
 | [P20](#p20) | 🟢 低 | Python | 测试间余弦阈值不一致且缺乏文档说明 |
 | [P21](#p21) | 🟢 低 | Python | benchmark.py 手动复制 engine._run_vision 逻辑 |
 
@@ -216,47 +216,28 @@ Deepstack 是 Qwen3VL 的核心跨模态融合机制：vision block [5, 11, 17] 
 
 ## 🟡 中优先级
 
-### P8: test_text_attention.py 与 test_310p_diag.py 冗余 {#p8}
+### P8: test_text_attention.py 与 test_310p_diag.py 冗余 {#p8} ✅ DONE 2026-06-15
 
-**问题是什么**
+**修复内容**
 
-`test_text_attention.py` 只测试 `B=1, S=16, MHA (nh=4, kv_nh=4)`。`test_310p_diag.py` 的 T1（MHA+nomask）和 T2（MHA+mask）覆盖了相同的场景，且额外测试了 GQA、hd=128、S=4/16/880 等配置。`test_text_attention.py` 是 `test_310p_diag.py` 的严格子集。
+`test_text_attention.py` 已删除。其所有独有功能已合并到 `test_310p_diag.py`：
 
-**怎么修复**
-
-1. 将 `test_text_attention.py` 中独有的功能合并到 `test_310p_diag.py`：使用 `compare_tensors`（打印 MSE 和 max_diff）替代 `test_310p_diag.py` 中的裸余弦比较。
-2. 删除 `test_text_attention.py`。
-3. 或者保留 `test_text_attention.py` 作为最简示例/教程，但添加注释说明完整测试在 `test_310p_diag.py`。
-
-**怎么验收**
-
-- 删除后所有 attention 相关测试场景仍被覆盖。
-- `test_310p_diag.py` 输出包含 MSE 和 max_diff 信息。
-
-**如何避免再犯**
-
-- 新增测试文件时，先搜索现有测试是否已覆盖相同或更广的场景。
-- 测试文件头部注释应列出"相关测试文件"和"本文件与它们的区别"。
+1. **MSE + max_diff 诊断输出**：在 `_run_attention_test` 中增加了 `mse` 和 `max_diff` 计算和打印（原文件中的 `compare_tensors` 函数）
+2. **场景覆盖确认**：`test_310p_diag.py` 的 T1（MHA+nomask, S=16, nh=4, kv_nh=4, hd=64）和 T2（MHA+mask, S=16, nh=4, kv_nh=4, hd=64）完全覆盖了原 `test_text_attention.py` 的两种测试场景
+3. 无其他文件 import 该文件，删除安全
 
 ---
 
-### P9: test_nz_quick_verify.py 与 test_nz_format_verify.py 冗余 {#p9}
+### P9: test_nz_quick_verify.py 与 test_nz_format_verify.py 冗余 {#p9} ✅ DONE 2026-06-15
 
-**问题是什么**
+**修复内容**
 
-`test_nz_quick_verify.py`（创建 + 格式检查）的所有检查都被 `test_nz_format_verify.py`（创建 + 格式检查 + data copy + value verification + format cast + ATB acceptance）覆盖。前者是后者的严格子集。
+`test_nz_quick_verify.py` 已删除。其所有检查均被 `test_nz_format_verify.py` 覆盖：
 
-**怎么修复**
-
-删除 `test_nz_quick_verify.py`。
-
-**怎么验收**
-
-- `test_nz_format_verify.py` 全部 6 个 test function 通过。
-
-**如何避免再犯**
-
-- 同 P8。
+1. **S 值覆盖**：`test_nz_format_verify.py` 的 test_01（S=3,4,8,16,32）和 test_04（S=3,880,883）完全覆盖原文件的 S=3,4,8,16,880
+2. **格式/类型检查**：shape、FRACTAL_NZ format、float16 dtype 检查均在 test_01 中覆盖
+3. **额外覆盖**：test_02（data copy roundtrip）、test_03（mask value correctness）、test_03b（format cast）、test_05（ATB graph acceptance）均超出原文件范围
+4. 无其他文件 import 该文件，删除安全
 
 ---
 
@@ -284,24 +265,15 @@ Deepstack 是 Qwen3VL 的核心跨模态融合机制：vision block [5, 11, 17] 
 
 ---
 
-### P11: test_consistency.cpp 是 test_accuracy.cpp 的子集 {#p11}
+### P11: test_consistency.cpp 是 test_accuracy.cpp 的子集 {#p11} ✅ DONE 2026-06-15
 
-**问题是什么**
+**修复内容**
 
-`test_consistency.cpp` 的 TEXT_ONLY 推理 + 保存 pooler 输出的逻辑是 `test_accuracy.cpp` TEXT_ONLY 路径的子集。前者是后者的早期简化版本。
+`test_consistency.cpp` 和其配套 Python 脚本 `test_consistency.py` 已删除。两者均为 `test_accuracy.cpp` / `test_accuracy.py` 的严格子集：
 
-**怎么修复**
-
-1. 确认 `test_consistency.cpp` 无独有功能后删除。
-2. 如果有独有功能（如多次推理一致性检查），提取到 `test_accuracy.cpp`。
-
-**怎么验收**
-
-- 删除后 `test_accuracy.cpp` 覆盖所有 consistency 场景。
-
-**如何避免再犯**
-
-- 新增 C++ 测试文件时，检查是否已有文件覆盖相同路径。在文件头部注释中声明与现有测试的关系。
+1. **功能覆盖**：`test_consistency.cpp` 仅做 TEXT_ONLY 推理并保存输出，`test_accuracy.cpp` 已包含 TEXT_ONLY + IMAGE_ONLY + IMAGE_AND_TEXT 三种模式。
+2. **API 相同**：两者均使用 `LLMEngine::Create` + `Encode` API，结构一致。
+3. **引用更新**：`CMakeLists.txt`（两处）、`refactoring-plan.md`（两处）、`test-coverage-log.md`（两处）、`compare_with_torch.py` 中的 test_consistency 引用已全部更新为 test_accuracy。
 
 ---
 
@@ -490,24 +462,15 @@ Deepstack 是 Qwen3VL 的核心跨模态融合机制：vision block [5, 11, 17] 
 
 ---
 
-### P19: 死代码清理 {#p19}
+### P19: 死代码清理 {#p19} ✅ DONE 2026-06-15
 
-**问题是什么**
+**修复内容**
 
-- `test_embedder_e2e.py:64`：`VISION_START_TOKEN_ID = 151652` 定义但从未使用。
-- `test_embedder_e2e.py:378-425`：`run_quick_tf` 接受 `n_warmup`/`n_iter` 参数但从未使用。
+1. 删除了 `VISION_START_TOKEN_ID = 151652`（定义但从未使用）
+2. 从 `run_quick_tf` 函数签名中移除了未使用的 `n_warmup`/`n_iter` 参数
+3. 更新了 `main()` 中的调用点，不再传递 `args.warmup, args.iter` 给 `run_quick_tf`
 
-**怎么修复**
-
-删除未使用的常量和无用参数。
-
-**怎么验收**
-
-- Python linter（如 ruff/flake8）不再报告未使用的变量。
-
-**如何避免再犯**
-
-- CI 中集成 Python linter，检测未使用变量/导入。
+其他函数的 `n_warmup`/`n_iter` 参数（`run_quick_atb`、`run_bench_atb`、`run_bench_tf`、`ATBRunner.benchmark`、`TFRunner.benchmark`）均正常使用，未受影响。
 
 ---
 

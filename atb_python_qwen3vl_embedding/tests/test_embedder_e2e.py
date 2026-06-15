@@ -61,7 +61,6 @@ sys.path.insert(0, QWEN3VL_EMB_SRC)
 # ═══════════════════════════════════════════════════════════════════
 
 IMAGE_TOKEN_ID = 151655
-VISION_START_TOKEN_ID = 151652
 BIN_DIR = "/tmp"
 
 RESOLUTIONS = [(416, 672), (720, 1280), (1080, 1920), (1440, 2560)]
@@ -375,8 +374,7 @@ def run_quick_atb(model_dir: str, processor, cases,
     return results
 
 
-def run_quick_tf(model_dir: str, processor, cases,
-                 n_warmup: int, n_iter: int) -> Dict[str, torch.Tensor]:
+def run_quick_tf(model_dir: str, processor, cases) -> Dict[str, torch.Tensor]:
     """TF quick test: use Qwen3VLModel via processor pipeline."""
     import safetensors.torch
     from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLConfig
@@ -619,8 +617,7 @@ def main(argv: Optional[list] = None) -> int:
             atb_emb = run_quick_atb(args.model_dir, processor, cases,
                                     args.warmup, args.iter)
         if run_tf:
-            tf_emb = run_quick_tf(args.model_dir, processor, cases,
-                                  args.warmup, args.iter)
+            tf_emb = run_quick_tf(args.model_dir, processor, cases)
 
         if run_atb and run_tf:
             ok = compare_quick(atb_emb, tf_emb, args.threshold)
