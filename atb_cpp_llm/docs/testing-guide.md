@@ -98,7 +98,7 @@ ASCEND_PLATFORM=310P ./test_self_attention_precision 2>&1 | tee /tmp/310p_phase1
 **分组说明**：
 - **Group 1**（#1-3）：基础功能，覆盖 MHA/GQA、有/无 mask
 - **Group 2**（#4-6）：不同 S 值 — 测试 16 对齐约束（S=4/8 非对齐 vs S=16/32 对齐）
-- **Group 3**（#7-9）：真实模型参数 — hd=128, nh=16（Qwen3VL-Embedding-2B MHA 权重展开后）
+- **Group 3**（#7-9）：真实模型参数 — hd=128, nh=16（Qwen3VL-Embedding-2B MHA 配置）
 
 **精度标准**: 余弦相似度 ≥ 0.99，理想值 = 1.0
 
@@ -181,11 +181,11 @@ cmake --build . --target test_e2e -j8
 ASCEND_PLATFORM=310P ./test_e2e 2>&1 | tee /tmp/310p_phase3a.log
 ```
 
-**范围**：完整 Qwen3VL-Embedding-2B 推理（vision + text），使用 GQA→MHA 展开权重。
+**范围**：完整 Qwen3VL-Embedding-2B 推理（vision + text），使用原生 GQA 权重。
 
 | 测试内容 | 类型 | 说明 |
 |---------|------|------|
-| 全模型推理 + 精度对比 | MHA（展开后） | Vision + Text，NZ mask |
+| 全模型推理 + 精度对比 | 原生 GQA | Vision + Text，NZ mask |
 
 ### 3b. Python E2E
 
@@ -197,8 +197,8 @@ ASCEND_PLATFORM=310P python tests/test_e2e_full_pipeline.py 2>&1 | tee /tmp/310p
 
 | 测试 | 内容 | 类型 |
 |------|------|------|
-| `test_engine.py` | Engine 级别：text-only, image-only, image+text | GQA→MHA 展开 |
-| `test_e2e_full_pipeline.py` | 全流程 vs transformers 参考 | GQA→MHA 展开 |
+| `test_engine.py` | Engine 级别：text-only, image-only, image+text | 原生 GQA |
+| `test_e2e_full_pipeline.py` | 全流程 vs transformers 参考 | 原生 GQA |
 
 ### 3c. Python NZ mask format 验证
 

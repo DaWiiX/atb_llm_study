@@ -181,12 +181,12 @@ const metaText = await page.evaluate(async () => {
 
 ### 310P 平台适配
 
-310P 上 SelfAttention 不支持 GQA 模式（`kv_head_num < head_num`）。解决方案是在权重加载时将 GQA 展开为 MHA（数学精确变换）。详见 [`atb_cpp_llm/docs/platform-310p.md`](./atb_cpp_llm/docs/platform-310p.md)。
+310P 上 SelfAttention PA_ENCODER 的 mask 格式要求为 NZ (FRACTAL_NZ)，不同于 910B 的 ND 格式。GQA 模式（`kv_head_num < head_num`）在 310P 上原生支持（实测 cos=1.0），无需展开为 MHA。详见 [`atb_cpp_llm/docs/platform-310p.md`](./atb_cpp_llm/docs/platform-310p.md)。
 
 关键要点：
-- Python: `is_310p()` 检测平台 → engine 层自动展开 K/V 权重
-- C++: `Is310P()` 检测平台 → `Qwen3VLModel::Load()` 中自动展开
-- 新增 GQA 测试必须加 `Is310P()` 守卫（910B 可运行 310P 路径，310P 不可运行原生 GQA）
+- Python: `is_310p()` 检测平台 → `make_causal_mask_nz_npu()` 生成 NZ 格式 mask
+- C++: `Is310P()` 检测平台 → `MakeCausalMaskNzFp16()` 生成 NZ 格式 mask
+- GQA 测试无需 `Is310P()` 守卫（310P 原生支持 GQA）
 - 平台配置：`.env` 中 `ASCEND_PLATFORM=310P`（默认 910B）
 # CLAUDE.md
 

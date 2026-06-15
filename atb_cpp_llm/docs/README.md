@@ -8,7 +8,7 @@
 | [refactoring-plan.md](./refactoring-plan.md) | 重构计划（Phase 0–19）、踩坑经验集、基准报告、开发检查清单 |
 | [optimization-roadmap.md](./optimization-roadmap.md) | NPU 性能优化长期路线 — P0 到 P8 逐阶段收益、冷热缓存分析 |
 | [testing-guide.md](./testing-guide.md) | 测试策略指南 — Level 0~4 测试金字塔、精度标准、反模式 |
-| [platform-310p.md](./platform-310p.md) | 310P 平台适配文档 — GQA→MHA 策略、兼容性矩阵、运维指南 |
+| [platform-310p.md](./platform-310p.md) | 310P 平台适配文档 — NZ mask 策略、兼容性矩阵、运维指南 |
 | [cpp11-compat-todo.md](./cpp11-compat-todo.md) | C++17→C++11 降级待办 — `make_unique` / 泛型 lambda 改造清单 |
 
 ## 历史归档

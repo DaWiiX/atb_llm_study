@@ -53,3 +53,8 @@ extra-info/data-dump/
 # Local env (machine-specific paths; copy .env.example to .env to bootstrap)
 .env
 .claude
+
+# Node.js (dev tooling)
+package.json
+package-lock.json
+node_modules/

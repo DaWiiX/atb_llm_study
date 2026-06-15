@@ -368,55 +368,44 @@ grep -E "cosine|FAILED|ERROR|Skipping|test cases" /tmp/310p_sa_test.log
 | 文件 | Is310P() 判断点 | 用途 |
 |------|----------------|------|
 | `src/ops/self_attention_op.cpp` | 1 处 | isTriuMask 参数（可能不需要）|
-| `src/adapters/qwen3vl_embedding/qwen3vl_model.cpp` | 1 处 | GQA→MHA 权重展开 |
+| `src/adapters/qwen3vl_embedding/qwen3vl_model.cpp` | 1 处 | 310P NZ mask 创建（`MakeCausalMaskNzFp16`）|
 | `src/components/common/self_attention_graph.cpp` | 1 处 | TransdataOp ND→NZ（临时方案）|
 | `src/components/common/gqa_attention_builder.cpp` | 1 处 | TransdataOp ND→NZ（临时方案）|
-| 测试文件 | N 处 | GQA 测试 SKIP guard |
+| 测试文件 | 0 处 | 已无 GQA skip guard |
 
 **目标**：将 self_attention_graph.cpp 和 gqa_attention_builder.cpp 中的 TransdataOp 逻辑移除，改为在 mask 创建时直接指定 NZ 格式。
 
-## 适配策略：GQA→MHA 权重展开
+## 适配策略：NZ Mask 格式
 
-### 原理
+### 核心差异
 
-GQA (Grouped Query Attention) 中多个 query head 共享同一组 KV head。Qwen3VL-Embedding-2B 的配置是 `nh=32, kv_nh=4, ratio=8`。
+310P 与 910B 的唯一关键差异是 SelfAttention PA_ENCODER 的 mask 格式要求不同：
 
-将 KV 权重从 GQA 展开到 MHA 是**数学精确**的变换：复制每个 KV head `ratio` 次，使得 `kv_nh == nh`。展开后 MHA SelfAttention 产生与原始 GQA 完全相同的 attention 输出。
+| 平台 | Mask 格式 |
+|------|----------|
+| 910B | ND (ACL_FORMAT=2) |
+| 310P | NZ / FRACTAL_NZ (ACL_FORMAT=29) |
 
-```
-原始 GQA:  K = (4, hd, hidden)     →  每个 KV head 被 8 个 Q head 共享
-展开 MHA:  K = (32, hd, hidden)    →  每个 KV head 复制 8 次
-```
+GQA 模式（`kv_head_num < head_num`）在 310P 上**原生支持**（实测 cos=1.0），无需展开为 MHA。
 
-### Python 侧实现
+### Mask 创建路径
 
-位置：`atb_python_qwen3vl_embedding/engine.py:141-194`
-
+Python 侧（`engine.py:_ensure_text_graph()`）：
 ```python
-def _expand_kv_weights_to_mha(self):
-    """权重加载时展开 K/V/K-norm，使 nkv_t == nh_t"""
-    ratio = self.nh_t // self.nkv_t
-    for li in range(self.n_layer):
-        # K weight: (kv_nh*hd, hidden) → (nh*hd, hidden)
-        k_w_exp = k_w.reshape(kv_nh, hd, -1) \
-            .repeat_interleave(ratio, dim=0) \
-            .reshape(nh * hd, -1)
-        # V weight: 同理
-        # K-norm: (hd,) per-head → 无需展开；(kv_nh*hd,) → 展开
-    self.nkv_t = self.nh_t  # 更新后图使用 MHA
+if is_310p():
+    mask = make_causal_mask_nz_npu(S)   # NZ layout + FRACTAL_NZ format
+else:
+    mask = to_npu_half(make_causal_mask(S))  # ND format
 ```
 
-触发条件（`engine.py:109`）：
-```python
-if is_310p() and self.nkv_t < self.nh_t:
-    self._expand_kv_weights_to_mha()
+C++ 侧（`qwen3vl_model.cpp`）：
+```cpp
+if (Is310P()) {
+    MakeCausalMaskNzFp16(S, cached_mask_npu_);  // NZ layout + FRACTAL_NZ format
+} else {
+    // ND format mask
+}
 ```
-
-### C++ 侧实现
-
-位置：`atb_cpp_llm/src/adapters/qwen3vl_embedding/qwen3vl_model.cpp:78-176`
-
-逻辑与 Python 完全一致：从 NPU CopyToHost → CPU 上 memcpy 展开 → AllocFloat16 新 NPU tensor → CopyToDevice。最后更新 `config_.text_num_kv_heads = config_.text_num_heads`。
 
 ## 配置
 
@@ -450,7 +439,7 @@ ASCEND_PLATFORM=310P
 | Level 1 CPU 纯函数 | 全部通过 | 无 NPU 依赖 |
 | Level 2 算子精度 | 全部通过（含 GQA）| GQA 实测 cos=1.0 |
 | Level 3 集成 | 全部通过（含 GQA）| GQA 实测通过 |
-| Level 4 E2E | 全部通过（走 GQA→MHA 展开路径） | engine 层自动处理 |
+| Level 4 E2E | 全部通过（GQA 原生支持） | engine 层 NZ mask 处理 |
 
 ### 310P 上无跳过的测试
 
@@ -459,7 +448,7 @@ ASCEND_PLATFORM=310P
 ## 精度保证
 
 - **绝不降低阈值**：所有精度测试阈值保持 `cos > 0.99`（多数情况下 > 0.9999）
-- **数值等价**：GQA→MHA 展开是精确变换，910B 原路径和 310P 展开路径的输出余弦相似度 > 0.99998
+- **数值等价**：310P 和 910B 在相同输入下的输出余弦相似度 > 0.99（实测多数场景 cos=1.0）
 - **逐阶段验证**：Stage reference 测试覆盖 Vision 和 Text 的每个中间阶段
 
 ## 排查问题
@@ -608,7 +597,7 @@ mask 缓存在 `self._cached_mask` 中，后续 `_run_text()` 直接通过 `caus
 **原因**: SelfAttention 收到 ND 格式 mask → fusion runner 内部尝试 ND→NZ 转换 → 310P 上 Transdata 不支持
 **修复**: 在 mask 创建处（model 层/测试层）直接生成 NZ 格式 mask，让 SelfAttention 跳过内部转换
 
-### 当前状态 (6/14)
+### 当前状态 (6/15)
 
 | 组件 | 状态 | 备注 |
 |------|------|------|
@@ -617,7 +606,7 @@ mask 缓存在 `self._cached_mask` 中，后续 `_run_text()` 直接通过 `caus
 | C++ Graph 精度测试 | ✅ 23/23 | NZ mask 正确传播 |
 | Python ATB mask | ✅ 已修复 | `engine.py` + `text_model.py` NZ 支持 |
 | Python E2E | ⏳ 待 310P 验证 | |
-| GQA→MHA 展开 | ✅ 已确认 | GQA 在 310P 上原生支持（cos=1.0）；展开代码仍保留但不再触发（`is_310p() && nkv_t < nh_t` 条件已通过 GQA 原生支持满足，展开路径仅作为向后兼容保留）|
+| GQA 原生支持 | ✅ 已确认 | GQA 在 310P 上完全支持（cos=1.0）；GQA→MHA 展开代码已移除 |
 
 ## 相关文件索引
 
@@ -627,14 +616,13 @@ mask 缓存在 `self._cached_mask` 中，后续 `_run_text()` 直接通过 `caus
 | `atb_python_qwen3vl_embedding/utils.py:132-176` | make_self_attention() 参数灵活化 |
 | `atb_python_qwen3vl_embedding/utils.py:198-282` | NZ mask 生成函数（nd_to_nz_fp16, make_causal_mask_nz, make_causal_mask_nz_npu）|
 | `atb_python_qwen3vl_embedding/text_attention.py:19-49` | build_attention/add_attention_graph |
-| `atb_python_qwen3vl_embedding/engine.py:197-228` | _ensure_text_graph() — 310P mask 创建（调用 make_causal_mask_nz_npu）|
-| `atb_python_qwen3vl_embedding/engine.py:105-194` | Python GQA→MHA 展开 |
+| `atb_python_qwen3vl_embedding/engine.py:135-152` | _ensure_text_graph() — 310P mask 创建（调用 make_causal_mask_nz_npu）|
 | `atb_python_qwen3vl_embedding/tests/test_310p_diag.py` | 310P 快速诊断 |
 | `atb_python_qwen3vl_embedding/tests/test_310p_combinations.py` | 310P 参数深度扫描 |
 | `atb_cpp_llm/docs/platform-310p.md` | 本文档 |
 | `atb_cpp_llm/src/utils/cpp11_compat.h:74-89` | C++ 平台检测 |
 | `atb_cpp_llm/src/utils/float_utils.h:47-48` | C++ MakeCausalMaskNzFp16() — FRACTAL_NZ mask 创建 |
-| `atb_cpp_llm/src/adapters/qwen3vl_embedding/qwen3vl_model.cpp:78-176` | C++ GQA→MHA 展开 |
+| `atb_cpp_llm/src/adapters/qwen3vl_embedding/qwen3vl_model.cpp` | C++ Model::Load() — NZ mask 创建 |
 | `atb_cpp_llm/src/ops/self_attention_op.cpp` | C++ SelfAttentionOp 创建 |
 | `atb_cpp_llm/src/components/common/self_attention_graph.cpp` | GQA graph builder（含临时 TransdataOp）|
 | `atb_cpp_llm/src/components/common/gqa_attention_builder.cpp` | MHA graph builder（含临时 TransdataOp）|
