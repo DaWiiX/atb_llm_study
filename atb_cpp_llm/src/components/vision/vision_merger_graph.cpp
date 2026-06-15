@@ -25,12 +25,11 @@ Status VisionMergerGraph::Build(const std::string& name,
     s = builder->Init(name, nullptr, in_names, out_names);
     if (s != STATUS_OK) return s;
 
-    auto add_op = [&](OperationHandle&& op_h,
-                      const atb::SVector<std::string>& ins,
-                      const atb::SVector<std::string>& outs) -> Status {
-        if (!op_h) return ERROR_GRAPH_BUILD;
-        return builder->AddOperation(op_h.release(), ins, outs);
-    };
+    if (hidden_size <= 0 || merge_size <= 0) {
+        LOG_ERROR("VisionMergerGraph: hidden_size=%d, merge_size=%d; both must be positive",
+                  hidden_size, merge_size);
+        return ERROR_INVALID_PARAM;
+    }
 
     int32_t merge = merge_size;
     int32_t mer_hs = hidden_size * merge * merge;
@@ -45,17 +44,17 @@ Status VisionMergerGraph::Build(const std::string& name,
                 new_shape.dims[1] = mer_hs;
             }, "ds_flat");
 
-        s = add_op(ops::LayerNormOp::Create(epsilon),
+        s = builder->AddOp(ops::LayerNormOp::Create(epsilon),
                    {"ds_flat", "n_w", "n_b"}, {"normed"});
         if (s != STATUS_OK) return s;
 
         // fc1 -> GELU -> fc2
-        s = add_op(ops::LinearOp::Create(true),
+        s = builder->AddOp(ops::LinearOp::Create(true),
                    {"normed", "f1_w", "f1_b"}, {"fc1_out"});
         if (s != STATUS_OK) return s;
     } else {
         // Main merger: norm first, then reshape
-        s = add_op(ops::LayerNormOp::Create(epsilon),
+        s = builder->AddOp(ops::LayerNormOp::Create(epsilon),
                    {"x", "n_w", "n_b"}, {"normed"});
         if (s != STATUS_OK) return s;
 
@@ -67,18 +66,18 @@ Status VisionMergerGraph::Build(const std::string& name,
             }, "mf");
 
         // fc1 -> GELU -> fc2
-        s = add_op(ops::LinearOp::Create(true),
+        s = builder->AddOp(ops::LinearOp::Create(true),
                    {"mf", "f1_w", "f1_b"}, {"fc1_out"});
         if (s != STATUS_OK) return s;
     }
 
     // GELU activation
-    s = add_op(ops::ActivationOp::MakeGELU(),
+    s = builder->AddOp(ops::ActivationOp::MakeGELU(),
                {"fc1_out"}, {"act_out"});
     if (s != STATUS_OK) return s;
 
     // fc2 Linear
-    s = add_op(ops::LinearOp::Create(true),
+    s = builder->AddOp(ops::LinearOp::Create(true),
                {"act_out", "f2_w", "f2_b"}, {"output"});
     if (s != STATUS_OK) return s;
 

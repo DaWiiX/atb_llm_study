@@ -18,7 +18,7 @@ bool WriteCountedBlob(const char* path, int64_t count,
     std::fwrite(&count, sizeof(int64_t), 1, f);
     std::fwrite(data, 1, bytes, f);
     std::fclose(f);
-    LOG_INFO("Saved %s (%ld values)", path, static_cast<long>(count));
+    LOG_DEBUG("Saved %s (%ld values)", path, static_cast<long>(count));
     return true;
 }
 }  // namespace
@@ -87,7 +87,7 @@ Status MaybeFeedNpuFp16(IRuntime* rt, atb::Tensor& dst_npu,
     Status s = rt->GetAllocator()->CopyToDevice(
         dst_npu, buf.data(), count * sizeof(uint16_t));
     rt->Synchronize();
-    LOG_INFO("CONTROLLED FEED: overwrote tensor with %s (%ld values)",
+    LOG_DEBUG("CONTROLLED FEED: overwrote tensor with %s (%ld values)",
              path, static_cast<long>(count));
     return s;
 }

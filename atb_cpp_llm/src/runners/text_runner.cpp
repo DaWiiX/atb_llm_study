@@ -84,5 +84,28 @@ void MakeCausalMaskFp16(int32_t seq_len, uint16_t* mask_out) {
     }
 }
 
+void MakeCausalMaskNzFp16(int32_t seq_len, uint16_t* mask_out,
+                           int64_t s_pad, int64_t n1) {
+    // Generate causal mask directly in NZ (FRACTAL_NZ) layout.
+    // Shape: [1, n1, s_pad, 16]  where n1 = ceil(seq_len/16), s_pad = n1*16.
+    // NZ[0, col/16, row, col%16] = ND[row][col]
+    //
+    // Only the upper-triangular positions are non-zero (-65504 = masked).
+    // All padding and lower-triangular positions default to zero (attend).
+    const int64_t total = n1 * s_pad * 16;
+    const uint16_t mask_fp16 = atb_llm::Fp32ToFp16(-65504.0f);
+    // Zero-fill everything (padding + lower triangle = attend)
+    std::memset(mask_out, 0, static_cast<size_t>(total) * sizeof(uint16_t));
+    // Write upper-triangular mask positions
+    for (int32_t row = 0; row < seq_len; row++) {
+        for (int32_t col = row + 1; col < seq_len; col++) {  // col > row = masked
+            int64_t block_col = col / 16;
+            int64_t col_in_block = col % 16;
+            int64_t nz_idx = block_col * s_pad * 16 + row * 16 + col_in_block;
+            mask_out[nz_idx] = mask_fp16;
+        }
+    }
+}
+
 } // namespace runners
 } // namespace atb_llm

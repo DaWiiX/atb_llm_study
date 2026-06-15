@@ -19,6 +19,9 @@
  * Run:  ./test_pos_embed_npu_graph
  */
 
+#define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+#include "doctest.h"
+
 #include "atb_llm/types.h"
 #include "atb_llm/runtime.h"
 #include "components/vision/pos_embed_npu_graph.h"
@@ -171,136 +174,17 @@ std::vector<float> Fp16VecToF32(const std::vector<uint16_t>& src) {
     return out;
 }
 
-}  // namespace
-
 // ═════════════════════════════════════════════════════════════════════
-// Run one case: build graph, copy inputs, execute, compare with expected.
-// ═════════════════════════════════════════════════════════════════════
-struct CaseResult {
-    std::string tag;
-    bool ok = false;
-    double cosine = 0.0;
-    float max_abs = 0.0f;
-    int64_t n = 0;
-    int64_t hs = 0;
-    std::string reason;
-};
-
-static CaseResult RunCase(const std::string& tag,
-                          const std::vector<uint16_t>& pos_embed_data,
-                          int64_t num_pos_rows, int64_t vis_hs,
-                          atb_llm::IRuntime* runtime) {
-    CaseResult res; res.tag = tag;
-
-    Bundle b;
-    const std::string bundle_path = "/tmp/posembed_npu_case_" + tag + ".bin";
-    if (!ReadBundle(bundle_path, b)) {
-        res.reason = "missing bundle " + bundle_path;
-        return res;
-    }
-    if (b.vis_hs != vis_hs) {
-        res.reason = "bundle vis_hs mismatch";
-        return res;
-    }
-
-    res.n = b.idx_count;
-    res.hs = vis_hs;
-
-    LOG_INFO("  [%s] N=%ld vis_hs=%ld expected=(%ld,%ld)",
-             tag.c_str(),
-             static_cast<long>(b.idx_count), static_cast<long>(vis_hs),
-             static_cast<long>(b.expected_shape[0]),
-             static_cast<long>(b.expected_shape[1]));
-
-    // ── Build NPU graph ─────────────────────────────────────────
-    atb_llm::OperationHandle graph;
-    atb_llm::Status s = atb_llm::components::PosEmbedInterpGraph::Build(
-        "PosEmbedInterp_" + tag, graph);
-    if (!IS_OK(s) || !graph) {
-        res.reason = "graph build failed";
-        return res;
-    }
-
-    auto* alloc = runtime->GetAllocator();
-    auto* ctx = runtime->GetContext();
-
-    // ── Allocate + upload tensors ───────────────────────────────
-    atb::Tensor pe_npu, idx_npu[4], wt_npu[4], out_npu;
-
-    s = alloc->AllocFloat16(pe_npu, {num_pos_rows, vis_hs});
-    if (!IS_OK(s)) { res.reason = "alloc pe_npu"; return res; }
-    alloc->CopyToDevice(pe_npu, pos_embed_data.data(),
-                        pos_embed_data.size() * sizeof(uint16_t));
-
-    for (int k = 0; k < 4; k++) {
-        s = alloc->AllocInt32(idx_npu[k], {b.idx_count});
-        if (!IS_OK(s)) { res.reason = "alloc idx"; return res; }
-        alloc->CopyToDevice(idx_npu[k], b.idx[k].data(),
-                            b.idx_count * sizeof(int32_t));
-        // wt: shape (N, 1) so ElewiseMul broadcasts over vis_hs
-        s = alloc->AllocFloat16(wt_npu[k], {b.idx_count, 1});
-        if (!IS_OK(s)) { res.reason = "alloc wt"; return res; }
-        alloc->CopyToDevice(wt_npu[k], b.wt[k].data(),
-                            b.idx_count * sizeof(uint16_t));
-    }
-
-    s = alloc->AllocFloat16(out_npu, {b.idx_count, vis_hs});
-    if (!IS_OK(s)) { res.reason = "alloc out"; return res; }
-
-    // ── Execute ──────────────────────────────────────────────────
-    atb::VariantPack vp;
-    vp.inTensors = {pe_npu,
-                    idx_npu[0], idx_npu[1], idx_npu[2], idx_npu[3],
-                    wt_npu[0],  wt_npu[1],  wt_npu[2],  wt_npu[3]};
-    vp.outTensors = {out_npu};
-
-    uint64_t ws_size = 0;
-    atb::Status atb_s = graph.get()->Setup(vp, ws_size, ctx);
-    if (atb_s != atb::NO_ERROR) {
-        res.reason = "Setup failed: " + std::to_string(atb_s);
-        return res;
-    }
-
-    uint8_t* ws_ptr = nullptr;
-    auto __atb_pair_ws = runtime->GetWorkspace(ws_size > 0 ? ws_size : 1); auto& ws = __atb_pair_ws.first; auto& ws_st = __atb_pair_ws.second;
-    if (ws_st == atb_llm::STATUS_OK) ws_ptr = ws;
-
-    atb_s = graph.get()->Execute(vp, ws_ptr, ws_size, ctx);
-    if (atb_s != atb::NO_ERROR) {
-        res.reason = "Execute failed: " + std::to_string(atb_s);
-        return res;
-    }
-    runtime->Synchronize();
-
-    // ── Read back and compare ────────────────────────────────────
-    std::vector<uint16_t> out_fp16(b.idx_count * vis_hs);
-    alloc->CopyToHost(out_fp16.data(), out_npu,
-                      out_fp16.size() * sizeof(uint16_t));
-
-    auto got = Fp16VecToF32(out_fp16);
-    auto exp = Fp16VecToF32(b.expected);
-
-    res.cosine  = CosineSim(got, exp);
-    res.max_abs = MaxAbsDiff(got, exp);
-    res.ok      = (res.cosine >= 0.999);
-
-    LOG_INFO("  [%s] cosine=%.6f  max_abs=%.5f  %s",
-             tag.c_str(), res.cosine, res.max_abs,
-             res.ok ? "PASS" : "FAIL");
-    return res;
-}
-
-// ═════════════════════════════════════════════════════════════════════
-// Host-only Stage A regression test — compares our C++ index/weight
+// Stage A (host-only) regression test — compares our C++ index/weight
 // builder against the values baked into the bundle (which Python produced).
 // This catches Stage A bugs WITHOUT needing the NPU at all.
 // ═════════════════════════════════════════════════════════════════════
-static bool TestStageA(const std::string& tag) {
+void TestStageA(const std::string& tag) {
+    CAPTURE(tag);
+
     Bundle b;
-    if (!ReadBundle("/tmp/posembed_npu_case_" + tag + ".bin", b)) {
-        LOG_ERROR("Stage A [%s]: bundle missing", tag.c_str());
-        return false;
-    }
+    const std::string path = "/tmp/posembed_npu_case_" + tag + ".bin";
+    REQUIRE_MESSAGE(ReadBundle(path, b), "Stage A [" << tag << "]: bundle missing");
 
     std::vector<int32_t> idx_cpp[4];
     std::vector<uint16_t> wt_cpp[4];
@@ -312,14 +196,8 @@ static bool TestStageA(const std::string& tag) {
 
     // Compare lengths
     for (int k = 0; k < 4; k++) {
-        if (idx_cpp[k].size() != b.idx[k].size() ||
-            wt_cpp[k].size()  != b.wt[k].size()) {
-            LOG_ERROR("Stage A [%s] k=%d size mismatch: cpp=%zu/%zu py=%zu/%zu",
-                      tag.c_str(), k,
-                      idx_cpp[k].size(), wt_cpp[k].size(),
-                      b.idx[k].size(),    b.wt[k].size());
-            return false;
-        }
+        CHECK(idx_cpp[k].size() == b.idx[k].size());
+        CHECK(wt_cpp[k].size()  == b.wt[k].size());
     }
 
     // Compare values
@@ -342,62 +220,132 @@ static bool TestStageA(const std::string& tag) {
              static_cast<long>(idx_mism), static_cast<long>(wt_mism), wt_max_diff);
 
     // Indices must be 100% exact. Weights allow a few ULPs of fp16 rounding noise.
-    return (idx_mism == 0) && (wt_max_diff < 1e-3f);
+    CHECK(idx_mism == 0);
+    CHECK(wt_max_diff < 1e-3f);
 }
 
-int main() {
-    LOG_INFO("=== Vision PosEmbed NPU Graph Test ===");
+// ═════════════════════════════════════════════════════════════════════
+// Stage B (NPU graph) — build graph, copy inputs, execute, compare with expected.
+// ═════════════════════════════════════════════════════════════════════
+void RunCase(const std::string& tag) {
+    CAPTURE(tag);
 
-    // ── Stage A regression on a couple of cases ──
-    int passed_a = 0, total_a = 0;
-    for (auto& tag : {std::string("tiny_4x4"), std::string("t1_8x8"),
-                      std::string("224x224"), std::string("416x672"),
-                      std::string("896x896")}) {
-        total_a++;
-        if (TestStageA(tag)) passed_a++;
-    }
-    LOG_INFO("Stage A: %d/%d cases passed", passed_a, total_a);
-
-    // ── Stage B (NPU) — need a runtime ──
-    // Load pos_embed table once
+    // ── Load pos_embed table ────────────────────────────────────
     std::vector<uint16_t> pe_data;
     int64_t pe_rows = 0, vis_hs = 0;
     if (!ReadPosEmbedTable("/tmp/posembed_npu_pos_embed_w.bin",
-                            pe_data, pe_rows, vis_hs)) {
-        LOG_ERROR("Failed to read /tmp/posembed_npu_pos_embed_w.bin — "
-                  "run `python tests/gen_pos_embed_npu_reference.py` first");
-        return 1;
+                           pe_data, pe_rows, vis_hs)) {
+        FAIL_CHECK("pos_embed table missing — "
+                   "run `python tests/gen_pos_embed_npu_reference.py` first");
+        return;
     }
     LOG_INFO("pos_embed table: rows=%ld vis_hs=%ld",
              static_cast<long>(pe_rows), static_cast<long>(vis_hs));
 
-    // Create runtime — only needs (device_id, buffer_size); model dir is
-    // not used because we load pos_embed table directly from /tmp.
-    std::unique_ptr<atb_llm::IRuntime> runtime;
-    auto rt_st = atb_llm::RuntimeImpl::Create(
-        /*device_id=*/0,
-        /*buffer_size=*/2LL * 1024 * 1024 * 1024,
-        runtime);
-    if (rt_st != atb_llm::STATUS_OK || !runtime) {
-        LOG_ERROR("Runtime create failed");
-        return 1;
+    // ── Load case bundle ────────────────────────────────────────
+    Bundle b;
+    const std::string bundle_path = "/tmp/posembed_npu_case_" + tag + ".bin";
+    if (!ReadBundle(bundle_path, b)) {
+        FAIL_CHECK("Stage B [" << tag << "]: bundle missing " << bundle_path);
+        return;
+    }
+    REQUIRE(b.vis_hs == vis_hs);
+
+    int64_t N = b.idx_count;
+
+    LOG_INFO("  [%s] N=%ld vis_hs=%ld expected=(%ld,%ld)",
+             tag.c_str(),
+             static_cast<long>(N), static_cast<long>(vis_hs),
+             static_cast<long>(b.expected_shape[0]),
+             static_cast<long>(b.expected_shape[1]));
+
+    // ── Build NPU graph ─────────────────────────────────────────
+    atb_llm::OperationHandle graph;
+    atb_llm::Status s = atb_llm::components::PosEmbedInterpGraph::Build(
+        "PosEmbedInterp_" + tag, graph);
+    REQUIRE(IS_OK(s));
+    REQUIRE(graph);
+
+    // ── Create runtime ──────────────────────────────────────────
+    auto runtime = atb_llm::CreateRuntime(0, 2LL * 1024 * 1024 * 1024);
+    REQUIRE(runtime);
+
+    auto* alloc = runtime->GetAllocator();
+    auto* ctx = runtime->GetContext();
+
+    // ── Allocate + upload tensors ───────────────────────────────
+    atb::Tensor pe_npu, idx_npu[4], wt_npu[4], out_npu;
+
+    REQUIRE(IS_OK(alloc->AllocFloat16(pe_npu, {pe_rows, vis_hs})));
+    alloc->CopyToDevice(pe_npu, pe_data.data(),
+                        pe_data.size() * sizeof(uint16_t));
+
+    for (int k = 0; k < 4; k++) {
+        REQUIRE(IS_OK(alloc->AllocInt32(idx_npu[k], {N})));
+        alloc->CopyToDevice(idx_npu[k], b.idx[k].data(),
+                            N * sizeof(int32_t));
+        // wt: shape (N, 1) so ElewiseMul broadcasts over vis_hs
+        REQUIRE(IS_OK(alloc->AllocFloat16(wt_npu[k], {N, 1})));
+        alloc->CopyToDevice(wt_npu[k], b.wt[k].data(),
+                            N * sizeof(uint16_t));
     }
 
-    int passed_b = 0, total_b = 0;
-    for (auto& tag : {std::string("tiny_4x4"), std::string("t1_8x8"),
-                      std::string("224x224"), std::string("416x672"),
-                      std::string("896x896")}) {
-        total_b++;
-        auto r = RunCase(tag, pe_data, pe_rows, vis_hs, runtime.get());
-        if (r.ok) passed_b++;
-        if (!r.ok && !r.reason.empty()) {
-            LOG_ERROR("  [%s] error: %s", tag.c_str(), r.reason.c_str());
-        }
-    }
+    REQUIRE(IS_OK(alloc->AllocFloat16(out_npu, {N, vis_hs})));
 
-    LOG_INFO("──────────────────────────────────────────────────");
-    LOG_INFO("Stage A (host-only):  %d/%d", passed_a, total_a);
-    LOG_INFO("Stage B (NPU graph):  %d/%d", passed_b, total_b);
+    // ── Execute ──────────────────────────────────────────────────
+    atb::VariantPack vp;
+    vp.inTensors = {pe_npu,
+                    idx_npu[0], idx_npu[1], idx_npu[2], idx_npu[3],
+                    wt_npu[0],  wt_npu[1],  wt_npu[2],  wt_npu[3]};
+    vp.outTensors = {out_npu};
 
-    return (passed_a == total_a && passed_b == total_b) ? 0 : 1;
+    uint64_t ws_size = 0;
+    atb::Status atb_s = graph.get()->Setup(vp, ws_size, ctx);
+    REQUIRE(atb_s == atb::NO_ERROR);
+
+    uint8_t* ws_ptr = nullptr;
+    auto __atb_pair_ws = runtime->GetWorkspace(ws_size > 0 ? ws_size : 1); auto& ws = __atb_pair_ws.first; auto& ws_st = __atb_pair_ws.second;
+    if (ws_st == atb_llm::STATUS_OK) ws_ptr = ws;
+
+    atb_s = graph.get()->Execute(vp, ws_ptr, ws_size, ctx);
+    REQUIRE(atb_s == atb::NO_ERROR);
+    runtime->Synchronize();
+
+    // ── Read back and compare ────────────────────────────────────
+    std::vector<uint16_t> out_fp16(N * vis_hs);
+    alloc->CopyToHost(out_fp16.data(), out_npu,
+                      out_fp16.size() * sizeof(uint16_t));
+
+    auto got = Fp16VecToF32(out_fp16);
+    auto exp = Fp16VecToF32(b.expected);
+
+    double cosine  = CosineSim(got, exp);
+    float  max_abs = MaxAbsDiff(got, exp);
+
+    LOG_INFO("  [%s] cosine=%.6f  max_abs=%.5f",
+             tag.c_str(), cosine, max_abs);
+
+    CHECK(cosine >= 0.999);
 }
+
+}  // namespace
+
+// ═════════════════════════════════════════════════════════════════════
+// Stage A: host-only index/weight builder regression (no NPU needed)
+// ═════════════════════════════════════════════════════════════════════
+
+TEST_CASE("PosEmbedNPU StageA: tiny_4x4") { TestStageA("tiny_4x4"); }
+TEST_CASE("PosEmbedNPU StageA: t1_8x8")   { TestStageA("t1_8x8"); }
+TEST_CASE("PosEmbedNPU StageA: 224x224")  { TestStageA("224x224"); }
+TEST_CASE("PosEmbedNPU StageA: 416x672")  { TestStageA("416x672"); }
+TEST_CASE("PosEmbedNPU StageA: 896x896")  { TestStageA("896x896"); }
+
+// ═════════════════════════════════════════════════════════════════════
+// Stage B: NPU graph execution and precision validation
+// ═════════════════════════════════════════════════════════════════════
+
+TEST_CASE("PosEmbedNPU StageB: tiny_4x4") { RunCase("tiny_4x4"); }
+TEST_CASE("PosEmbedNPU StageB: t1_8x8")   { RunCase("t1_8x8"); }
+TEST_CASE("PosEmbedNPU StageB: 224x224")  { RunCase("224x224"); }
+TEST_CASE("PosEmbedNPU StageB: 416x672")  { RunCase("416x672"); }
+TEST_CASE("PosEmbedNPU StageB: 896x896")  { RunCase("896x896"); }

@@ -25,34 +25,27 @@ Status VisRopeGraph::Build(const std::string& name, OperationHandle& out) {
     s = builder->Init(name, nullptr, in_names, out_names);
     if (s != STATUS_OK) return s;
 
-    auto add_op = [&](OperationHandle&& op_h,
-                      const atb::SVector<std::string>& ins,
-                      const atb::SVector<std::string>& outs) -> Status {
-        if (!op_h) return ERROR_GRAPH_BUILD;
-        return builder->AddOperation(op_h.release(), ins, outs);
-    };
-
     // ── 2× Gather (axis=0): freq_table[row_idx] / freq_table[col_idx] ──
-    s = add_op(ops::GatherOp::Create(/*axis=*/0, /*batch_dims=*/0),
+    s = builder->AddOp(ops::GatherOp::Create(/*axis=*/0, /*batch_dims=*/0),
                {"freq_table", "row_idx"}, {"row_freq"});
     if (s != STATUS_OK) return s;
-    s = add_op(ops::GatherOp::Create(0, 0),
+    s = builder->AddOp(ops::GatherOp::Create(0, 0),
                {"freq_table", "col_idx"}, {"col_freq"});
     if (s != STATUS_OK) return s;
 
     // ── 2× Concat (axis=1): build [row, col, row, col] over half-dim ──
     // ATB Concat takes exactly 2 inputs, so we stack two operations.
-    s = add_op(ops::ConcatOp::Create(/*concat_dim=*/1),
+    s = builder->AddOp(ops::ConcatOp::Create(/*concat_dim=*/1),
                {"row_freq", "col_freq"}, {"rc"});
     if (s != STATUS_OK) return s;
-    s = add_op(ops::ConcatOp::Create(1),
+    s = builder->AddOp(ops::ConcatOp::Create(1),
                {"rc", "rc"}, {"emb"});
     if (s != STATUS_OK) return s;
 
     // ── Cos / Sin ───────────────────────────────────────────────
-    s = add_op(ops::ElewiseOp::MakeCos(), {"emb"}, {"cos_out"});
+    s = builder->AddOp(ops::ElewiseOp::MakeCos(), {"emb"}, {"cos_out"});
     if (s != STATUS_OK) return s;
-    s = add_op(ops::ElewiseOp::MakeSin(), {"emb"}, {"sin_out"});
+    s = builder->AddOp(ops::ElewiseOp::MakeSin(), {"emb"}, {"sin_out"});
     if (s != STATUS_OK) return s;
 
     out = builder->Build();
@@ -146,6 +139,14 @@ void BuildVisRopeFreqTable(int32_t max_hw, int32_t half,
 }
 
 int32_t MaxGridHW(const int64_t* grid_thw, int64_t num_images) {
+    constexpr int64_t kMaxImages = 256;
+    if (num_images <= 0 || num_images > kMaxImages) {
+        LOG_ERROR("MaxGridHW: invalid num_images=%lld (max=%lld)",
+                  static_cast<long long>(num_images),
+                  static_cast<long long>(kMaxImages));
+        return 0;
+    }
+
     int32_t m = 0;
     for (int64_t img = 0; img < num_images; img++) {
         m = std::max<int32_t>(m, static_cast<int32_t>(grid_thw[img * 3 + 1]));

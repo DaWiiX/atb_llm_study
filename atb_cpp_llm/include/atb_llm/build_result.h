@@ -1,6 +1,6 @@
 #pragma once
 #include "atb_llm/types.h"
-#include "core/raii.h"
+#include "atb_llm/operation_handle.h"
 #include <string>
 #include <vector>
 

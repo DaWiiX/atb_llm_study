@@ -1,6 +1,7 @@
 #pragma once
 #include "atb_llm/types.h"
 #include "atb_llm/runtime.h"
+#include "atb_llm/operation_handle.h"
 #include "atb/graph_op_builder.h"
 #include "core/raii.h"
 #include <string>
@@ -42,6 +43,19 @@ public:
     /// Corresponds to atb::GraphOpBuilder::AddOperation(OpParam, ...).
     template <typename OpParam>
     Status AddOp(const OpParam& param,
+                 const atb::SVector<std::string>& in_names,
+                 const atb::SVector<std::string>& out_names);
+
+    /// Add an operation to the graph from an OperationHandle (RAII wrapper).
+    ///
+    /// Validates the handle, releases ownership, and adds the raw operation
+    /// to the underlying ATB graph builder.
+    ///
+    /// @param op_h       OperationHandle owning the operation (consumed via move)
+    /// @param in_names   Names of input edges
+    /// @param out_names  Names of output edges
+    /// @return Status    ERROR_GRAPH_BUILD if handle is invalid, otherwise result of AddOperation
+    Status AddOp(OperationHandle&& op_h,
                  const atb::SVector<std::string>& in_names,
                  const atb::SVector<std::string>& out_names);
 

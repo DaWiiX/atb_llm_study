@@ -34,10 +34,11 @@
 #include "core/raii.h"
 #include "core/tensor_allocator.h"
 #include "components/text/decoder_layer_graph.h"
+#include "test_mask_helper.h"
 #include "engine/runtime_impl.h"
 #include "utils/float_utils.h"
 #include "log/logger.h"
-#include "util/cpp11_compat.h"
+#include "utils/cpp11_compat.h"
 
 #include <cstdio>
 #include <cstdint>
@@ -166,7 +167,7 @@ float RunDecoderLayer(atb_llm::IRuntime* runtime, const Case& c) {
     REQUIRE(IS_OK(alloc->AllocFloat16(in_cos, {S, hd})));
     REQUIRE(IS_OK(alloc->AllocFloat16(in_sin, {S, hd})));
     if (use_mask) {
-        REQUIRE(IS_OK(alloc->AllocFloat16(in_mask, {S, S})));
+        atb_llm::test::UploadMask(alloc, mask_a.data.data(), S, in_mask);
     }
     REQUIRE(IS_OK(alloc->AllocFloat16(out_t, {S, H})));
 
@@ -180,7 +181,7 @@ float RunDecoderLayer(atb_llm::IRuntime* runtime, const Case& c) {
     upload(in_gw,  gw);  upload(in_uw,  uw);  upload(in_dw, dw);
     upload(in_iln, ilnw); upload(in_pln, plnw);
     upload(in_cos, cos_a); upload(in_sin, sin_a);
-    if (use_mask) upload(in_mask, mask_a);
+    // mask already uploaded via test::UploadMask above
 
     // seqlen: single int32 = S (batch=1)
     int32_t seqlen_val = S;
@@ -259,14 +260,9 @@ TEST_CASE("TextDecoderLayerGraph precision: small no-mask") {
 
 // ═════════════════════════════════════════════════════════════════
 // Case 2: GQA with causal mask (nh=12, kvh=4, hd=64, I=256, S=8)
-// SKIP on 310P: internally uses SelfAttention GQA, not supported.
-// Production inference uses GQA→MHA weight expansion instead.
+// Verified on 310P (GQA supported, NZ mask works — cos=1.0)
 // ═════════════════════════════════════════════════════════════════
 TEST_CASE("TextDecoderLayerGraph precision: GQA with mask") {
-    if (atb_llm::Is310P()) {
-        MESSAGE("Skipping TextDecoderLayerGraph GQA precision test on 310P (GQA→MHA expansion handles this at engine layer)");
-        return;
-    }
     LOG_INFO("=== TextDecoderLayerGraph precision: GQA + mask ===");
 
     ArrayI32 meta;

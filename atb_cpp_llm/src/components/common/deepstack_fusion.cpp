@@ -1,4 +1,5 @@
 #include "components/common/deepstack_fusion.h"
+#include "families/base_model.h"
 #include "utils/float_utils.h"
 #include "core/tensor_allocator.h"
 #include "core/npu_tensor.h"
@@ -85,35 +86,13 @@ Status DeepstackFusion::ExtractFeatures(
     ds_vp.outTensors = {*ds_out.Get()};
 
     // Execute the deepstack merger graph
-    auto* ctx = runtime->GetContext();
     uint64_t ws_size = 0;
-    atb::Status atb_s = deepstack_graph_.get()->Setup(ds_vp, ws_size, ctx);
-    if (atb_s != atb::NO_ERROR) {
-        LOG_ERROR("DeepstackMerger graph Setup failed: %d", static_cast<int>(atb_s));
-        return ERROR_GRAPH_BUILD;
-    }
-
-    uint8_t* ws_ptr = nullptr;
-    if (ws_size > 0) {
-        auto __atb_pair_ws = runtime->GetWorkspace(ws_size); auto& ws = __atb_pair_ws.first; auto& ws_s = __atb_pair_ws.second;
-        ws_ptr = ws;
-        if (ws_s != STATUS_OK || ws_ptr == nullptr) {
-            LOG_ERROR("Failed to get workspace for DeepstackMerger: %zu bytes",
-                      static_cast<size_t>(ws_size));
-            return ERROR_NPU_MEMORY;
-        }
-    } else {
-        auto __atb_pair_ws = runtime->GetWorkspace(1); auto& ws = __atb_pair_ws.first; auto& ws_s = __atb_pair_ws.second;
-        if (ws_s == STATUS_OK && ws != nullptr) {
-            ws_ptr = ws;
-            ws_size = 1;
-        }
-    }
-
-    atb_s = deepstack_graph_.get()->Execute(ds_vp, ws_ptr, ws_size, ctx);
-    if (atb_s != atb::NO_ERROR) {
-        LOG_ERROR("DeepstackMerger %zu execution failed", fusion_idx);
-        return ERROR_INFERENCE;
+    Status st = ExecuteOperation(deepstack_graph_.get(), ds_vp, runtime, ws_size,
+                                 /*sync=*/false);
+    if (st != STATUS_OK) {
+        LOG_ERROR("DeepstackMerger %zu execution failed: status %d",
+                  fusion_idx, static_cast<int>(st));
+        return st;
     }
 
     // Move the NPU-resident output tensor into the caller's collection.
@@ -157,7 +136,6 @@ void DeepstackFusion::InjectFeatures(NpuTensor& hidden_npu,
     }
 
     auto* alloc = runtime->GetAllocator();
-    auto* ctx   = runtime->GetContext();
 
     int64_t n = static_cast<int64_t>(positions.size());
 
@@ -196,24 +174,13 @@ void DeepstackFusion::InjectFeatures(NpuTensor& hidden_npu,
     vp.outTensors = {*hidden_npu.Get()};
 
     uint64_t ws_size = 0;
-    atb::Status atb_s = inject_op_.get()->Setup(vp, ws_size, ctx);
-    if (atb_s != atb::NO_ERROR) {
-        LOG_ERROR("InjectFeatures: IndexAdd Setup failed: %d",
-                  static_cast<int>(atb_s));
+    Status st = ExecuteOperation(inject_op_.get(), vp, runtime, ws_size,
+                                 /*sync=*/true);
+    if (st != STATUS_OK) {
+        LOG_ERROR("InjectFeatures: IndexAdd failed: status %d",
+                  static_cast<int>(st));
         return;
     }
-    uint8_t* ws_ptr = nullptr;
-    auto __atb_pair_ws = runtime->GetWorkspace(ws_size > 0 ? ws_size : 1); auto& ws = __atb_pair_ws.first; auto& ws_st = __atb_pair_ws.second;
-    if (ws_st == STATUS_OK) ws_ptr = ws;
-    atb_s = inject_op_.get()->Execute(vp, ws_ptr, ws_size, ctx);
-    if (atb_s != atb::NO_ERROR) {
-        LOG_ERROR("InjectFeatures: IndexAdd Execute failed: %d",
-                  static_cast<int>(atb_s));
-        return;
-    }
-    // Sync to enforce ordering w.r.t. the next decoder layer that reads
-    // from hidden_npu.
-    runtime->Synchronize();
 }
 
 // ═════════════════════════════════════════════════════════════════════

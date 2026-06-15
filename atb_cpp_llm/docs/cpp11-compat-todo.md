@@ -21,7 +21,7 @@ ATB SDK 自带头文件 `atb/svector.h` 使用了 C++14 才允许的"扩展 cons
 - 保留 `set(CMAKE_CXX_STANDARD_REQUIRED ON)` —— 编译器会拒绝任何 C++15+ 语法，
   这是验收的硬约束。
 
-### 2. 新增 shim 头文件：`src/util/cpp11_compat.h`
+### 2. 新增 shim 头文件：`src/utils/cpp11_compat.h`（原 `src/util/cpp11_compat.h`，已迁移）
 
 提供 C++14+ 才有的若干工具的 shim（命名空间 `atb_llm::`），让代码即使将来
 再降到 C++11 也能用。实际目前在 C++14 模式下编译，shim 与标准库等价但不污染 std。
@@ -93,7 +93,7 @@ shim 仍然可用、零成本，无需回退。如果想拥抱原生标准库：
 3. `s/atb_llm::clamp/std::clamp/g`（仅 `qwen3vl_preprocess.cpp`）
 4. 结构化绑定可选择性还原（`__atb_pair_x` 模式 → `auto [a, b] = ...`），
    但功能等价，没必要批量改回。
-5. 删 `src/util/cpp11_compat.h` 并清理 `#include "util/cpp11_compat.h"`。
+5. ✅ `src/util/cpp11_compat.h` → `src/utils/cpp11_compat.h`（已完成 2026-06-14，19 个引用已更新）
 
 ## 参考
 

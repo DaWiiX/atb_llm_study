@@ -78,5 +78,15 @@ void MakeCausalMask(int32_t seq_len, float* mask_out);
 /// @param mask_out Output: (seq_len, seq_len) fp16 additive mask, pre-allocated
 void MakeCausalMaskFp16(int32_t seq_len, uint16_t* mask_out);
 
+/// Build a causal mask for text attention, directly in NZ (FRACTAL_NZ) layout.
+/// Output shape: [1, n1, s_pad, 16]  where n1 = ceil(seq_len/16), s_pad = n1*16.
+/// Only writes the upper-triangular mask positions; padding is zero-filled.
+/// @param seq_len  Sequence length
+/// @param mask_out Output: NZ-layout fp16 mask, pre-allocated to n1*s_pad*16 elements
+/// @param s_pad    Padded sequence length = ceil(seq_len/16)*16
+/// @param n1       Number of 16-column blocks = ceil(seq_len/16)
+void MakeCausalMaskNzFp16(int32_t seq_len, uint16_t* mask_out,
+                           int64_t s_pad, int64_t n1);
+
 } // namespace runners
 } // namespace atb_llm

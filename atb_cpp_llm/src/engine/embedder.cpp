@@ -1,5 +1,6 @@
 #include "atb_llm/embedder.h"
 #include "log/logger.h"
+#include <cstdlib>
 
 namespace atb_llm {
 
@@ -39,7 +40,22 @@ Status Qwen3VLEmbedder::Load(const std::string& model_dir) {
     EngineConfig cfg;
     cfg.model_dir = model_dir;
     cfg.device_id = 0;
-    cfg.buffer_size = 5ULL * 1024 * 1024 * 1024;
+    const char* env_buf = getenv("ATB_BUFFER_SIZE_GB");
+    if (env_buf) {
+        int64_t gb = std::atoll(env_buf);
+        if (gb > 0) {
+            if (gb > 1024) {
+                LOG_WARN("ATB_BUFFER_SIZE_GB=%ld exceeds max (1024 GiB), capping", static_cast<long>(gb));
+                gb = 1024;
+            }
+            cfg.buffer_size = static_cast<uint64_t>(gb) * 1024 * 1024 * 1024;
+        } else {
+            LOG_WARN("ATB_BUFFER_SIZE_GB=%s is invalid, using default 5 GiB", env_buf);
+        }
+    }
+    if (cfg.buffer_size == 0) {
+        cfg.buffer_size = 5ULL * 1024 * 1024 * 1024;
+    }
     // NOTE: L2 normalization is fixed-true for Qwen3VL embedding by the
     // model config (Qwen3VLConfig::normalize defaults to true and is not
     // exposed through EngineConfig).  An embedder always L2-normalises.

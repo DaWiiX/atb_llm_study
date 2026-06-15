@@ -33,54 +33,14 @@ Status BaseModel::ExecuteGraph(OperationHandle& graph,
                                atb::VariantPack& vp) {
     if (!graph) return ERROR_GRAPH_BUILD;
 
-    auto* ctx = runtime_->GetContext();
-
     uint64_t ws_size = 0;
-    atb::Status atb_s = graph.get()->Setup(vp, ws_size, ctx);
-    if (atb_s != atb::NO_ERROR) {
-        LOG_ERROR("Graph Setup failed: %d", static_cast<int>(atb_s));
-        return ERROR_GRAPH_BUILD;
-    }
-
-    uint8_t* ws_ptr = nullptr;
-    if (ws_size > 0) {
-        auto __atb_pair_ws = runtime_->GetWorkspace(ws_size); auto& ws = __atb_pair_ws.first; auto& ws_s = __atb_pair_ws.second;
-        ws_ptr = ws;
-        if (ws_s != STATUS_OK) {
-            LOG_ERROR("Failed to get workspace: %zu bytes", static_cast<size_t>(ws_size));
-            return ws_s;
-        }
-        if (ws_ptr == nullptr) {
-            LOG_ERROR("Workspace pointer is null despite size=%zu", static_cast<size_t>(ws_size));
-            return ERROR_NPU_MEMORY;
-        }
-    } else {
-        // GRAPH_LAUNCH_MODE requires non-null workspace device pointer
-        auto __atb_pair_ws = runtime_->GetWorkspace(1); auto& ws = __atb_pair_ws.first; auto& ws_s = __atb_pair_ws.second;
-        if (ws_s == STATUS_OK && ws != nullptr) {
-            ws_ptr = ws;
-            ws_size = 1;
-        }
-    }
-
-    atb_s = graph.get()->Execute(vp, ws_ptr, ws_size, ctx);
-    if (atb_s != atb::NO_ERROR) {
-        LOG_ERROR("Graph Execute failed: %d", static_cast<int>(atb_s));
-        return ERROR_INFERENCE;
-    }
 
     // P4: Per-op sync is skipped when ATB_DISABLE_PER_OP_SYNC=1.
     // Stream FIFO ordering guarantees ops are serialised on the same stream;
     // the host only *must* sync before reading device→host copies.
-    if (!PerOpSyncDisabled()) {
-        Status sync_s = runtime_->Synchronize();
-        if (sync_s != STATUS_OK) {
-            LOG_ERROR("Stream sync failed after Execute: %d", static_cast<int>(sync_s));
-            return sync_s;
-        }
-    }
+    bool sync = !PerOpSyncDisabled();
 
-    return STATUS_OK;
+    return ExecuteOperation(graph.get(), vp, runtime_, ws_size, sync);
 }
 
 // ═════════════════════════════════════════════════════════════════════

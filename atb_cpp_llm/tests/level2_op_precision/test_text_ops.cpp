@@ -20,7 +20,7 @@
 #include "core/graph_builder.h"
 #include "core/context_manager.h"
 #include "core/tensor_allocator.h"
-#include "util/cpp11_compat.h"
+#include "utils/cpp11_compat.h"
 #include "ops/linear_op.h"
 #include "ops/rms_norm_op.h"
 #include "ops/elewise_op.h"
@@ -237,26 +237,19 @@ TEST_CASE("SelfAttentionGraph") {
             "TestAttn_Mask", 12, 12, 64, 16, 1e-6f, true, op);
         CHECK(IS_OK(s));
         REQUIRE(op.get() != nullptr);
-        // 11 inputs: +mask
-        CHECK(op.get()->GetInputNum() == 11);
+        // On 310P: 10 inputs (MASK_TYPE_NORM + isTriuMask=1, mask tensor is always present)
+        // On 910B: 11 inputs (+mask)
+        uint32_t expected = 11;
+        CHECK(op.get()->GetInputNum() == expected);
     }
 
-    // GQA: num_kv_heads < num_heads
-    // SKIP on 310P: SelfAttention GQA is not supported on 310P hardware.
-    // The engine layer handles this via GQA→MHA weight expansion at load time,
-    // so production inference is unaffected. This test exists purely to verify
-    // GQA builder plumbing.
-    if (!atb_llm::Is310P())
+    // GQA: num_kv_heads < num_heads (verified on 310P, cos=1.0)
     {
         atb_llm::OperationHandle op;
         atb_llm::Status s = atb_llm::components::SelfAttentionGraph::Build(
             "TestAttn_GQA", 12, 2, 64, 16, 1e-6f, false, op);
         CHECK(IS_OK(s));
         CHECK(op.get() != nullptr);
-    }
-    else
-    {
-        MESSAGE("Skipping GQA SelfAttentionGraph build test on 310P (GQA→MHA expansion handles this at engine layer)");
     }
 
     LOG_INFO("SelfAttentionGraph test done");
@@ -287,11 +280,13 @@ TEST_CASE("TextDecoderLayerGraph") {
             "TestDecoderLayer_Mask", 12, 12, 64, 16, 1e-6f, true, op);
         CHECK(IS_OK(s));
         REQUIRE(op.get() != nullptr);
-        CHECK(op.get()->GetInputNum() == 16);
+        // On 310P: 15 inputs (MASK_TYPE_NORM + isTriuMask=1, mask tensor is always present)
+        // On 910B: 16 inputs (+mask)
+        uint32_t expected = 16;
+        CHECK(op.get()->GetInputNum() == expected);
     }
 
-    // GQA (skipped on 310P — SelfAttention GQA is unsupported)
-    if (!atb_llm::Is310P())
+    // GQA (verified on 310P, cos=1.0)
     {
         atb_llm::OperationHandle op;
         atb_llm::Status s = atb_llm::components::text::TextDecoderLayerGraph::Build(

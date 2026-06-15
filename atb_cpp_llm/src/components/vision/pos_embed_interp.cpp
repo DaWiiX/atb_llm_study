@@ -26,8 +26,8 @@ void ComputePosEmbedInterp(const uint16_t* pos_embed_src,
 
         for (int64_t hi = 0; hi < h; hi++) {
             for (int64_t wi = 0; wi < w; wi++) {
-                float fy = static_cast<float>(hi) * (num_grid - 1) / (h - 1);
-                float fx = static_cast<float>(wi) * (num_grid - 1) / (w - 1);
+                float fy = (h <= 1) ? 0.0f : static_cast<float>(hi) * (num_grid - 1) / (h - 1);
+                float fx = (w <= 1) ? 0.0f : static_cast<float>(wi) * (num_grid - 1) / (w - 1);
 
                 int32_t y0 = static_cast<int32_t>(fy);
                 int32_t x0 = static_cast<int32_t>(fx);

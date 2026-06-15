@@ -6,13 +6,15 @@
 // 命名与 std:: 对齐但放在 atb_llm 命名空间下，避免污染 std。
 //
 // 使用方式：
-//   #include "util/cpp11_compat.h"
+//   #include "utils/cpp11_compat.h"
 //   auto p = atb_llm::make_unique<Foo>(a, b);
 //
-// 将来若升级到 C++14+，可以全局把 atb_llm::make_unique 替换回
-// std::make_unique，无其他副作用。
+// Provides C++14/17 backports for C++11 compatibility. Used project-wide
+// instead of std::make_unique for consistency.
 
 #pragma once
+
+#include "atb_llm/operation_handle.h"
 
 #include <cstddef>
 #include <memory>
@@ -41,19 +43,6 @@ make_unique(std::size_t n) {
 template <typename T, typename... Args>
 typename std::enable_if<std::extent<T>::value != 0, void>::type
 make_unique(Args&&...) = delete;
-
-// ─────────────────────────────────────────────────────────────
-// std::exchange (C++14) 等价实现。
-//
-// 用 obj 当前值返回，并把 obj 设为 new_value。常用于 move 构造/
-// move 赋值里把源对象置空。
-// ─────────────────────────────────────────────────────────────
-template <typename T, typename U = T>
-T exchange(T& obj, U&& new_value) {
-    T old_value = std::move(obj);
-    obj = std::forward<U>(new_value);
-    return old_value;
-}
 
 // ─────────────────────────────────────────────────────────────
 // std::clamp (C++17) 等价实现。

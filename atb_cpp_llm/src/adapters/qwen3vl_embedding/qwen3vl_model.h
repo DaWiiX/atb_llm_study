@@ -42,7 +42,12 @@ public:
 
     // IModel interface
     Status Load(const std::string& model_dir, IRuntime* runtime) override;
+    /// @note Not thread-safe. Forward() must be called from a single thread
+    /// due to non-synchronized access to text model input caches
+    /// (cached_text_seq_len_, cached_mask_npu_, cached_cos_npu_,
+    /// cached_sin_npu_). See cache fields documentation for details.
     Status Forward(const InferRequest& request, InferResult& result) override;
+    /// @note Not thread-safe. See Forward() documentation.
     Status ForwardWithTiming(const InferRequest& request,
                               InferResult& result,
                               StageTimings& timings) override;
@@ -86,6 +91,9 @@ private:
 
     // ── Text model input cache (P0: avoid regenerating mask/cos/sin
     //     when seq_len hasn't changed across forward calls) ──
+    /// @warning These cache fields are NOT thread-safe. Forward() must be
+    /// called from a single thread, or access must be serialized externally.
+    /// Concurrent Forward() calls may cause data races on cache regeneration.
     int32_t cached_text_seq_len_ = -1;
     NpuTensor cached_mask_npu_;
     NpuTensor cached_cos_npu_;

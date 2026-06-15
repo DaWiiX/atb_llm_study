@@ -9,8 +9,7 @@ namespace atb_llm {
 
 /// Manages ACL initialization, ATB Context, and Stream lifecycle.
 /// RAII: destructor automatically cleans up Context, Stream, and ACL.
-/// Use the static Create() factory method -- the constructor is private
-/// to prevent partially-initialized objects on construction failure.
+/// Use the static Create() factory method for full initialization.
 class ContextManager {
 public:
     ~ContextManager();

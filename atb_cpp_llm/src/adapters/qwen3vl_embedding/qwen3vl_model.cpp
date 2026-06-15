@@ -7,7 +7,7 @@
 #include "core/debug_dump.h"
 #include "io/weight_helpers.h"
 #include "log/logger.h"
-#include "util/cpp11_compat.h"
+#include "utils/cpp11_compat.h"
 #include <chrono>
 #include <cstring>
 #include <cmath>
@@ -31,6 +31,60 @@ bool SkipTimingSyncs() {
     const char* env = getenv("ATB_SKIP_TIMING_SYNCS");
     return env != nullptr;
 }
+
+// ═════════════════════════════════════════════════════════════════════
+// Debug dump helpers — consolidated call sites for readability.
+// All are no-ops when ATB_DEBUG_VISION env var is unset.
+// ═════════════════════════════════════════════════════════════════════
+
+void DebugDumpVisionRoPE(IRuntime* rt,
+                         const atb::Tensor& cos, const atb::Tensor& sin,
+                         int64_t count) {
+    debug::DumpNpuFp16(rt, cos, count, "/tmp/cpp_rope_cos.bin");
+    debug::DumpNpuFp16(rt, sin, count, "/tmp/cpp_rope_sin.bin");
+}
+
+void DebugDumpFirstLayer(IRuntime* rt, const atb::Tensor& h,
+                         int64_t count) {
+    debug::DumpNpuFp16(rt, h, count, "/tmp/cpp_first_layer_out.bin");
+}
+
+void DebugMaybeFeedFirstLayer(IRuntime* rt, atb::Tensor& h,
+                              int64_t count) {
+    debug::MaybeFeedNpuFp16(rt, h, count, "/tmp/diag_first_layer_out.bin");
+}
+
+void DebugDumpBlock1(IRuntime* rt, const atb::Tensor& h,
+                     int64_t count) {
+    debug::DumpNpuFp16(rt, h, count, "/tmp/cpp_block_1_out.bin");
+}
+
+void DebugDumpBlockOutputs(IRuntime* rt, const atb::Tensor& h,
+                           int32_t li, int64_t count,
+                           int32_t vis_depth,
+                           const std::vector<int32_t>& deepstack_indices) {
+    if (!debug::VisionDumpEnabled()) return;
+    bool is_ds = false;
+    for (auto di : deepstack_indices) {
+        if (li == di) { is_ds = true; break; }
+    }
+    if (is_ds || li == vis_depth - 1) {
+        char path[256];
+        std::snprintf(path, sizeof(path), "/tmp/cpp_block_%d_out.bin", li);
+        debug::DumpNpuFp16(rt, h, count, path);
+    }
+}
+
+void DebugDumpTextInputs(const uint16_t* embeds, int64_t embed_count,
+                         const int64_t* pos_ids, int64_t pos_count) {
+    debug::DumpHostFp16(embeds, embed_count, "/tmp/cpp_inputs_embeds.bin");
+    debug::DumpHostInt64(pos_ids, pos_count, "/tmp/cpp_position_ids.bin");
+}
+
+void DebugDumpMerged(const uint16_t* data, int64_t count) {
+    debug::DumpHostFp16(data, count, "/tmp/cpp_vision_merged.bin");
+}
+
 }  // namespace
 
 Qwen3VLModel::Qwen3VLModel() = default;
@@ -75,107 +129,7 @@ Status Qwen3VLModel::Load(const std::string& model_dir, IRuntime* runtime) {
         }
     }
 
-    // 2c. 310P GQA→MHA weight expansion.
-    //     310P SelfAttention may not support GQA (kv_head_num < head_num).
-    //     Expand K/V/K-norm weights so the graph uses MHA (same as vision path).
-    if (Is310P() && config_.text_num_kv_heads < config_.text_num_heads) {
-        int32_t nh = config_.text_num_heads;
-        int32_t kv_nh = config_.text_num_kv_heads;
-        int32_t hd = config_.text_head_dim;
-        int32_t ratio = nh / kv_nh;
-        LOG_INFO("310P: Expanding GQA→MHA: nh=%d kv_nh=%d ratio=%d hd=%d",
-                 nh, kv_nh, ratio, hd);
-
-        auto* alloc = runtime_->GetAllocator();
-        for (int32_t i = 0; i < config_.text_num_layers; i++) {
-            auto& lw = weights_.text_layers[i];
-
-            // k_weight: (kv_nh*hd, hidden) → (nh*hd, hidden)
-            {
-                int64_t old_rows = lw.k_weight.desc.shape.dims[0];  // kv_nh * hd
-                int64_t hidden = lw.k_weight.desc.shape.dims[1];
-                size_t old_elems = static_cast<size_t>(old_rows * hidden);
-
-                std::vector<uint16_t> k_old(old_elems);
-                s = alloc->CopyToHost(k_old.data(), lw.k_weight,
-                                      old_elems * sizeof(uint16_t));
-                if (s != STATUS_OK) return s;
-
-                std::vector<uint16_t> k_new(nh * hd * hidden);
-                for (int32_t h = 0; h < nh; h++) {
-                    int32_t src_h = h / ratio;
-                    std::memcpy(k_new.data() + h * hd * hidden,
-                                k_old.data() + src_h * hd * hidden,
-                                hd * hidden * sizeof(uint16_t));
-                }
-
-                s = alloc->AllocFloat16(lw.k_weight, {nh * hd, hidden});
-                if (s != STATUS_OK) return s;
-                s = alloc->CopyToDevice(lw.k_weight, k_new.data(),
-                                        k_new.size() * sizeof(uint16_t));
-                if (s != STATUS_OK) return s;
-            }
-
-            // v_weight: (kv_nh*hd, hidden) → (nh*hd, hidden)
-            {
-                int64_t old_rows = lw.v_weight.desc.shape.dims[0];
-                int64_t hidden = lw.v_weight.desc.shape.dims[1];
-                size_t old_elems = static_cast<size_t>(old_rows * hidden);
-
-                std::vector<uint16_t> v_old(old_elems);
-                s = alloc->CopyToHost(v_old.data(), lw.v_weight,
-                                      old_elems * sizeof(uint16_t));
-                if (s != STATUS_OK) return s;
-
-                std::vector<uint16_t> v_new(nh * hd * hidden);
-                for (int32_t h = 0; h < nh; h++) {
-                    int32_t src_h = h / ratio;
-                    std::memcpy(v_new.data() + h * hd * hidden,
-                                v_old.data() + src_h * hd * hidden,
-                                hd * hidden * sizeof(uint16_t));
-                }
-
-                s = alloc->AllocFloat16(lw.v_weight, {nh * hd, hidden});
-                if (s != STATUS_OK) return s;
-                s = alloc->CopyToDevice(lw.v_weight, v_new.data(),
-                                        v_new.size() * sizeof(uint16_t));
-                if (s != STATUS_OK) return s;
-            }
-
-            // k_norm_weight: (hd,) or (kv_nh*hd,) → (nh*hd,)
-            {
-                int64_t kn_dim0 = lw.k_norm_weight.desc.shape.dims[0];
-                int64_t kn_elems = kn_dim0;
-                // If per-kv-group (kv_nh*hd,), expand to (nh*hd,)
-                if (kn_elems == kv_nh * hd) {
-                    std::vector<uint16_t> kn_old(kn_elems);
-                    s = alloc->CopyToHost(kn_old.data(), lw.k_norm_weight,
-                                          kn_elems * sizeof(uint16_t));
-                    if (s != STATUS_OK) return s;
-
-                    std::vector<uint16_t> kn_new(nh * hd);
-                    for (int32_t h = 0; h < nh; h++) {
-                        int32_t src_h = h / ratio;
-                        std::memcpy(kn_new.data() + h * hd,
-                                    kn_old.data() + src_h * hd,
-                                    hd * sizeof(uint16_t));
-                    }
-
-                    s = alloc->AllocFloat16(lw.k_norm_weight, {nh * hd});
-                    if (s != STATUS_OK) return s;
-                    s = alloc->CopyToDevice(lw.k_norm_weight, kn_new.data(),
-                                            kn_new.size() * sizeof(uint16_t));
-                    if (s != STATUS_OK) return s;
-                }
-                // else: per-head (hd,) — already correct for MHA, no expansion needed
-            }
-        }
-
-        // Update effective head count so graph uses MHA
-        config_.text_num_kv_heads = config_.text_num_heads;
-    }
-
-    // 2d. Upload pos_embed to NPU + build the interp graph (one-time cost).
+    // 2c. Upload pos_embed to NPU + build the interp graph (one-time cost).
     // The graph is shape-agnostic; runtime tensors carry the actual N.
     {
         int64_t num_pos = config_.vis_num_position_embeddings;
@@ -363,6 +317,10 @@ Status Qwen3VLModel::ForwardWithTiming(const InferRequest& request,
         // ── Stage: Vision Pos Embed + RoPE ─────────────────────
         // PosEmbed: computed directly on NPU via the interp graph.
         NpuTensor pos_npu = AllocNpuFloat16({np, vis_hs});
+        if (!pos_npu) {
+            LOG_ERROR("ForwardWithTiming: alloc vision pos NPU tensor failed");
+            return ERROR_NPU_MEMORY;
+        }
         Status pe_s = ComputePosEmbedNpu(grid_thw_host.data(), num_images,
                                           np, *pos_npu.Get());
         if (pe_s != STATUS_OK) return pe_s;
@@ -370,7 +328,15 @@ Status Qwen3VLModel::ForwardWithTiming(const InferRequest& request,
         // VisionRoPE cos/sin: computed on NPU.
         // total_tokens = np (= sum over images of T*H*W)
         NpuTensor cos_npu = AllocNpuFloat16({np, static_cast<int64_t>(vis_hd)});
+        if (!cos_npu) {
+            LOG_ERROR("ForwardWithTiming: alloc vision cos NPU tensor failed");
+            return ERROR_NPU_MEMORY;
+        }
         NpuTensor sin_npu = AllocNpuFloat16({np, static_cast<int64_t>(vis_hd)});
+        if (!sin_npu) {
+            LOG_ERROR("ForwardWithTiming: alloc vision sin NPU tensor failed");
+            return ERROR_NPU_MEMORY;
+        }
         int64_t total_tokens = ComputeVisionRopeNpu(
             grid_thw_host.data(), num_images, *cos_npu.Get(), *sin_npu.Get());
         if (total_tokens < 0 || total_tokens != np) {
@@ -380,10 +346,8 @@ Status Qwen3VLModel::ForwardWithTiming(const InferRequest& request,
         }
 
         // DEBUG: Save RoPE cos/sin for comparison with Python
-        debug::DumpNpuFp16(runtime_, *cos_npu.Get(), total_tokens * vis_hd,
-                           "/tmp/cpp_rope_cos.bin");
-        debug::DumpNpuFp16(runtime_, *sin_npu.Get(), total_tokens * vis_hd,
-                           "/tmp/cpp_rope_sin.bin");
+        DebugDumpVisionRoPE(runtime_, *cos_npu.Get(), *sin_npu.Get(),
+                            total_tokens * vis_hd);
 
         // Synchronize to capture true GPU time for pos_embed + RoPE.
         // Without this, the NPU time leaks into vision_model_ms.
@@ -401,6 +365,10 @@ Status Qwen3VLModel::ForwardWithTiming(const InferRequest& request,
         size_t pixel_bytes = static_cast<size_t>(flat_elements) * sizeof(uint16_t);
 
         NpuTensor pixels_npu = AllocNpuFloat16({flat_elements});
+        if (!pixels_npu) {
+            LOG_ERROR("ForwardWithTiming: alloc vision pixels NPU tensor failed");
+            return ERROR_NPU_MEMORY;
+        }
         alloc->CopyToDevice(*pixels_npu.Get(), pv, pixel_bytes);
 
         atb::Tensor vis_seqlen;
@@ -415,6 +383,10 @@ Status Qwen3VLModel::ForwardWithTiming(const InferRequest& request,
         // ── Vision sub-stage: FirstLayer (patch_embed + pos_embed + block 0) ──
         auto t_v_first = std::chrono::high_resolution_clock::now();
         NpuTensor h_npu = AllocNpuFloat16({total_tokens, vis_hs});
+        if (!h_npu) {
+            LOG_ERROR("ForwardWithTiming: alloc vision first layer out NPU tensor failed");
+            return ERROR_NPU_MEMORY;
+        }
         {
             const auto& bw = weights_.vis_blocks[0];
             atb::VariantPack vp;
@@ -431,8 +403,7 @@ Status Qwen3VLModel::ForwardWithTiming(const InferRequest& request,
         }
 
         // DEBUG: Save first layer output
-        debug::DumpNpuFp16(runtime_, *h_npu.Get(), total_tokens * vis_hs,
-                           "/tmp/cpp_first_layer_out.bin");
+        DebugDumpFirstLayer(runtime_, *h_npu.Get(), total_tokens * vis_hs);
 
         // ── Vision sub-stage: Blocks 1..(depth-1) + Deepstack extraction ──
         auto t_v_blocks = std::chrono::high_resolution_clock::now();
@@ -443,6 +414,10 @@ Status Qwen3VLModel::ForwardWithTiming(const InferRequest& request,
         for (int32_t li = 1; li < config_.vis_depth; li++) {
             const auto& bw = weights_.vis_blocks[li];
             NpuTensor h_out = AllocNpuFloat16({total_tokens, vis_hs});
+            if (!h_out) {
+                LOG_ERROR("ForwardWithTiming: alloc vision block %d out NPU tensor failed", li);
+                return ERROR_NPU_MEMORY;
+            }
             atb::VariantPack vp;
             vp.inTensors = {
                 *h_npu.Get(),
@@ -456,18 +431,10 @@ Status Qwen3VLModel::ForwardWithTiming(const InferRequest& request,
             h_npu = std::move(h_out);
 
             // DEBUG: Save block output at deepstack layers and last block
-            if (debug::VisionDumpEnabled()) {
-                bool is_ds = false;
-                for (auto di : config_.vis_deepstack_visual_indexes) {
-                    if (li == di) { is_ds = true; break; }
-                }
-                if (is_ds || li == config_.vis_depth - 1) {
-                    char path[256];
-                    std::snprintf(path, sizeof(path), "/tmp/cpp_block_%d_out.bin", li);
-                    debug::DumpNpuFp16(runtime_, *h_npu.Get(),
-                                       total_tokens * vis_hs, path);
-                }
-            }
+            DebugDumpBlockOutputs(runtime_, *h_npu.Get(), li,
+                                  total_tokens * vis_hs,
+                                  config_.vis_depth,
+                                  config_.vis_deepstack_visual_indexes);
 
             size_t fusion_idx = 0;
             if (deepstack_fusion_->IsDeepstackLayer(li, fusion_idx)) {
@@ -488,6 +455,10 @@ Status Qwen3VLModel::ForwardWithTiming(const InferRequest& request,
         {
             const auto& mw = weights_.merger;
             NpuTensor merged_out = AllocNpuFloat16({merged_tokens, vis_embed_dim});
+            if (!merged_out) {
+                LOG_ERROR("ForwardWithTiming: alloc vision merger out NPU tensor failed");
+                return ERROR_NPU_MEMORY;
+            }
             atb::VariantPack vp;
             vp.inTensors = {
                 *h_npu.Get(),
@@ -511,7 +482,7 @@ Status Qwen3VLModel::ForwardWithTiming(const InferRequest& request,
             t_vis_model - t_prev).count();
         t_prev = t_vis_model;
 
-        LOG_INFO("  [Vision detail] FirstLayer: %.2f ms | Blocks(1..%d): %.2f ms | Merger+D2H: %.2f ms",
+        LOG_DEBUG("  [Vision detail] FirstLayer: %.2f ms | Blocks(1..%d): %.2f ms | Merger+D2H: %.2f ms",
                  v_first_ms, config_.vis_depth - 1, v_blocks_ms, v_merger_ms);
 
         // Inject vision tokens into text embeddings
@@ -541,33 +512,64 @@ Status Qwen3VLModel::ForwardWithTiming(const InferRequest& request,
                              config_.vis_spatial_merge_size, position_ids.data());
 
     // DEBUG: Save inputs_embeds and position_ids for comparison with Python
-    debug::DumpHostFp16(inputs_embeds.data(), seq_len * hidden_size,
-                        "/tmp/cpp_inputs_embeds.bin");
-    debug::DumpHostInt64(position_ids.data(), 3 * seq_len,
-                         "/tmp/cpp_position_ids.bin");
+    DebugDumpTextInputs(inputs_embeds.data(), seq_len * hidden_size,
+                        position_ids.data(), 3 * seq_len);
     // ── P0: MRoPE cos/sin + Causal mask — direct fp16 + NPU cache ──
     // When seq_len is unchanged across calls, reuse the cached NPU tensors
     // to avoid regeneration + H2D upload (saves ~212ms at S=4096).
-    bool cache_hit = (seq_len == cached_text_seq_len_ && cached_mask_npu_);
+    // On 310P, SelfAttention uses MASK_TYPE_CAUSAL (no external mask tensor)
+    // so mask generation and caching are skipped.
+    bool cache_hit = (seq_len == cached_text_seq_len_ && cached_cos_npu_);
     if (!cache_hit) {
         // Generate cos/sin directly in fp16 (skip fp32 intermediate)
         std::vector<uint16_t> cos16(seq_len * hd);
         std::vector<uint16_t> sin16(seq_len * hd);
         mrope_->ComputeFp16(position_ids.data(), 1, seq_len,
                             cos16.data(), sin16.data());
-        // Generate causal mask directly in fp16 (skip fp32 intermediate)
-        std::vector<uint16_t> m16(static_cast<size_t>(seq_len) * seq_len);
-        runners::MakeCausalMaskFp16(seq_len, m16.data());
         // Upload to NPU and cache
         cached_cos_npu_ = AllocNpuFloat16({seq_len, hd});
+        if (!cached_cos_npu_) {
+            LOG_ERROR("ForwardWithTiming: alloc cached cos NPU tensor failed");
+            return ERROR_NPU_MEMORY;
+        }
         alloc->CopyToDevice(*cached_cos_npu_.Get(), cos16.data(),
                             static_cast<size_t>(seq_len) * hd * sizeof(uint16_t));
         cached_sin_npu_ = AllocNpuFloat16({seq_len, hd});
+        if (!cached_sin_npu_) {
+            LOG_ERROR("ForwardWithTiming: alloc cached sin NPU tensor failed");
+            return ERROR_NPU_MEMORY;
+        }
         alloc->CopyToDevice(*cached_sin_npu_.Get(), sin16.data(),
                             static_cast<size_t>(seq_len) * hd * sizeof(uint16_t));
-        cached_mask_npu_ = AllocNpuFloat16({seq_len, seq_len});
-        alloc->CopyToDevice(*cached_mask_npu_.Get(), m16.data(),
-                            static_cast<size_t>(seq_len) * seq_len * sizeof(uint16_t));
+        // Generate causal mask in platform-correct format
+        if (Is310P()) {
+            // 310P PA_ENCODER requires NZ (FRACTAL_NZ) format mask.
+            // Generate directly in NZ layout — no intermediate ND array.
+            int64_t s_pad = ((seq_len + 15) / 16) * 16;
+            int64_t n1    = (seq_len + 15) / 16;
+            int64_t nz_elems = n1 * s_pad * 16;
+            std::vector<uint16_t> m16_nz(static_cast<size_t>(nz_elems));
+            runners::MakeCausalMaskNzFp16(seq_len, m16_nz.data(), s_pad, n1);
+            cached_mask_npu_ = AllocNpuFloat16({1, n1, s_pad, 16});
+            if (!cached_mask_npu_) {
+                LOG_ERROR("ForwardWithTiming: alloc cached mask NPU tensor (NZ) failed");
+                return ERROR_NPU_MEMORY;
+            }
+            cached_mask_npu_.Get()->desc.format = ACL_FORMAT_FRACTAL_NZ;
+            alloc->CopyToDevice(*cached_mask_npu_.Get(), m16_nz.data(),
+                                static_cast<size_t>(nz_elems) * sizeof(uint16_t));
+        } else {
+            // 910B: standard ND causal mask
+            std::vector<uint16_t> m16(static_cast<size_t>(seq_len) * seq_len);
+            runners::MakeCausalMaskFp16(seq_len, m16.data());
+            cached_mask_npu_ = AllocNpuFloat16({seq_len, seq_len});
+            if (!cached_mask_npu_) {
+                LOG_ERROR("ForwardWithTiming: alloc cached mask NPU tensor (ND) failed");
+                return ERROR_NPU_MEMORY;
+            }
+            alloc->CopyToDevice(*cached_mask_npu_.Get(), m16.data(),
+                                static_cast<size_t>(seq_len) * seq_len * sizeof(uint16_t));
+        }
         cached_text_seq_len_ = seq_len;
     }
 
@@ -582,6 +584,10 @@ Status Qwen3VLModel::ForwardWithTiming(const InferRequest& request,
     {
         int64_t n = seq_len;
         NpuTensor h_npu = AllocNpuFloat16({n, hidden_size});
+        if (!h_npu) {
+            LOG_ERROR("ForwardWithTiming: alloc text hidden NPU tensor failed");
+            return ERROR_NPU_MEMORY;
+        }
         alloc->CopyToDevice(*h_npu.Get(), inputs_embeds.data(),
                             static_cast<size_t>(n) * hidden_size * sizeof(uint16_t));
         atb::Tensor seqlen;
@@ -603,7 +609,13 @@ Status Qwen3VLModel::ForwardWithTiming(const InferRequest& request,
         for (int32_t li = 0; li < config_.text_num_layers; li++) {
             const auto& lw = weights_.text_layers[li];
             NpuTensor h_out = AllocNpuFloat16({n, hidden_size});
+            if (!h_out) {
+                LOG_ERROR("ForwardWithTiming: alloc text layer %d out NPU tensor failed", li);
+                return ERROR_NPU_MEMORY;
+            }
             atb::VariantPack vp;
+            // All platforms use MASK_TYPE_NORM with external mask tensor.
+            // 310P additionally sets isTriuMask=1 inside SelfAttentionOp::Create().
             vp.inTensors = {*h_npu.Get(),
                             lw.q_weight, lw.k_weight, lw.v_weight, lw.o_weight,
                             lw.q_norm_weight, lw.k_norm_weight,
@@ -629,6 +641,10 @@ Status Qwen3VLModel::ForwardWithTiming(const InferRequest& request,
             t_t_norm - t_t_layers).count();
 
         NpuTensor norm_out = AllocNpuFloat16({n, hidden_size});
+        if (!norm_out) {
+            LOG_ERROR("ForwardWithTiming: alloc text norm out NPU tensor failed");
+            return ERROR_NPU_MEMORY;
+        }
         atb::VariantPack nvp;
         nvp.inTensors = {*h_npu.Get(), weights_.text_norm_weight};
         nvp.outTensors = {*norm_out.Get()};
@@ -646,7 +662,7 @@ Status Qwen3VLModel::ForwardWithTiming(const InferRequest& request,
         t_text_model - t_prev).count();
     t_prev = t_text_model;
 
-    LOG_INFO("  [Text detail] H2D prep: %.2f ms | %d layers: %.2f ms (avg %.3f/layer) | Norm+D2H: %.2f ms",
+    LOG_DEBUG("  [Text detail] H2D prep: %.2f ms | %d layers: %.2f ms (avg %.3f/layer) | Norm+D2H: %.2f ms",
              t_h2d_ms, config_.text_num_layers, t_layers_ms,
              t_layers_ms / config_.text_num_layers, t_norm_ms);
 
@@ -691,6 +707,10 @@ Status Qwen3VLModel::RunVision(const uint16_t* pixel_values, int64_t num_patches
 
     // 1. Compute position embeddings on NPU via the interp graph.
     NpuTensor pos_npu = AllocNpuFloat16({num_patches, vis_hs});
+    if (!pos_npu) {
+        LOG_ERROR("RunVision: alloc vision pos NPU tensor failed");
+        return ERROR_NPU_MEMORY;
+    }
     Status pe_s = ComputePosEmbedNpu(grid_thw, num_images,
                                       num_patches, *pos_npu.Get());
     if (pe_s != STATUS_OK) return pe_s;
@@ -698,7 +718,15 @@ Status Qwen3VLModel::RunVision(const uint16_t* pixel_values, int64_t num_patches
     // 2. Compute vision RoPE cos/sin on NPU.
     // VisionRoPE outputs (total_tokens, vis_hd) — dim*2 = half*4 = vis_hd
     NpuTensor cos_npu = AllocNpuFloat16({num_patches, static_cast<int64_t>(vis_hd)});
+    if (!cos_npu) {
+        LOG_ERROR("RunVision: alloc vision cos NPU tensor failed");
+        return ERROR_NPU_MEMORY;
+    }
     NpuTensor sin_npu = AllocNpuFloat16({num_patches, static_cast<int64_t>(vis_hd)});
+    if (!sin_npu) {
+        LOG_ERROR("RunVision: alloc vision sin NPU tensor failed");
+        return ERROR_NPU_MEMORY;
+    }
     int64_t total_tokens = ComputeVisionRopeNpu(
         grid_thw, num_images, *cos_npu.Get(), *sin_npu.Get());
     if (total_tokens < 0 || total_tokens != num_patches) {
@@ -708,10 +736,8 @@ Status Qwen3VLModel::RunVision(const uint16_t* pixel_values, int64_t num_patches
     }
 
     // DEBUG: Save RoPE cos/sin for comparison with Python
-    debug::DumpNpuFp16(runtime_, *cos_npu.Get(), total_tokens * vis_hd,
-                       "/tmp/cpp_rope_cos.bin");
-    debug::DumpNpuFp16(runtime_, *sin_npu.Get(), total_tokens * vis_hd,
-                       "/tmp/cpp_rope_sin.bin");
+    DebugDumpVisionRoPE(runtime_, *cos_npu.Get(), *sin_npu.Get(),
+                        total_tokens * vis_hd);
 
     // 3. Copy vision inputs to NPU (pos_npu/cos_npu/sin_npu already done)
     int64_t patch_dim = static_cast<int64_t>(config_.vis_in_channels) *
@@ -723,6 +749,10 @@ Status Qwen3VLModel::RunVision(const uint16_t* pixel_values, int64_t num_patches
     // PatchEmbed graph expects 1D flat input: (N * patch_dim,)
     // Its Reshape divides by kernel_size to recover N
     NpuTensor pixels_npu = AllocNpuFloat16({flat_elements});
+    if (!pixels_npu) {
+        LOG_ERROR("RunVision: alloc vision pixels NPU tensor failed");
+        return ERROR_NPU_MEMORY;
+    }
     alloc->CopyToDevice(*pixels_npu.Get(), pixel_values, pixel_bytes);
 
     // Seqlen for vision (host-side int32, not NPU-allocated)
@@ -737,6 +767,10 @@ Status Qwen3VLModel::RunVision(const uint16_t* pixel_values, int64_t num_patches
 
     // 4. Run FirstLayer (patch_embed + pos_embed + block 0)
     NpuTensor h_npu = AllocNpuFloat16({total_tokens, vis_hs});
+    if (!h_npu) {
+        LOG_ERROR("RunVision: alloc vision first layer out NPU tensor failed");
+        return ERROR_NPU_MEMORY;
+    }
 
     {
         const auto& bw = weights_.vis_blocks[0];
@@ -758,14 +792,12 @@ Status Qwen3VLModel::RunVision(const uint16_t* pixel_values, int64_t num_patches
     }
 
     // DEBUG: Save first layer output
-    debug::DumpNpuFp16(runtime_, *h_npu.Get(), total_tokens * vis_hs,
-                       "/tmp/cpp_first_layer_out.bin");
+    DebugDumpFirstLayer(runtime_, *h_npu.Get(), total_tokens * vis_hs);
 
     // CONTROLLED FEED: When ATB_DEBUG_VISION=2, overwrite C++ first_layer
     // output with Python's first_layer output to isolate whether block
     // computation differs or error is amplified from input difference.
-    debug::MaybeFeedNpuFp16(runtime_, *h_npu.Get(), total_tokens * vis_hs,
-                            "/tmp/diag_first_layer_out.bin");
+    DebugMaybeFeedFirstLayer(runtime_, *h_npu.Get(), total_tokens * vis_hs);
 
     // 5. Run blocks 1..depth-1, collect deepstack features
     ds_features.resize(config_.vis_deepstack_visual_indexes.size());
@@ -774,6 +806,10 @@ Status Qwen3VLModel::RunVision(const uint16_t* pixel_values, int64_t num_patches
 
         // Allocate fresh output tensor (ATB does NOT support in-place: input==output)
         NpuTensor h_out = AllocNpuFloat16({total_tokens, vis_hs});
+        if (!h_out) {
+            LOG_ERROR("RunVision: alloc vision block %d out NPU tensor failed", li);
+            return ERROR_NPU_MEMORY;
+        }
 
         atb::VariantPack vp;
         vp.inTensors = {
@@ -795,23 +831,14 @@ Status Qwen3VLModel::RunVision(const uint16_t* pixel_values, int64_t num_patches
 
         // DEBUG: Save block 1 output for early-divergence diagnosis
         if (li == 1) {
-            debug::DumpNpuFp16(runtime_, *h_npu.Get(), total_tokens * vis_hs,
-                               "/tmp/cpp_block_1_out.bin");
+            DebugDumpBlock1(runtime_, *h_npu.Get(), total_tokens * vis_hs);
         }
 
         // DEBUG: Save block output at deepstack layers and last block
-        if (debug::VisionDumpEnabled()) {
-            bool is_ds = false;
-            for (auto di : config_.vis_deepstack_visual_indexes) {
-                if (li == di) { is_ds = true; break; }
-            }
-            if (is_ds || li == config_.vis_depth - 1) {
-                char path[256];
-                std::snprintf(path, sizeof(path), "/tmp/cpp_block_%d_out.bin", li);
-                debug::DumpNpuFp16(runtime_, *h_npu.Get(),
-                                   total_tokens * vis_hs, path);
-            }
-        }
+        DebugDumpBlockOutputs(runtime_, *h_npu.Get(), li,
+                              total_tokens * vis_hs,
+                              config_.vis_depth,
+                              config_.vis_deepstack_visual_indexes);
 
         // Check if this layer produces deepstack features
         size_t fusion_idx = 0;
@@ -830,6 +857,10 @@ Status Qwen3VLModel::RunVision(const uint16_t* pixel_values, int64_t num_patches
         const auto& mw = weights_.merger;
         int64_t merged_tokens = total_tokens / (merge_size * merge_size);
         NpuTensor merged_out = AllocNpuFloat16({merged_tokens, config_.vis_out_hidden_size});
+        if (!merged_out) {
+            LOG_ERROR("RunVision: alloc vision merger out NPU tensor failed");
+            return ERROR_NPU_MEMORY;
+        }
 
         atb::VariantPack vp;
         vp.inTensors = {
@@ -851,9 +882,8 @@ Status Qwen3VLModel::RunVision(const uint16_t* pixel_values, int64_t num_patches
         alloc->CopyToHost(vis_embeds_out, *merged_out.Get(), merged_bytes);
 
         // DEBUG: Save merged vision output for comparison with Python
-        debug::DumpHostFp16(vis_embeds_out,
-                            merged_tokens * config_.vis_out_hidden_size,
-                            "/tmp/cpp_vision_merged.bin");
+        DebugDumpMerged(vis_embeds_out,
+                        merged_tokens * config_.vis_out_hidden_size);
         // merged_out auto-freed at end of block
     }
 

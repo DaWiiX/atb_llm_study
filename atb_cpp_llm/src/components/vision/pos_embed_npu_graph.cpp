@@ -31,45 +31,38 @@ Status PosEmbedInterpGraph::Build(const std::string& name,
     s = builder->Init(name, nullptr, in_names, out_names);
     if (s != STATUS_OK) return s;
 
-    auto add_op = [&](OperationHandle&& op_h,
-                      const atb::SVector<std::string>& ins,
-                      const atb::SVector<std::string>& outs) -> Status {
-        if (!op_h) return ERROR_GRAPH_BUILD;
-        return builder->AddOperation(op_h.release(), ins, outs);
-    };
-
     // ── 4× Gather: idx_k → corner_k (N, vis_hs) ─────────────────
-    s = add_op(ops::GatherOp::Create(/*axis=*/0, /*batch_dims=*/0),
+    s = builder->AddOp(ops::GatherOp::Create(/*axis=*/0, /*batch_dims=*/0),
                {"pos_embed_w", "idx00"}, {"v00"});
     if (s != STATUS_OK) return s;
-    s = add_op(ops::GatherOp::Create(0, 0),
+    s = builder->AddOp(ops::GatherOp::Create(0, 0),
                {"pos_embed_w", "idx01"}, {"v01"});
     if (s != STATUS_OK) return s;
-    s = add_op(ops::GatherOp::Create(0, 0),
+    s = builder->AddOp(ops::GatherOp::Create(0, 0),
                {"pos_embed_w", "idx10"}, {"v10"});
     if (s != STATUS_OK) return s;
-    s = add_op(ops::GatherOp::Create(0, 0),
+    s = builder->AddOp(ops::GatherOp::Create(0, 0),
                {"pos_embed_w", "idx11"}, {"v11"});
     if (s != STATUS_OK) return s;
 
     // ── 4× Mul with broadcast: wt_k(N,1) × v_k(N,vis_hs) → m_k(N,vis_hs) ──
     // ElewiseMul auto-broadcasts when one dim is 1; caller must shape wt
     // as (N, 1).
-    s = add_op(ops::ElewiseOp::MakeMul(), {"v00", "wt00"}, {"m00"});
+    s = builder->AddOp(ops::ElewiseOp::MakeMul(), {"v00", "wt00"}, {"m00"});
     if (s != STATUS_OK) return s;
-    s = add_op(ops::ElewiseOp::MakeMul(), {"v01", "wt01"}, {"m01"});
+    s = builder->AddOp(ops::ElewiseOp::MakeMul(), {"v01", "wt01"}, {"m01"});
     if (s != STATUS_OK) return s;
-    s = add_op(ops::ElewiseOp::MakeMul(), {"v10", "wt10"}, {"m10"});
+    s = builder->AddOp(ops::ElewiseOp::MakeMul(), {"v10", "wt10"}, {"m10"});
     if (s != STATUS_OK) return s;
-    s = add_op(ops::ElewiseOp::MakeMul(), {"v11", "wt11"}, {"m11"});
+    s = builder->AddOp(ops::ElewiseOp::MakeMul(), {"v11", "wt11"}, {"m11"});
     if (s != STATUS_OK) return s;
 
     // ── 3× Add: pairwise reduction over the 4 corners ───────────
-    s = add_op(ops::ElewiseOp::MakeAdd(), {"m00", "m01"}, {"sum_top"});
+    s = builder->AddOp(ops::ElewiseOp::MakeAdd(), {"m00", "m01"}, {"sum_top"});
     if (s != STATUS_OK) return s;
-    s = add_op(ops::ElewiseOp::MakeAdd(), {"m10", "m11"}, {"sum_bot"});
+    s = builder->AddOp(ops::ElewiseOp::MakeAdd(), {"m10", "m11"}, {"sum_bot"});
     if (s != STATUS_OK) return s;
-    s = add_op(ops::ElewiseOp::MakeAdd(), {"sum_top", "sum_bot"}, {"output"});
+    s = builder->AddOp(ops::ElewiseOp::MakeAdd(), {"sum_top", "sum_bot"}, {"output"});
     if (s != STATUS_OK) return s;
 
     out = builder->Build();

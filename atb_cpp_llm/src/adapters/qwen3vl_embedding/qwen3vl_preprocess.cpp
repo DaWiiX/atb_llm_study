@@ -2,7 +2,7 @@
 #include "adapters/qwen3vl_embedding/qwen3vl_weights.h"
 #include "utils/float_utils.h"
 #include "log/logger.h"
-#include "util/cpp11_compat.h"
+#include "utils/cpp11_compat.h"
 #include <cmath>
 #include <algorithm>
 #include <cstring>

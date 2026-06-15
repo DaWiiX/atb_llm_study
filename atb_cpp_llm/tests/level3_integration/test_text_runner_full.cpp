@@ -32,9 +32,10 @@
 #include "core/raii.h"
 #include "core/tensor_allocator.h"
 #include "runners/text_runner.h"
+#include "test_mask_helper.h"
 #include "engine/runtime_impl.h"
 #include "log/logger.h"
-#include "util/cpp11_compat.h"
+#include "utils/cpp11_compat.h"
 
 #include <cstdio>
 #include <cstring>
@@ -166,7 +167,11 @@ TEST_CASE("TextRunner Full Pipeline (multi-layer loop)") {
     atb::Tensor cos_t, sin_t, mask_t;
     alloc->AllocFloat16(cos_t,  {seq_len, hd});
     alloc->AllocFloat16(sin_t,  {seq_len, hd});
-    alloc->AllocFloat16(mask_t, {seq_len, seq_len});
+    // Zero mask (no masking) in platform-correct format
+    {
+        std::vector<uint16_t> z(static_cast<size_t>(seq_len) * seq_len, FP16_ZERO);
+        atb_llm::test::UploadMask(alloc, z.data(), seq_len, mask_t);
+    }
 
     // seqlen tensor (int32, host)
     atb::Tensor seqlen_t;
@@ -183,7 +188,7 @@ TEST_CASE("TextRunner Full Pipeline (multi-layer loop)") {
     for (auto& w : layers) FillLayer(alloc, w);
     fill_fp16(alloc, cos_t,  FP16_ONE);   // identity rotation
     fill_fp16(alloc, sin_t,  FP16_ZERO);
-    fill_fp16(alloc, mask_t, FP16_ZERO);  // no masking
+    // mask_t already filled via test::UploadMask
 
     // ── 5. Loop layers ──────────────────────────────────────
     atb::Tensor h_in = hidden_in;
@@ -249,15 +254,9 @@ TEST_CASE("TextRunner Full Pipeline (multi-layer loop)") {
 //   - Verifies the shared layer graph handles GQA correctly through the
 //     full multi-layer loop + final norm
 //
-// SKIP on 310P: SelfAttention GQA is not supported on 310P hardware.
-// Production inference uses GQA→MHA weight expansion in
-// Qwen3VLModel::Load() instead.
+// Verified on 310P (GQA supported — cos=1.0)
 // ══════════════════════════════════════════════════════════════════════
 TEST_CASE("TextRunner GQA Full Pipeline") {
-    if (atb_llm::Is310P()) {
-        MESSAGE("Skipping TextRunner GQA Full Pipeline test on 310P (GQA→MHA expansion handles this at engine layer)");
-        return;
-    }
     LOG_INFO("=== Test: TextRunner GQA full pipeline ===");
 
     atb_llm::runners::TextRunner::Config cfg;
@@ -295,7 +294,11 @@ TEST_CASE("TextRunner GQA Full Pipeline") {
     atb::Tensor cos_t, sin_t, mask_t;
     alloc->AllocFloat16(cos_t,  {seq_len, hd});
     alloc->AllocFloat16(sin_t,  {seq_len, hd});
-    alloc->AllocFloat16(mask_t, {seq_len, seq_len});
+    // Zero mask (no masking) in platform-correct format
+    {
+        std::vector<uint16_t> z(static_cast<size_t>(seq_len) * seq_len, FP16_ZERO);
+        atb_llm::test::UploadMask(alloc, z.data(), seq_len, mask_t);
+    }
 
     atb::Tensor seqlen_t;
     int32_t seqlen_val = seq_len;

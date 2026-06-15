@@ -25,6 +25,7 @@
 #include "ops/reduce_op.h"
 #include "engine/runtime_impl.h"
 #include "utils/float_utils.h"
+#include "utils/cpp11_compat.h"
 #include "log/logger.h"
 
 #include <cstdio>
@@ -247,6 +248,10 @@ std::vector<float> RunReduceBf16(atb_llm::IRuntime* runtime,
 // Case 2: Reduce MAX along axis=1 (bf16 — ATB requires bf16 or int32)
 // ═════════════════════════════════════════════════════════════════
 TEST_CASE("ReduceOp precision: MAX axis=1 [3,5] (bf16)") {
+    if (atb_llm::Is310P()) {
+        MESSAGE("Skipping: bf16 ReduceOp not supported on 310P");
+        return;
+    }
     LOG_INFO("=== Reduce MAX precision (bf16) ===");
     ArrayFp16 in, ref;
     REQUIRE(in.Load("/tmp/cpu_op_reduce_bf16_in.bin"));
@@ -266,6 +271,10 @@ TEST_CASE("ReduceOp precision: MAX axis=1 [3,5] (bf16)") {
 // Case 3: Reduce MIN along axis=1 (bf16 — ATB requires bf16 or int32)
 // ═════════════════════════════════════════════════════════════════
 TEST_CASE("ReduceOp precision: MIN axis=1 [3,5] (bf16)") {
+    if (atb_llm::Is310P()) {
+        MESSAGE("Skipping: bf16 ReduceOp not supported on 310P");
+        return;
+    }
     LOG_INFO("=== Reduce MIN precision (bf16) ===");
     ArrayFp16 in, ref;
     REQUIRE(in.Load("/tmp/cpu_op_reduce_bf16_in.bin"));

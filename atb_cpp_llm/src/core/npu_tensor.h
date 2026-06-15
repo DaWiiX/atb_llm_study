@@ -31,7 +31,7 @@ public:
     atb::Tensor* Get();
     const atb::Tensor* Get() const;
 
-    /// Release ownership of the device memory. Caller must free deviceData via aclrtFree.
+    [[deprecated("Use Get() for read access. Release() transfers raw NPU pointer ownership — caller must aclrtFree().")]]
     atb::Tensor* Release();
 
     /// True if this NpuTensor owns a non-null device allocation.

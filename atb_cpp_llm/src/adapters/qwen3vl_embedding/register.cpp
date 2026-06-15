@@ -1,7 +1,7 @@
 #include "atb_llm/model.h"
 #include "adapters/qwen3vl_embedding/qwen3vl_model.h"
 #include "io/json_config.h"
-#include "util/cpp11_compat.h"
+#include "utils/cpp11_compat.h"
 
 namespace atb_llm {
 

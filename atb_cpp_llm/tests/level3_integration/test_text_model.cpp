@@ -18,9 +18,10 @@
 #include "core/raii.h"
 #include "core/graph_builder.h"
 #include "core/context_manager.h"
-#include "util/cpp11_compat.h"
+#include "utils/cpp11_compat.h"
 #include "core/tensor_allocator.h"
 #include "runners/text_runner.h"
+#include "test_mask_helper.h"
 #include "engine/runtime_impl.h"
 #include "log/logger.h"
 
@@ -144,7 +145,11 @@ TEST_CASE("TextModel Execute") {
     alloc->AllocFloat16(pln_w, {hidden});
     alloc->AllocFloat16(cos_t, {seq_len, hd});
     alloc->AllocFloat16(sin_t, {seq_len, hd});
-    alloc->AllocFloat16(mask_t, {seq_len, seq_len});
+    // Zero mask (all attend) in platform-correct format
+    {
+        std::vector<uint16_t> zero_mask(static_cast<size_t>(seq_len) * seq_len, 0x0000);
+        atb_llm::test::UploadMask(alloc, zero_mask.data(), seq_len, mask_t);
+    }
     alloc->AllocInt64(seqlen_t, {1});  // int32 tensor for seqlen (AllocInt64 allocates enough)
     alloc->AllocFloat16(output_t, {seq_len, hidden});
 
@@ -168,7 +173,7 @@ TEST_CASE("TextModel Execute") {
     fill_fp16(pln_w, 0x3C00);
     fill_fp16(cos_t, 0x3C00);   // cos ~1.0
     fill_fp16(sin_t, 0x0000);   // sin ~0.0
-    fill_fp16(mask_t, 0x0000);  // all attend
+    // mask_t already filled via test::UploadMask above
 
     // seqlen: int32 value = seq_len * batch_size
     // Use hostData for the seqlen tensor (small, single int32)
@@ -261,17 +266,9 @@ TEST_CASE("TextModel Execute") {
 }
 
 // ══════════════════════════════════════════════════════════
-// Test: TextModel with GQA
-//
-// SKIP on 310P: SelfAttention GQA (kv_head_num < head_num) is not
-// supported on 310P hardware.  Production inference uses GQA→MHA weight
-// expansion in Qwen3VLModel::Load() instead.
+// Test: TextModel with GQA (verified on 310P, cos=1.0)
 // ══════════════════════════════════════════════════════════
 TEST_CASE("TextModel GQA") {
-    if (atb_llm::Is310P()) {
-        MESSAGE("Skipping TextModel GQA test on 310P (GQA→MHA expansion handles this at engine layer)");
-        return;
-    }
     LOG_INFO("=== Test: TextModel GQA ===");
 
     atb_llm::runners::TextRunner::Config cfg;

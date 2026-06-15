@@ -4,7 +4,6 @@
 #include <cstring>
 #include <cstdarg>
 #include <ctime>
-#include <acl/acl.h>
 
 namespace atb_llm {
 
@@ -18,16 +17,24 @@ enum class LogLevel {
 
 namespace detail {
 
-inline LogLevel GetLogLevel() {
+inline LogLevel& MutableLogLevel() {
     static LogLevel level = []() {
         const char* env = std::getenv("LOG_LEVEL");
-        if (!env) return LogLevel::INFO;
+        if (!env) return LogLevel::WARN;
         int val = std::atoi(env);
         if (val < 0) return LogLevel::DEBUG;
         if (val > 3) return LogLevel::NONE;
         return static_cast<LogLevel>(val);
     }();
     return level;
+}
+
+inline LogLevel GetLogLevel() {
+    return MutableLogLevel();
+}
+
+inline void SetLogLevel(LogLevel level) {
+    MutableLogLevel() = level;
 }
 
 inline const char* LogLevelStr(LogLevel level) {
@@ -82,25 +89,3 @@ inline void LogMessage(LogLevel level, const char* file, int line, const char* f
     atb_llm::detail::LogMessage(atb_llm::LogLevel::WARN, __FILE__, __LINE__, fmt, ##__VA_ARGS__)
 #define LOG_ERROR(fmt, ...) \
     atb_llm::detail::LogMessage(atb_llm::LogLevel::ERROR, __FILE__, __LINE__, fmt, ##__VA_ARGS__)
-
-// ── Error check macros ───────────────────────────────────
-#define ATB_LLM_CHECK(expr)                                                \
-    do {                                                                   \
-        atb::Status _s = (expr);                                          \
-        if (_s != atb::NO_ERROR) {                                        \
-            LOG_ERROR("ATB error: %d (%s:%d)", static_cast<int>(_s),      \
-                      __FILE__, __LINE__);                                 \
-            return static_cast<atb_llm::Status>(                          \
-                atb_llm::ERROR_ATB_BASE + static_cast<int32_t>(_s));      \
-        }                                                                  \
-    } while (0)
-
-#define ATB_LLM_CHECK_ACL(expr)                                           \
-    do {                                                                   \
-        auto _s = (expr);                                                  \
-        if (_s != ACL_SUCCESS) {                                          \
-            LOG_ERROR("ACL error: %d (%s:%d)", static_cast<int>(_s),      \
-                      __FILE__, __LINE__);                                 \
-            return atb_llm::ERROR_NPU_MEMORY;                             \
-        }                                                                  \
-    } while (0)

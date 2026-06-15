@@ -25,6 +25,9 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 REPO_ROOT = HERE.parent.parent.parent
 
+sys.path.insert(0, str(HERE.parent))
+from _tests_env import ASCEND_PLATFORM  # noqa: E402
+
 # Generator → list of sentinel files it produces (used by --skip-fresh).
 # We only check one or two representative paths per generator; if those are
 # present we assume the full batch is, too. Re-run without --skip-fresh to
@@ -73,11 +76,35 @@ def main():
         rc = run_one(script)
         if rc != 0:
             failures.append(script)
+            # Continue running remaining generators — one failure
+            # shouldn't block others (e.g. stage refdata can be
+            # regenerated later; op-level refdata is independent).
 
     if failures:
-        print("\n[gen_all] ❌ Generators that failed:")
+        platform = ASCEND_PLATFORM
+        print(f"\n[gen_all] ❌ {len(failures)}/{len(GENERATORS)} generators failed "
+              f"(platform: {platform}):")
         for s in failures:
             print(f"           - {s}")
+        print("\n[gen_all] 💡 Recover by re-running the failed generator directly:")
+        for s in failures:
+            print(f"           python tests/python_reference/{s}")
+        print("[gen_all] 💡 For 310P Python ATB issues, the generator may need")
+        print("[gen_all]    to fall back to torch_npu or CPU (see refdata_fallback.py).")
+
+        if platform == "310P":
+            print("\n[gen_all] 🔧 310P-specific diagnostics:")
+            print("[gen_all]    1. Check mask format: make_causal_mask_nz_npu() MUST set")
+            print("[gen_all]       FRACTAL_NZ format (acl_format=29) on the NPU tensor.")
+            print("[gen_all]       Without this, ATB SelfAttention fails 'call operation setup fail'.")
+            print("[gen_all]    2. test_stage_reference.py: TEXT_ONLY has transformers CPU fallback;")
+            print("[gen_all]       IMAGE_ONLY/IMAGE_AND_TEXT are skipped if ATB fails.")
+            print("[gen_all]    3. gen_stage_reference.py: vision stages (L1-L3) should work on 310P")
+            print("[gen_all]       (no SelfAttention mask involved). If they fail, check ATB log.")
+            print("[gen_all]    4. ATB log: cat $(ls -rt ~/ascend/log/atb/ | tail -n 1)")
+            print("[gen_all]    5. When a generator writes NO .bin file, C++ tests dependent on it")
+            print("[gen_all]       are automatically excluded by build_and_test.sh (--no-refdata).")
+
         sys.exit(1)
     print("\n[gen_all] ✅ All reference data generated.")
 
