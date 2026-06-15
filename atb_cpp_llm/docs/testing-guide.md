@@ -148,8 +148,7 @@ ASCEND_PLATFORM=310P ./test_text_decoder_layer_precision 2>&1 | tee /tmp/310p_ph
 |---|------|---|----|-----|-----|------|------|----------|------|
 | 1 | `small no-mask` | 8 | 4 | 4 | 32 | ❌ | MHA | ✅ | 无 mask 基线 |
 | 2 | `GQA with mask` | 8 | 12 | 4 | 64 | ✅ | GQA | ✅ 通过 | 待验证 |
-
-**⚠️ 缺失覆盖**：目前没有 **MHA + causal mask** 的 DecoderLayer 精度测试。Case 1 无 mask，Case 2 是 GQA（被 skip）。阶段 1 通过后应补充。
+| 3 | `MHA with causal mask` | 16 | 32 | 32 | 128 | ✅ | MHA | ✅ 通过 | MHA + mask 精度基线 |
 
 ### 2c. TextModel 精度测试 (`test_text_model`)
 
@@ -262,6 +261,7 @@ ASCEND_PLATFORM=310P python3 tests/python_reference/gen_all.py 2>&1 | tee /tmp/3
 | test_text_ops | — | GQA cases | ❌ SKIP (已修复) | ⬜ |
 | test_decoder_layer | 1 | small no-mask | ✅ | ⬜ |
 | test_decoder_layer | 2 | GQA with mask | ❌ SKIP (已修复) | ⬜ |
+| test_decoder_layer | 3 | MHA with causal mask | — | ⬜ |
 | test_text_model | 1-3 | Build/Mask/Execute | ❌ Setup 失败 | ⬜ |
 | test_text_model | 4 | TextModel GQA | ❌ SKIP (已修复) | ⬜ |
 | test_text_runner_full | 1 | MHA pipeline | ❌ Setup 失败 | ⬜ |

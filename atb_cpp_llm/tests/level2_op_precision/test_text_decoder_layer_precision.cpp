@@ -285,3 +285,32 @@ TEST_CASE("TextDecoderLayerGraph precision: GQA with mask") {
     LOG_INFO("  cosine = %.6f", cs);
     CHECK(cs >= 0.99f);
 }
+
+// ═════════════════════════════════════════════════════════════════
+// Case 3: MHA with causal mask (nh=32, kvh=32, hd=128, I=1024, S=16)
+// Covers MHA + causal mask DecoderLayer precision — the standard
+// path on 910B that was previously untested.
+// ═════════════════════════════════════════════════════════════════
+TEST_CASE("TextDecoderLayerGraph precision: MHA with causal mask") {
+    LOG_INFO("=== TextDecoderLayerGraph precision: MHA + causal mask ===");
+
+    ArrayI32 meta;
+    REQUIRE(meta.Load("/tmp/cpu_dec_mha_causal_meta.bin"));
+    REQUIRE(meta.data.size() == 6);
+    Case c;
+    c.name = "mha_causal";
+    c.S    = meta.data[0];
+    c.nh   = meta.data[1];
+    c.kvh  = meta.data[2];
+    c.hd   = meta.data[3];
+    c.I    = meta.data[4];
+    c.use_mask = (meta.data[5] != 0);
+    REQUIRE(c.use_mask);
+
+    auto runtime = atb_llm::CreateRuntime(0, 3LL * 1024 * 1024 * 1024);
+    REQUIRE(runtime != nullptr);
+
+    float cs = RunDecoderLayer(runtime.get(), c);
+    LOG_INFO("  cosine = %.6f", cs);
+    CHECK(cs >= 0.99f);
+}

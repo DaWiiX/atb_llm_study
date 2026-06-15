@@ -1394,11 +1394,12 @@ def _sdpa_gqa(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
 
 
 def gen_text_decoder_layer():
-    """Reference data for TextDecoderLayerGraph (no-mask + GQA-with-mask).
+    """Reference data for TextDecoderLayerGraph (no-mask + GQA-with-mask + MHA-with-mask).
 
     Cases:
       * "small_nomask" — nh=4, kvh=4, hd=32, I=64,  S=4   (small debug)
       * "gqa_mask"     — nh=12, kvh=4, hd=64, I=256, S=8  (GQA + causal mask)
+      * "mha_causal"   — nh=32, kvh=32, hd=128, I=1024, S=16 (MHA + causal mask)
     """
     print("[gen] text_decoder_layer — full layer fp16 ground truth")
     eps = 1e-6
@@ -1514,8 +1515,9 @@ def gen_text_decoder_layer():
         kind = "with-mask" if use_mask else "no-mask"
         print(f"  → {name}: S={S} nh={nh} kvh={kvh} hd={hd} I={I} ({kind})")
 
-    _make("small_nomask", S=4, nh=4,  kvh=4, hd=32, I=64,  use_mask=False, seed=6001)
-    _make("gqa_mask",     S=8, nh=12, kvh=4, hd=64, I=256, use_mask=True,  seed=6002)
+    _make("small_nomask", S=4, nh=4,  kvh=4,  hd=32,  I=64,   use_mask=False, seed=6001)
+    _make("gqa_mask",     S=8, nh=12, kvh=4,  hd=64,  I=256,  use_mask=True,  seed=6002)
+    _make("mha_causal",   S=16, nh=32, kvh=32, hd=128, I=1024, use_mask=True,  seed=6003)
 
 
 # ═══════════════════════════════════════════════════════════════════
