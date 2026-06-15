@@ -40,6 +40,8 @@ def build_text_norm_graph(hidden_size, eps=1e-6):
 
 # ── Weight collectors ────────────────────────────────────────────────
 
+# Deprecated: only used by run_text_model() for test_text_model.py.
+# Production path uses engine.py which pre-loads all weights to NPU.
 def collect_text_layer_weights(layer):
     """Extract 11 weight tensors from a Qwen3VLTextDecoderLayer in ATB order.
 
@@ -98,29 +100,6 @@ def _text_layer_inputs(hidden, weight_list, cos_npu, sin_npu, seqlen,
     return inputs
 
 
-def run_text_layer(graph, hidden_states, layer_weights, cos, sin, seqlen,
-                   causal_mask=None):
-    """Execute one DecoderLayer and return CPU float output.
-
-    This CPU-facing wrapper accepts ordinary CPU tensors (including weights and
-    masks), converts them, and calls the graph. ``seqlen`` should be a
-    pre-created CPU int32 tensor created once outside the loop.
-    """
-    inputs = _text_layer_inputs(
-        to_npu_half(hidden_states),
-        prepare_npu_weights(layer_weights),
-        to_npu_half(cos), to_npu_half(sin), seqlen,
-        causal_mask=to_npu_half(causal_mask) if causal_mask is not None else None)
-    return to_cpu_float(graph.forward(inputs)[0])
-
-
-def run_text_layer_fast(graph, hidden_states, layer_weights, cos_npu, sin_npu,
-                         seqlen, causal_mask=None):
-    """Compatibility wrapper for callers that pre-transfer cos/sin to NPU."""
-    return run_text_layer(graph, hidden_states, layer_weights, cos_npu, sin_npu,
-                          seqlen, causal_mask=causal_mask)
-
-
 def run_text_layer_npu(graph, hidden_npu, weight_list, cos_npu, sin_npu,
                         seqlen, causal_mask=None):
     """Execute one DecoderLayer and keep output on NPU.
@@ -134,18 +113,14 @@ def run_text_layer_npu(graph, hidden_npu, weight_list, cos_npu, sin_npu,
     return graph.forward(inputs)[0]
 
 
-def run_text_norm(graph, hidden_states, norm_weight):
-    """Execute final RMSNorm and return CPU float output."""
-    inputs = [to_npu_half(hidden_states), to_npu_half(norm_weight)]
-    return to_cpu_float(graph.forward(inputs)[0])
-
-
 def run_text_norm_npu(graph, hidden_npu, norm_weight):
     """Execute final RMSNorm and keep output on NPU."""
     inputs = [to_npu_half(hidden_npu), to_npu_half(norm_weight)]
     return graph.forward(inputs)[0]
 
 
+# Deprecated: only used by test_text_model.py.
+# Production path: engine.py loops run_text_layer_npu() directly.
 def run_text_model(text_model, hidden_states, cos, sin, seqlen,
                     layer_graph, norm_graph, use_mask=True):
     """Run full Qwen3VLTextModel through ATB graphs.

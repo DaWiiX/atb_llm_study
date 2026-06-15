@@ -13,7 +13,6 @@ Usage:
     python tests/test_stage_reference.py
 """
 
-import os
 import sys
 import struct
 import traceback
@@ -23,7 +22,7 @@ import torch
 import torch.nn.functional as F
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from _tests_env import MODEL_DIR, REPO_ROOT  # noqa: E402
+from _tests_env import MODEL_DIR, REPO_ROOT, ASCEND_PLATFORM  # noqa: E402
 sys.path.insert(0, str(REPO_ROOT))
 
 from atb_python_qwen3vl_embedding.utils import set_atb_buffer_size
@@ -120,7 +119,7 @@ def compute_text_only_reference(model_dir, engine, input_ids):
         data, method = _compute_text_only_atb(engine, input_ids)
         print(f"  ✓ {method}")
         return data, method, None
-    except Exception as e:
+    except RuntimeError as e:
         err_msg = f"ATB engine failed: {e}"
         errors.append(err_msg)
         print(f"  ✗ Tier 1 (ATB): {e}")
@@ -130,7 +129,7 @@ def compute_text_only_reference(model_dir, engine, input_ids):
         data, method = _compute_text_only_transformers(model_dir, input_ids)
         print(f"  ✓ {method} (fallback)")
         return data, method, None
-    except Exception as e:
+    except (RuntimeError, OSError, ValueError) as e:
         err_msg = f"Transformers fallback also failed: {e}"
         errors.append(err_msg)
         print(f"  ✗ Tier 2 (transformers): {e}")
@@ -141,7 +140,7 @@ def compute_text_only_reference(model_dir, engine, input_ids):
 def main():
     print("=" * 60)
     print("Stage Reference Generator")
-    print(f"Platform: {os.getenv('ASCEND_PLATFORM', '910B')}")
+    print(f"Platform: {ASCEND_PLATFORM}")
     print("=" * 60)
 
     # ── Setup ──────────────────────────────────────────────────
@@ -152,7 +151,7 @@ def main():
         engine = Qwen3VLEngine(MODEL_DIR)
         print(f"Engine loaded: {engine.n_layer} text layers, {engine.v_depth} vision blocks")
         engine_ok = True
-    except Exception as e:
+    except (RuntimeError, OSError, ValueError) as e:
         print(f"  ✗ Engine init FAILED: {e}")
         engine_ok = False
 
@@ -191,11 +190,11 @@ def main():
             print(f"  vis_embeds: shape={vis_embeds.shape}, dtype={vis_embeds.dtype}")
             print(f"  first 8: {vis_cpu[0, :8].tolist()}")
             print("  ✓ Stage 3 OK")
-        except Exception as e:
+        except RuntimeError as e:
             failed_stages.append("Stage 3 (vision model)")
             print(f"  ✗ Stage 3 FAILED: {e}")
             print(f"  ⚠  /tmp/stage_vis_embeds.bin NOT written")
-            if os.getenv('ASCEND_PLATFORM', '') == '310P':
+            if ASCEND_PLATFORM == '310P':
                 print(f"  💡 Hint: on 310P, vision SelfAttention uses no mask → should work.")
                 print(f"     Check ATB log: cat $(ls -rt ~/ascend/log/atb/ | tail -n 1)")
             engine_ok = False  # subsequent stages also likely to fail
@@ -261,7 +260,7 @@ def main():
             save_float32("/tmp/stage_final_text_only.bin", emb_t)
             print(f"  ✓ ATB engine: shape={emb_t.shape}, first 8: {emb_t[:8].tolist()}")
             text_only_ok = True
-        except Exception as e:
+        except RuntimeError as e:
             failed_stages.append("Stage 6 TEXT_ONLY (ATB)")
             print(f"  ✗ ATB engine FAILED: {e}")
             print(f"  → Falling back to transformers CPU reference...")
@@ -273,7 +272,7 @@ def main():
                 print(f"  ✓ transformers (CPU fallback): shape={emb_t.shape}, "
                       f"first 8: {emb_t[:8].tolist()}")
                 text_only_ok = True
-            except Exception as e2:
+            except (RuntimeError, OSError, ValueError) as e2:
                 failed_stages.append("Stage 6 TEXT_ONLY (fallback)")
                 print(f"  ✗ Fallback also FAILED: {e2}")
     else:
@@ -289,7 +288,7 @@ def main():
             emb_io = result_io.flatten().float().numpy()
             save_float32("/tmp/stage_final_image_only.bin", emb_io)
             print(f"  ✓ ATB engine: shape={emb_io.shape}, first 8: {emb_io[:8].tolist()}")
-        except Exception as e:
+        except RuntimeError as e:
             failed_stages.append("Stage 6 IMAGE_ONLY")
             print(f"  ✗ ATB engine FAILED: {e}")
             print(f"  ⚠  No CPU fallback for IMAGE_ONLY (vision pipeline too complex)")
@@ -307,7 +306,7 @@ def main():
             emb_mt = result_mt.flatten().float().numpy()
             save_float32("/tmp/stage_final_image_text.bin", emb_mt)
             print(f"  ✓ ATB engine: shape={emb_mt.shape}, first 8: {emb_mt[:8].tolist()}")
-        except Exception as e:
+        except RuntimeError as e:
             failed_stages.append("Stage 6 IMAGE_AND_TEXT")
             print(f"  ✗ ATB engine FAILED: {e}")
             print(f"  ⚠  No CPU fallback for IMAGE_AND_TEXT (vision pipeline too complex)")

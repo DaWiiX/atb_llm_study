@@ -18,6 +18,7 @@ import torch
 import torch_npu  # noqa: F401
 import torch.nn.functional as F
 
+from atb_python_qwen3vl_embedding.env import ASCEND_PLATFORM
 from atb_python_qwen3vl_embedding.utils import make_causal_mask_nz
 
 # ACL format constants
@@ -39,7 +40,7 @@ def test_01_create_nz_tensor():
             fmt = torch_npu.get_npu_format(t)
             print(f"  S={S}: shape={shape}, format={fmt}, "
                   f"dtype={t.dtype}, device={t.device}  ✅")
-        except Exception as e:
+        except RuntimeError as e:
             print(f"  S={S}: shape={shape}, FAILED: {e}  ❌")
 
 
@@ -122,7 +123,7 @@ def test_04_shape_broadcast():
             mask_npu.copy_(mask_cpu)
             fmt = torch_npu.get_npu_format(mask_npu)
             print(f"  {label} (S={S}): shape={shape}, elems={elems}, format={fmt} ✅")
-        except Exception as e:
+        except RuntimeError as e:
             print(f"  {label} (S={S}): FAILED: {e} ❌")
 
 
@@ -151,7 +152,7 @@ def test_03b_format_cast():
 
             status = "✅" if diff == 0.0 else f"❌ (data changed, max_diff={diff})"
             print(f"  S={S}: format {fmt_before}→{fmt_after}, roundtrip diff={diff:.6f} {status}")
-        except Exception as e:
+        except RuntimeError as e:
             print(f"  S={S}: npu_format_cast FAILED: {e} ❌")
 
 
@@ -208,7 +209,7 @@ def test_05_atb_acceptance():
             seqlen = torch.tensor([ntoken], dtype=torch.int32)
             out = graph.forward([q, k, v, mask, seqlen])[0]
             print(f"  {approach}: format={fmt}, output shape={out.shape} ✅")
-        except Exception as e:
+        except RuntimeError as e:
             print(f"  {approach}: FAILED — {e} ❌")
 
 
@@ -230,7 +231,7 @@ def _cast_nz(cpu_data):
 def main():
     print("=" * 60)
     print("FRACTAL_NZ Format Verification")
-    print(f"Platform: {os.getenv('ASCEND_PLATFORM', '910B')}")
+    print(f"Platform: {ASCEND_PLATFORM}")
     print(f"Device: {torch.npu.get_device_name(0)}")
     print("=" * 60)
 
@@ -242,7 +243,7 @@ def main():
 
     # Note: on 910B, SelfAttention expects ND format mask, so
     # ATB acceptance test will FAIL with NZ format. Only valid on 310P.
-    if os.getenv('ASCEND_PLATFORM', '910B') == '310P':
+    if ASCEND_PLATFORM == '310P':
         test_05_atb_acceptance()
     else:
         print("\n=== Test 5: ATB SelfAttention — SKIP (only valid on 310P) ===")

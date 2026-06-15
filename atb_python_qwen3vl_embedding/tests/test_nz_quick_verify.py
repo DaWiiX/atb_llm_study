@@ -12,11 +12,12 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 import torch
 import torch_npu  # noqa: F401
 
+from atb_python_qwen3vl_embedding.env import ASCEND_PLATFORM
 from atb_python_qwen3vl_embedding.utils import make_causal_mask_nz_npu
 
 
 def main():
-    print(f"Platform: {os.getenv('ASCEND_PLATFORM', '910B')}")
+    print(f"Platform: {ASCEND_PLATFORM}")
     print(f"Device: {torch.npu.get_device_name(0)}")
 
     all_ok = True
@@ -39,7 +40,7 @@ def main():
                 all_ok = False
                 print(f"  {label} S={S}: shape={mask.shape} (expect {expected_shape}), "
                       f"format={fmt.name}, dtype={mask.dtype} ❌")
-        except Exception as e:
+        except RuntimeError as e:
             all_ok = False
             print(f"  {label} S={S}: ERROR — {e} ❌")
 

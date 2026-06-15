@@ -25,6 +25,9 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 REPO_ROOT = HERE.parent.parent.parent
 
+sys.path.insert(0, str(HERE.parent))
+from _tests_env import ASCEND_PLATFORM  # noqa: E402
+
 # Generator → list of sentinel files it produces (used by --skip-fresh).
 # We only check one or two representative paths per generator; if those are
 # present we assume the full batch is, too. Re-run without --skip-fresh to
@@ -78,7 +81,7 @@ def main():
             # regenerated later; op-level refdata is independent).
 
     if failures:
-        platform = os.getenv("ASCEND_PLATFORM", "910B")
+        platform = ASCEND_PLATFORM
         print(f"\n[gen_all] ❌ {len(failures)}/{len(GENERATORS)} generators failed "
               f"(platform: {platform}):")
         for s in failures:

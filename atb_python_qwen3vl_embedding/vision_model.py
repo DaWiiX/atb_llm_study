@@ -120,6 +120,8 @@ def build_deepstack_merger(config):
 # Weight collectors
 # ═════════════════════════════════════════════════════════════════════
 
+# Deprecated: only used by run_vision_model() for test_vision_model.py.
+# Production path uses engine.py which pre-loads all weights to NPU.
 def collect_patch_embed_weight(vm):
     """Extract patch_embed weights as Linear (flatten Conv3d → Linear).
 
@@ -132,6 +134,8 @@ def collect_patch_embed_weight(vm):
     return w, b
 
 
+# Deprecated: only used by run_vision_model() for test_vision_model.py.
+# Production path uses engine.py which pre-loads all weights to NPU.
 def collect_block_weights(blk):
     """Extract 12 weight tensors from a Qwen3VLVisionBlock.
 
@@ -148,6 +152,8 @@ def collect_block_weights(blk):
     ]
 
 
+# Deprecated: only used by run_vision_model() for test_vision_model.py.
+# Production path uses engine.py which pre-loads all weights to NPU.
 def collect_merger_weights(merger):
     """Extract 6 weight tensors from a PatchMerger.
 
@@ -205,17 +211,6 @@ def _merger_inputs(hidden, merger_weight_list):
     return inputs
 
 
-def run_first_layer(graph, pv, pe_w, pe_b, pos_npu, cos_npu, sin_npu,
-                    block0_weight_list, seqlen):
-    """Execute patch_embed + pos_embed + block 0 and return CPU float.
-
-    All tensor arguments should already be NPU float16.
-    """
-    return to_cpu_float(graph.forward(_first_layer_inputs(
-        pv, pe_w, pe_b, pos_npu, cos_npu, sin_npu,
-        block0_weight_list, seqlen))[0])
-
-
 def run_first_layer_npu(graph, pv, pe_w, pe_b, pos_npu, cos_npu, sin_npu,
                         block0_weight_list, seqlen):
     """Execute patch_embed + pos_embed + block 0 and keep output on NPU.
@@ -227,15 +222,6 @@ def run_first_layer_npu(graph, pv, pe_w, pe_b, pos_npu, cos_npu, sin_npu,
         block0_weight_list, seqlen))[0]
 
 
-def run_block(graph, hidden, block_weight_list, cos_npu, sin_npu, seqlen):
-    """Execute one VisionBlock and return CPU float.
-
-    All tensor arguments should already be NPU float16.
-    """
-    return to_cpu_float(graph.forward(_block_inputs(
-        hidden, block_weight_list, cos_npu, sin_npu, seqlen))[0])
-
-
 def run_block_npu(graph, hidden, block_weight_list, cos_npu, sin_npu, seqlen):
     """Execute one VisionBlock and keep output on NPU.
 
@@ -243,15 +229,6 @@ def run_block_npu(graph, hidden, block_weight_list, cos_npu, sin_npu, seqlen):
     """
     return graph.forward(_block_inputs(
         hidden, block_weight_list, cos_npu, sin_npu, seqlen))[0]
-
-
-def run_merger(graph, hidden, merger_weight_list):
-    """Execute PatchMerger and return CPU float.
-
-    All tensor arguments should already be NPU float16.
-    """
-    return to_cpu_float(graph.forward(_merger_inputs(
-        hidden, merger_weight_list))[0])
 
 
 def run_merger_npu(graph, hidden, merger_weight_list):
@@ -262,6 +239,8 @@ def run_merger_npu(graph, hidden, merger_weight_list):
     return graph.forward(_merger_inputs(hidden, merger_weight_list))[0]
 
 
+# Deprecated: only used by test_vision_model.py.
+# Production path: engine.py uses run_first_layer_npu/run_block_npu/run_merger_npu directly.
 def run_vision_model(vision_model, pixel_values, pos_embeds, cos, sin,
                      graph_first, graph_block, graph_merger,
                      graph_deepstack=None):

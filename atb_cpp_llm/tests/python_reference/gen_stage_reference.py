@@ -13,7 +13,6 @@ Usage:
     python atb_cpp_llm/tests/gen_stage_reference.py
 """
 
-import os
 import sys
 import struct
 from pathlib import Path
@@ -31,7 +30,7 @@ MERGE_SIZE = 2
 SPATIAL_MERGE = 2
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from _tests_env import MODEL_DIR, REPO_ROOT  # noqa: E402
+from _tests_env import MODEL_DIR, REPO_ROOT, ASCEND_PLATFORM  # noqa: E402
 sys.path.insert(0, str(REPO_ROOT))
 
 from atb_python_qwen3vl_embedding.utils import set_atb_buffer_size
@@ -111,7 +110,7 @@ def create_gradient_image(channels, height, width):
 # ── Main ────────────────────────────────────────────────────────────
 
 def main():
-    platform = os.getenv("ASCEND_PLATFORM", "910B")
+    platform = ASCEND_PLATFORM
     print("=" * 60)
     print(f"Per-Stage Reference Generator (Levels 0-3)  [{platform}]")
     print("=" * 60)
@@ -123,7 +122,7 @@ def main():
         print(f"Engine loaded: {engine.n_layer} text layers, "
               f"{engine.v_depth} vision blocks")
         engine_ok = True
-    except Exception as e:
+    except (RuntimeError, OSError, ValueError) as e:
         print(f"  ✗ Engine init FAILED: {e}")
         engine = None
         engine_ok = False
@@ -181,7 +180,7 @@ def main():
             save_tensor("/tmp/stage_L1_patch_embed_out.bin",
                        patch_embed_out_npu, dtype='fp16')
             print("  ✓ Level 1 OK")
-        except Exception as e:
+        except RuntimeError as e:
             failed.append("Level 1 (Patch Embedding)")
             print(f"  ✗ Level 1 FAILED: {e}")
     else:
@@ -224,7 +223,7 @@ def main():
                 pos_embed_npu_cpu.flatten(), pos_embed_cpu.flatten(), dim=0).item()
             max_diff_pos = (pos_embed_npu_cpu - pos_embed_cpu).abs().max().item()
             print(f"  NPU vs CPU pos_embed: cosine={cos_pos:.6f}, max_diff={max_diff_pos:.6f}")
-        except Exception as e:
+        except RuntimeError as e:
             failed.append("Level 2 (PosEmbed graph)")
             print(f"  ✗ Level 2 PosEmbed FAILED: {e}")
     else:
@@ -250,7 +249,7 @@ def main():
             save_tensor("/tmp/stage_L2_first_layer_after_pos.bin",
                        after_pos_npu, dtype='fp16')
             print("  ✓ Level 2 OK")
-        except Exception as e:
+        except RuntimeError as e:
             failed.append("Level 2 (PosAdd graph)")
             print(f"  ✗ Level 2 PosAdd FAILED: {e}")
     elif engine_ok:

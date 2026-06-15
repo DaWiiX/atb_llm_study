@@ -84,7 +84,7 @@ def _run_attention_test(name, num_heads, num_kv_heads, head_dim, use_mask, B=1, 
         status = "PASS" if ok else f"FAIL (cos={cos:.6f})"
         print(f"    {status}")
         return ok, None, cos
-    except Exception as e:
+    except RuntimeError as e:
         print(f"    ERROR: {e}")
         return False, str(e), 0.0
 

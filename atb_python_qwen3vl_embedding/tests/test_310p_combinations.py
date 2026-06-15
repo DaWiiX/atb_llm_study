@@ -93,7 +93,7 @@ def _run_full_attention(name, num_heads, num_kv_heads, head_dim,
         status = "PASS" if ok else f"FAIL (cos={cos:.6f})"
         print(f"    {status}")
         return ok, None, cos
-    except Exception as e:
+    except RuntimeError as e:
         err = f"{type(e).__name__}: {e}"
         print(f"    ERROR: {err}")
         return False, err, 0.0

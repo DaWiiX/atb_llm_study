@@ -87,7 +87,7 @@ def compute_sdpa_reference(q_fp16: torch.Tensor,
         out = op.forward(inputs)[0].cpu()
         print("[refdata] ✓ torch_atb (NPU)")
         return out
-    except Exception as e:
+    except RuntimeError as e:
         warnings.warn(f"[refdata] torch_atb failed: {e}")
 
     # Tier 2: torch_npu SDPA (NPU, no ATB dependency)
@@ -101,7 +101,7 @@ def compute_sdpa_reference(q_fp16: torch.Tensor,
         out_fp16 = out.cpu().half()
         print("[refdata] ✓ torch_npu SDPA (NPU, no ATB)")
         return out_fp16
-    except Exception as e:
+    except RuntimeError as e:
         warnings.warn(f"[refdata] torch_npu failed: {e}")
 
     # Tier 3: CPU torch (always available)
