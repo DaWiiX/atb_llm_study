@@ -95,6 +95,46 @@ def percentile(vals, p):
 
 
 # ═══════════════════════════════════════════════════════════════════
+# NPU memory measurement helpers
+# ═══════════════════════════════════════════════════════════════════
+
+
+def _start_npu_peak_measurement():
+    """Capture baseline memory and reset the peak tracker.
+
+    MUST be called AFTER warmup iterations — otherwise the peak includes
+    one-shot graph compilation and workspace allocations that are not
+    representative of steady-state inference.
+
+    Returns the current allocated NPU memory (baseline), which covers
+    immutable allocations such as engine weights and prebuilt ATB graphs.
+
+    Note: ``torch.npu.reset_max_memory_allocated()`` also resets
+    ``max_memory_reserved`` statistics as a side effect.
+    """
+    sync()
+    baseline_mem = torch.npu.memory_allocated()
+    torch.npu.reset_max_memory_allocated()  # also resets max_memory_reserved
+    sync()
+    return baseline_mem
+
+
+def _stop_npu_peak_measurement(baseline_mem):
+    """Read peak NPU memory and return a ``{'baseline_mb', 'peak_mb'}`` dict.
+
+    ``torch.npu.max_memory_allocated()`` only covers tensor memory tracked
+    by the PyTorch NPU allocator (ATB graph workspaces, NPU runtime/driver
+    overhead, and HCCL communication buffers are NOT included).
+    """
+    sync()
+    peak_mem = torch.npu.max_memory_allocated()
+    return {
+        'baseline_mb': baseline_mem / (1024 ** 2),
+        'peak_mb': peak_mem / (1024 ** 2),
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════
 # Input construction (shared between ATB and TF phases)
 # ═══════════════════════════════════════════════════════════════════
 
@@ -251,6 +291,8 @@ def benchmark_atb_staged(engine, inputs, n_warmup, n_iter):
         engine.forward(input_ids, pv_raw, grid_thw)
     sync()
 
+    baseline_mem = _start_npu_peak_measurement()
+
     results = {s: [] for s in STAGES}
 
     for _ in range(n_iter):
@@ -291,7 +333,8 @@ def benchmark_atb_staged(engine, inputs, n_warmup, n_iter):
         for s in STAGES:
             results[s].append(t[s])
 
-    return results
+    mem_info = _stop_npu_peak_measurement(baseline_mem)
+    return results, mem_info
 
 
 def benchmark_atb_e2e(engine, inputs, n_warmup, n_iter):
@@ -304,13 +347,17 @@ def benchmark_atb_e2e(engine, inputs, n_warmup, n_iter):
         engine.forward(input_ids, pv_raw, grid_thw)
     sync()
 
+    baseline_mem = _start_npu_peak_measurement()
+
     results = []
     for _ in range(n_iter):
         sync(); t0 = now()
         engine.forward(input_ids, pv_raw, grid_thw)
         sync()
         results.append(now() - t0)
-    return results
+
+    mem_info = _stop_npu_peak_measurement(baseline_mem)
+    return results, mem_info
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -391,7 +438,8 @@ STAGE_LABELS = {
 }
 
 
-def print_atb_report(resolution, S, n_vis_tokens, stages, atb_e2e):
+def print_atb_report(resolution, S, n_vis_tokens, stages, atb_e2e,
+                     staged_mem=None, e2e_mem=None):
     w, h = resolution
     atb_arr = ms(atb_e2e)
     print(f"\n{'─' * 70}")
@@ -418,6 +466,18 @@ def print_atb_report(resolution, S, n_vis_tokens, stages, atb_e2e):
         p95 = percentile(stage_vals, 0.95)
         p99 = percentile(stage_vals, 0.99)
         print(f"{STAGE_LABELS[key]} P50/P95/P99: {p50:.2f} / {p95:.2f} / {p99:.2f} ms")
+
+    # ── NPU memory ──────────────────────────────────────────────────
+    if staged_mem:
+        delta_mb = staged_mem['peak_mb'] - staged_mem['baseline_mb']
+        print(f"Peak NPU mem (staged): {staged_mem['peak_mb']:.1f} MB  "
+              f"(baseline: {staged_mem['baseline_mb']:.1f} MB,  "
+              f"delta: {delta_mb:.1f} MB)")
+    if e2e_mem:
+        delta_mb = e2e_mem['peak_mb'] - e2e_mem['baseline_mb']
+        print(f"Peak NPU mem (E2E):    {e2e_mem['peak_mb']:.1f} MB  "
+              f"(baseline: {e2e_mem['baseline_mb']:.1f} MB,  "
+              f"delta: {delta_mb:.1f} MB)")
 
 
 def print_atb_vs_tf_table(all_results):
@@ -568,10 +628,11 @@ def main(argv: Optional[list] = None) -> int:
 
             # E2E timing (no staged breakdown — no vision stages)
             engine._ensure_text_graph(S)
-            sync()
             for _ in range(args.warmup):
                 engine.forward(text_input_ids, None, None)
             sync()
+
+            baseline_mem = _start_npu_peak_measurement()
 
             e2e_times = []
             for _ in range(args.iter):
@@ -580,17 +641,23 @@ def main(argv: Optional[list] = None) -> int:
                 sync()
                 e2e_times.append(now() - t_start)
 
+            mem_info = _stop_npu_peak_measurement(baseline_mem)
+
+            # Save pooler output (outside peak window, consistent with IO/MM paths)
+            atb_output = engine.forward(text_input_ids, None, None)
+            save_pooler_bin(atb_output, text_attn_mask, engine,
+                            f"/tmp/py_text_only_{seq}.bin")
+            delta_mb = mem_info['peak_mb'] - mem_info['baseline_mb']
+
             e2e_arr = ms(e2e_times)
             tx_p50 = percentile(e2e_arr, 0.50)
             tx_p95 = percentile(e2e_arr, 0.95)
             tx_p99 = percentile(e2e_arr, 0.99)
             print(f"  Text E2E: {e2e_arr.mean():.2f} ± {e2e_arr.std():.2f} ms  "
                   f"(P50={tx_p50:.2f} P95={tx_p95:.2f} P99={tx_p99:.2f})")
-
-            # Save pooler output as .bin
-            atb_output = engine.forward(text_input_ids, None, None)
-            save_pooler_bin(atb_output, text_attn_mask, engine,
-                            f"/tmp/py_text_only_{seq}.bin")
+            print(f"  Peak NPU mem: {mem_info['peak_mb']:.1f} MB  "
+                  f"(baseline: {mem_info['baseline_mb']:.1f} MB,  "
+                  f"delta: {delta_mb:.1f} MB)")
 
     # ═════════════════════════════════════════════════════════════════
     # Mode: IMAGE_ONLY
@@ -611,8 +678,10 @@ def main(argv: Optional[list] = None) -> int:
 
             torch.npu.synchronize()
 
-            stages = benchmark_atb_staged(engine, inputs, args.warmup, args.iter)
-            atb_e2e = benchmark_atb_e2e(engine, inputs, args.warmup, args.iter)
+            stages, staged_mem = benchmark_atb_staged(engine, inputs,
+                                                        args.warmup, args.iter)
+            atb_e2e, e2e_mem = benchmark_atb_e2e(engine, inputs,
+                                                  args.warmup, args.iter)
 
             # Save pooler output as .bin
             atb_output = engine.forward(inputs['input_ids'],
@@ -620,7 +689,8 @@ def main(argv: Optional[list] = None) -> int:
             save_pooler_bin(atb_output, inputs['attention_mask'].cpu(), engine,
                             f"/tmp/py_io_{w}x{h}.bin")
 
-            print_atb_report((w, h), S, n_vis, stages, atb_e2e)
+            print_atb_report((w, h), S, n_vis, stages, atb_e2e,
+                             staged_mem=staged_mem, e2e_mem=e2e_mem)
 
     # ═════════════════════════════════════════════════════════════════
     # Mode: IMAGE_AND_TEXT  (multimodal — default, keeps existing behavior)
@@ -646,8 +716,10 @@ def main(argv: Optional[list] = None) -> int:
 
             torch.npu.synchronize()
 
-            stages = benchmark_atb_staged(engine, inputs, args.warmup, args.iter)
-            atb_e2e = benchmark_atb_e2e(engine, inputs, args.warmup, args.iter)
+            stages, staged_mem = benchmark_atb_staged(engine, inputs,
+                                                        args.warmup, args.iter)
+            atb_e2e, e2e_mem = benchmark_atb_e2e(engine, inputs,
+                                                  args.warmup, args.iter)
 
             # Save one ATB output (full pipeline, ATB vision + ATB text)
             atb_output = engine.forward(inputs['input_ids'],
@@ -686,7 +758,8 @@ def main(argv: Optional[list] = None) -> int:
             save_pooler_bin(atb_output, inputs['attention_mask'].cpu(), engine,
                             f"/tmp/py_mm_{w}x{h}.bin")
 
-            print_atb_report((w, h), S, n_vis, stages, atb_e2e)
+            print_atb_report((w, h), S, n_vis, stages, atb_e2e,
+                             staged_mem=staged_mem, e2e_mem=e2e_mem)
 
             all_results[(w, h)] = {
                 'S': S, 'n_vis': n_vis, 'inputs': inputs,
