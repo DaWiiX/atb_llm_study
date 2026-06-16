@@ -314,15 +314,38 @@ def benchmark_tf_e2e(ref, inputs, n_warmup, n_iter):
         sync()
         results.append(now() - t0)
 
-    # Accuracy check: compare last_hidden_state vs ATB output
-    with torch.no_grad():
-        tf_out = ref(use_cache=False, input_ids=input_ids,
-                     attention_mask=attn_mask,
-                     pixel_values=pv, image_grid_thw=gth
-                     ).last_hidden_state.cpu().float()
+    # Accuracy check: compare TF language_model vs ATB text model,
+    # both using the SAME ATB-computed vision embeddings + deepstack
+    # features (pre-computed in Phase 1 with TF pixel_values and saved
+    # to CPU).  This isolates the text model — ref.language_model()
+    # is used instead of ref() to avoid re-running vision internally.
     accuracy = None
-    if inputs.get('atb_output') is not None:
-        a = inputs['atb_output'].flatten()
+    if inputs.get('atb_text_tf_vision') is not None:
+        # Reload ATB vision embeddings (saved as CPU float32 in Phase 1)
+        vis_atb = inputs['vis_atb_tf'].half().npu()
+        ds_atb = [d.half().npu() for d in inputs['ds_atb_tf']]
+
+        # Build TF inputs_embeds with ATB vision injection
+        with torch.no_grad():
+            ie_tf = ref.get_input_embeddings()(input_ids).half()
+            tok_emb = ref.get_input_embeddings()(
+                torch.tensor(inputs['img_tok'], dtype=torch.long, device=ie_tf.device))
+            image_mask = (ie_tf == tok_emb).all(-1, keepdim=True).expand_as(ie_tf)
+            image_embeds_cat = torch.cat([vis_atb], dim=0).to(ie_tf.device, ie_tf.dtype)
+            ie_tf = ie_tf.masked_scatter(image_mask, image_embeds_cat)
+
+        # TF language_model with ATB vision features
+        vis_mask = inputs['vis_mask_tf']
+        vis_pos_masks = vis_mask.unsqueeze(0).npu()
+        with torch.no_grad():
+            tf_out = ref.language_model(
+                inputs_embeds=ie_tf,
+                position_ids=inputs['pid_tf'].npu(),
+                visual_pos_masks=vis_pos_masks if ds_atb else None,
+                deepstack_visual_embeds=ds_atb if ds_atb else None,
+            ).last_hidden_state.cpu().float()
+
+        a = inputs['atb_text_tf_vision'].flatten()
         t = tf_out.flatten()
         accuracy = F.cosine_similarity(a.unsqueeze(0), t.unsqueeze(0)).item()
     return results, accuracy
@@ -583,10 +606,38 @@ def main(argv: Optional[list] = None) -> int:
             stages = benchmark_atb_staged(engine, inputs, args.warmup, args.iter)
             atb_e2e = benchmark_atb_e2e(engine, inputs, args.warmup, args.iter)
 
-            # Save one ATB output for accuracy comparison against TF
+            # Save one ATB output (full pipeline, ATB vision + ATB text)
             atb_output = engine.forward(inputs['input_ids'],
                                         inputs['pv_raw'], inputs['grid_thw'])
             inputs['atb_output'] = atb_output
+
+            # Pre-compute ATB vision output using TF pixel_values and
+            # save to CPU.  Then run ATB text model with those vision
+            # embeddings.  In Phase 2, TF's language_model will use the
+            # SAME ATB vision embeddings + deepstack features, giving an
+            # apples-to-apples text-model comparison.
+            pv_tf = inputs['tf_pixel_values'].cpu().float()
+            gth_tf = inputs['tf_grid_thw'].cpu()
+            vis_atb_tf, ds_atb_tf = engine._run_vision(pv_tf, gth_tf)
+            # Save ATB vision output as CPU tensors for Phase 2
+            inputs['vis_atb_tf'] = vis_atb_tf.cpu().float()
+            inputs['ds_atb_tf'] = [d.cpu().float() for d in ds_atb_tf]
+            # Build ATB inputs_embeds with ATB vision injection
+            vis_mask = inputs['input_ids'].squeeze(0) == engine.img_tok
+            ie_atb = F.embedding(inputs['input_ids'], engine.embed_w).half().npu()
+            torch.npu.synchronize()
+            ie_atb[0, vis_mask.npu(), :] = vis_atb_tf
+            pid, _ = get_rope_index(
+                inputs['input_ids'], gth_tf, None, None,
+                image_token_id=engine.img_tok,
+                spatial_merge_size=engine.spatial_merge)
+            engine._ensure_text_graph(S)
+            # ATB text model with ATB vision embeddings (saved for Phase 2 comparison)
+            inputs['atb_text_tf_vision'] = engine._run_text(
+                ie_atb, pid, vis_mask, ds_atb_tf)
+            inputs['vis_mask_tf'] = vis_mask
+            inputs['pid_tf'] = pid
+            inputs['img_tok'] = engine.img_tok
 
             # Save pooler output as .bin
             save_pooler_bin(atb_output, inputs['attention_mask'].cpu(), engine,
