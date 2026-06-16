@@ -171,8 +171,6 @@ def test_text_with_tf_vision(proc, engine, model_dir):
     ref = load_tf_ref(model_dir, precision="half")
 
     name, img = TEST_IMAGES[0]  # use 120x200-red
-    img_arr = torch.from_numpy(np.array(img)).permute(2, 0, 1)
-    pv_atb, gth_atb = engine.preprocess_image(img_arr)
 
     # TF input_ids + pixel_values
     msgs = [{'role': 'user', 'content': [
@@ -194,6 +192,16 @@ def test_text_with_tf_vision(proc, engine, model_dir):
 
     print(f"  vis_tf_npu={vis_tf_npu.shape}  deepstack={len(ds_tf_npu)} features")
 
+    # ── Build TF inputs_embeds using TF embed weights (masked_scatter) ──
+    with torch.no_grad():
+        ie_tf = ref.get_input_embeddings()(input_ids.npu()).half()
+        image_embeds_cat = torch.cat([vis_tf_npu], dim=0).to(ie_tf.device, ie_tf.dtype)
+        tok_emb = ref.get_input_embeddings()(
+            torch.tensor(engine.img_tok, dtype=torch.long, device=ie_tf.device))
+        special_image_mask = (ie_tf == tok_emb)
+        image_mask = special_image_mask.all(-1, keepdim=True).expand_as(ie_tf)
+        ie_tf = ie_tf.masked_scatter(image_mask, image_embeds_cat)
+
     # ── Build ATB text inputs using TF's vision embeds ──
     inputs_embeds = F.embedding(input_ids, engine.embed_w).half().npu()
     vis_mask = input_ids.squeeze(0) == engine.img_tok   # (S,) bool
@@ -212,15 +220,18 @@ def test_text_with_tf_vision(proc, engine, model_dir):
         inputs_embeds, pid, vis_mask,
         ds_tf_npu if ds_tf_npu else None).cpu().float()
 
-    # TF full forward with same pixel_values
+    # TF language_model with same inputs (apples-to-apples comparison)
+    vis_pos_masks = vis_mask.unsqueeze(0).npu()  # (1, S) bool on NPU
     with torch.no_grad():
-        tf_out = ref(
-            input_ids=input_ids.npu(),
-            pixel_values=pv_tf.half().npu(),
-            image_grid_thw=gth_tf.npu()).last_hidden_state.cpu().float()
+        tf_out = ref.language_model(
+            inputs_embeds=ie_tf,
+            position_ids=pid.npu(),
+            visual_pos_masks=vis_pos_masks if ds_tf_npu else None,
+            deepstack_visual_embeds=ds_tf_npu if ds_tf_npu else None,
+        ).last_hidden_state.cpu().float()
 
     cs = cosine(atb_out, tf_out)
-    print(f"\n  ATB _run_text vs TF full forward (same TF vision inputs)")
+    print(f"\n  ATB _run_text vs TF language_model (same TF vision inputs)")
     del ref
     torch.npu.empty_cache()
     return report("text with TF vision embeds", cs)
@@ -231,13 +242,15 @@ def test_text_with_tf_vision(proc, engine, model_dir):
 # ═══════════════════════════════════════════════════════════════════
 
 def test_e2e_with_tf_preprocess(proc, engine, model_dir):
-    """Quick check: run engine.forward() with TF's pixel_values.
+    """Isolate text model with TF vision embeds (loop over test images).
 
-    If this passes but test_e2e fails, the problem is 100% in preprocessing.
+    Feeds TF vision embeddings into both ATB _run_text and TF
+    language_model.  Apples-to-apples comparison at the text-model level.
     """
-    print("\n── Test 4: e2e with TF preprocess (fast check) ──")
+    print("\n── Test 4: text model with TF vision embeds (both images) ──")
 
     ref = load_tf_ref(model_dir, precision="half")
+    from atb_python_qwen3vl_embedding.engine_utils import get_rope_index
 
     all_ok = True
     for name, img in TEST_IMAGES:
@@ -247,21 +260,58 @@ def test_e2e_with_tf_preprocess(proc, engine, model_dir):
         tf_in = proc.apply_chat_template(
             msgs, tokenize=True, return_dict=True, return_tensors='pt')
         input_ids = tf_in['input_ids']
+        S = input_ids.shape[1]
         pv_tf = tf_in['pixel_values']
         gth_tf = tf_in['image_grid_thw']
 
-        # ATB forward with TF pixel_values
-        atb_out = engine.forward(input_ids, pv_tf.float(), gth_tf)
+        print(f"\n  [{name}]  S={S}  pv={pv_tf.shape}  grid={gth_tf.tolist()}")
 
-        # TF forward
+        # ── TF vision → image_embeds + deepstack ──
         with torch.no_grad():
-            tf_out = ref(
-                input_ids=input_ids.npu(),
-                pixel_values=pv_tf.half().npu(),
-                image_grid_thw=gth_tf.npu()).last_hidden_state.cpu().float()
+            vis_tf_out = ref.visual(pv_tf.half().npu(), grid_thw=gth_tf.npu())
+            vis_tf_npu = vis_tf_out[0].half().npu()
+            ds_tf_npu = [d.half().npu() for d in vis_tf_out[1]] if vis_tf_out[1] else []
+
+        # ── Build TF inputs_embeds with TF vision embeds injected ──
+        with torch.no_grad():
+            ie_tf = ref.get_input_embeddings()(input_ids.npu()).half()
+            image_embeds_cat = torch.cat([vis_tf_npu], dim=0).to(ie_tf.device, ie_tf.dtype)
+            tok_emb = ref.get_input_embeddings()(
+                torch.tensor(engine.img_tok, dtype=torch.long, device=ie_tf.device))
+            special_image_mask = (ie_tf == tok_emb)
+            image_mask = special_image_mask.all(-1, keepdim=True).expand_as(ie_tf)
+            ie_tf = ie_tf.masked_scatter(image_mask, image_embeds_cat)
+
+        # ── Build ATB inputs_embeds with TF vision embeds injected ──
+        inputs_embeds_atb = F.embedding(input_ids, engine.embed_w).half().npu()
+        vis_mask = input_ids.squeeze(0) == engine.img_tok
+        inputs_embeds_atb[0, vis_mask.npu(), :] = vis_tf_npu
+
+        # ── Position IDs ──
+        pid, _ = get_rope_index(
+            input_ids, gth_tf, None, None,
+            image_token_id=engine.img_tok,
+            spatial_merge_size=engine.spatial_merge)
+
+        engine._ensure_text_graph(S)
+
+        # ATB _run_text with TF vision embeds + TF deepstack
+        atb_out = engine._run_text(
+            inputs_embeds_atb, pid, vis_mask,
+            ds_tf_npu if ds_tf_npu else None).cpu().float()
+
+        # TF language_model with same inputs
+        vis_pos_masks = vis_mask.unsqueeze(0).npu()
+        with torch.no_grad():
+            tf_out = ref.language_model(
+                inputs_embeds=ie_tf,
+                position_ids=pid.npu(),
+                visual_pos_masks=vis_pos_masks if ds_tf_npu else None,
+                deepstack_visual_embeds=ds_tf_npu if ds_tf_npu else None,
+            ).last_hidden_state.cpu().float()
 
         cs = cosine(atb_out, tf_out)
-        all_ok &= report(f"e2e with TF preprocess ({name})", cs)
+        all_ok &= report(f"text with TF vision ({name})", cs)
 
     del ref
     torch.npu.empty_cache()
@@ -302,8 +352,8 @@ def main():
 Interpretation:
   - If preprocess FAIL but all others PASS → preprocess is the sole issue
   - If vision_only FAIL → vision encoder internals (blocks, merger, RoPE)
-  - If text_with_tf_vision FAIL → deepstack injection or text layer
-  - If e2e_with_tf_preprocess PASS → 100% preprocess problem
+  - If text_with_tf_vision FAIL → text model or deepstack injection (single image)
+  - If e2e_with_tf_preprocess FAIL → text model or deepstack injection (both images)
 """)
 
     return 0 if all(results.values()) else 1
