@@ -34,6 +34,7 @@ def test_patch_embed():
 
     compare_tensors(ref, atb_out, label="VisionPatchEmbed")
     cs = F.cosine_similarity(ref.flatten(), atb_out.flatten(), dim=0).item()
+    # 0.999: single fp16 operator threshold — see THRESHOLDS.md
     return cs > 0.999
 
 if __name__ == '__main__':

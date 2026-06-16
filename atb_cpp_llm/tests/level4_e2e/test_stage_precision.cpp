@@ -34,11 +34,28 @@
 #define IS_OK(s) ((s) == atb_llm::STATUS_OK)
 
 static const std::string MODEL_DIR = GetModelDir();
-// IMAGE_ONLY uses vision-only tokens (no text anchor), so fp16 precision
-// differences in weight loading and position embedding cause larger divergence.
-// IMAGE_AND_TEXT and TEXT_ONLY achieve >0.999 cosine.
+// IMAGE_ONLY uses vision-only tokens (no text anchor).  The final output
+// depends on the *entire* sequence passed through 28 text layers, so any
+// small divergence in the vision preprocessing (C++ BicubicResize vs Python
+// PIL bicubic, max diff ~0.07) propagates and accumulates without a text
+// token anchor to dominate the final pooled vector.
+//
+// IMAGE_AND_TEXT achieves >0.999 because the final pooled token is text
+// (token 1879) — the image contribution is diluted by the text path which
+// is deterministic between C++ and Python (both use the same ATB graphs).
+//
+// The per-stage vision tests (L0–L3 in test_vision_stages) independently
+// confirm that each vision component (patch_embed, pos_embed, RoPE,
+// merger) matches at cos >= 0.999 when given the same input.
+//
+// With identical pixel_values (loaded from Python reference), the engine
+// achieves cos >= 0.999 for IMAGE_ONLY as well.  The 0.9986–0.9993
+// range seen in practice is therefore caused by the bicubic vs bilinear
+// interpolation difference in SmartResize/BicubicResize, not by any bug
+// in the ATB vision or text graphs.
 static const float COSINE_THRESHOLD = 0.99f;
-static const float COSINE_THRESHOLD_IMG_ONLY = 0.90f;
+static const float COSINE_THRESHOLD_IMG_ONLY = 0.99f;
+static const float COSINE_THRESHOLD_ENGINE_ONLY_DIAG = 0.999f;
 
 // ── Binary file loader ──────────────────────────────────────
 // Format: [ndim: int64, shape: int64[ndim], data: float32/...]
@@ -362,6 +379,74 @@ int main() {
                                  ref.data_f32[0], ref.data_f32[1], ref.data_f32[2], ref.data_f32[3],
                                  ref.data_f32[4], ref.data_f32[5], ref.data_f32[6], ref.data_f32[7]);
                     }
+                }
+            }
+
+            // ── IMAGE_ONLY diagnostic: engine-only precision ──────
+            // Use Python reference pixel_values to eliminate preprocessing
+            // differences, isolating engine precision.
+            LOG_INFO("  ── Engine-only diagnostic (Python ref pixel_values) ──");
+            {
+                LoadedArray ref_pixels_f32;
+                LoadedArray ref_grid_thw;
+                if (LoadFloat32("/tmp/stage_pixels.bin", ref_pixels_f32) &&
+                    LoadInt64("/tmp/stage_grid_thw.bin", ref_grid_thw)) {
+                    // Convert Python float32 pixel_values → fp16 for engine input
+                    int64_t ref_np = ref_grid_thw.data_i64[0] *
+                                    ref_grid_thw.data_i64[1] *
+                                    ref_grid_thw.data_i64[2];
+                    int64_t ref_patch_dim = ref_pixels_f32.total_elements / ref_np;
+                    int64_t ref_total = ref_np * ref_patch_dim;
+                    std::vector<uint16_t> ref_pv_fp16(ref_total);
+                    for (int64_t i = 0; i < ref_total; i++) {
+                        ref_pv_fp16[i] = atb_llm::Fp32ToFp16(ref_pixels_f32.data_f32[i]);
+                    }
+
+                    int64_t merge_size = pp_config.pp_merge_size;
+                    int64_t ref_merged_tokens = ref_np / (merge_size * merge_size);
+                    int64_t image_token_id = 151655;
+                    std::vector<int64_t> ref_input_ids(ref_merged_tokens, image_token_id);
+
+                    int64_t ref_grid_thw_arr[3] = {
+                        ref_grid_thw.data_i64[0],
+                        ref_grid_thw.data_i64[1],
+                        ref_grid_thw.data_i64[2]};
+
+                    atb_llm::InferRequest diag_request;
+                    diag_request.mode = atb_llm::InputMode::PREPROCESSED;
+                    diag_request.text.input_ids = ref_input_ids.data();
+                    diag_request.text.batch_size = 1;
+                    diag_request.text.seq_length = ref_merged_tokens;
+                    diag_request.preprocessed.pixel_values = ref_pv_fp16.data();
+                    diag_request.preprocessed.num_patches = ref_np;
+                    diag_request.preprocessed.grid_thw = ref_grid_thw_arr;
+                    diag_request.preprocessed.dtype = ACL_FLOAT16;
+
+                    atb_llm::InferResult diag_result;
+                    atb_llm::Status diag_s = engine->Encode(diag_request, diag_result);
+                    if (!IS_OK(diag_s)) {
+                        LOG_ERROR("  Engine-only diagnostic Encode failed: %d",
+                                  static_cast<int>(diag_s));
+                    } else {
+                        auto diag_data = ResultToFp32(diag_result);
+                        float diag_cos = CosineSim(diag_data.data(), ref.data_f32.data(),
+                                                   std::min(diag_data.size(), ref.data_f32.size()));
+                        float diag_max_d = MaxAbsDiff(diag_data.data(), ref.data_f32.data(),
+                                                      std::min(diag_data.size(), ref.data_f32.size()));
+                        LOG_INFO("  Engine-only (same pixels): Cosine=%.6f, MaxDiff=%.6f",
+                                 diag_cos, diag_max_d);
+                        tests_total++;
+                        if (diag_cos > COSINE_THRESHOLD_ENGINE_ONLY_DIAG) {
+                            tests_passed++;
+                            LOG_INFO("  [INFO] Engine precision is excellent (>0.999) — "
+                                     "IMAGE_ONLY divergence is from preprocessing interpolation");
+                        } else {
+                            LOG_ERROR("  [ERROR] Engine-only cosine=%.6f < 0.999 — "
+                                     "possible engine precision bug", diag_cos);
+                        }
+                    }
+                } else {
+                    LOG_INFO("  SKIP: /tmp/stage_pixels.bin or /tmp/stage_grid_thw.bin not found");
                 }
             }
         }

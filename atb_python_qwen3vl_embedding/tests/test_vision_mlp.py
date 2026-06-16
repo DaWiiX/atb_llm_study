@@ -22,6 +22,7 @@ def test_vision_mlp(hidden_size=128, intermediate_size=256, seqlen=24, seed=42):
         model.linear_fc2.weight.data.half().npu(), model.linear_fc2.bias.data.half().npu(),
     ])[0].cpu().float()
     compare_tensors(ref, atb, label="VisionMLP")
+    # 0.999: single fp16 operator threshold — see THRESHOLDS.md
     return F.cosine_similarity(ref.flatten(), atb.flatten(), dim=0).item() > 0.999
 
 

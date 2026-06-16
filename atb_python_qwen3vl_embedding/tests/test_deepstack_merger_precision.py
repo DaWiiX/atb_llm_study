@@ -81,6 +81,7 @@ def test_deepstack_merger_single(seed=42):
     print(f"  ATB shape: {tuple(atb.shape)}")
     compare_tensors(ref, atb, label="DeepstackMerger-Single")
     cs = F.cosine_similarity(ref.flatten(), atb.flatten(), dim=0).item()
+    # 0.999: single fp16 operator threshold — see THRESHOLDS.md
     ok = cs >= 0.999
     print(f"  {'PASS' if ok else 'FAIL'}  cosine={cs:.6f}  (threshold=0.999)")
     return ok
@@ -134,6 +135,7 @@ def test_deepstack_merger_varied_shapes(seed=42):
         atb = to_cpu_float(atb_out)
 
         cs = F.cosine_similarity(ref.flatten(), atb.flatten(), dim=0).item()
+        # 0.999: single fp16 operator threshold — see THRESHOLDS.md
         ok = cs >= 0.999
         all_ok &= ok
         print(f"  npatches={npatches:<4} → shape={tuple(atb.shape)}  "

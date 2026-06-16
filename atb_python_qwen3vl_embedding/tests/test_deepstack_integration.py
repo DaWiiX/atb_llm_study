@@ -218,7 +218,7 @@ def test_deepstack_extraction(model_dir=None):
     for i in range(len(ds_atb)):
         da, dt = ds_atb[i], ds_tf[i]
         cs = cosine(da, dt)
-        ok = cs >= 0.99
+        ok = cs >= 0.99  # 0.99: moderate fp16 accumulation (deepstack extraction) — see THRESHOLDS.md
         all_ok &= ok
         status = "PASS" if ok else "FAIL"
         print(f"  ds[{ds_indexes[i]}]    {str(tuple(da.shape)):<22} "
@@ -408,7 +408,7 @@ def test_deepstack_injection(model_dir=None):
         if li == 0 or li == n_layer - 1 or li % 8 == 0 or (li < len(ds_tf)):
             cs = cosine(hidden_atb, hidden_tf)
             is_ds = " [+ds]" if li < len(ds_tf) else ""
-            ok = cs >= 0.99
+            ok = cs >= 0.99  # 0.99: moderate fp16 accumulation (multi-layer injection) — see THRESHOLDS.md
             all_ok &= ok
             status = "PASS" if ok else "FAIL"
             print(f"  layer {li:2d}{is_ds:<8} {cs:>10.6f} {status:>8}")
@@ -418,6 +418,7 @@ def test_deepstack_injection(model_dir=None):
     with torch.no_grad():
         out_tf = ref.language_model.norm(hidden_tf).cpu().float()
     cs_final = cosine(out_atb, out_tf)
+    # 0.99: moderate fp16 accumulation (final norm after multi-layer injection) — see THRESHOLDS.md
     ok_final = cs_final >= 0.99
     all_ok &= ok_final
     print(f"  {'─'*50}")

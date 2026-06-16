@@ -1,8 +1,8 @@
 """Test Qwen3VLTextModel: transformers vs ATB (split-graph loop).
 
 Precision thresholds by depth (fp16 accumulation):
-  - 1-2 layers:  0.999  (single op precision, minimal accumulation)
-  - 2-5 layers:  0.99   (moderate accumulation, used for smoke tests)
+  - 1 layer:     0.999  (single op precision, minimal accumulation)
+  - 2+ layers:   0.99   (moderate accumulation, used for smoke tests)
   - 6-27 layers: 0.98   (significant accumulation)
   - 28 layers:   0.95   (full depth; if < 0.95 diagnose per-layer precision)
 
@@ -81,7 +81,7 @@ def test_text_model(B=1, S=16, num_layers=2, seed=42):
     )
 
     cs = F.cosine_similarity(ref_out.flatten(), atb_out.flatten(), dim=0).item()
-    # Float16 accumulation through multi-layer: allow 0.99
+    # 0.99 (2+ layers): moderate fp16 accumulation; 0.999 (1 layer): single op — see THRESHOLDS.md
     threshold = 0.99 if num_layers >= 2 else 0.999
     print(f"[TextModel-{num_layers}L] shape: {ref_out.shape}  cosine: {cs:.6f}")
     print(f"[TextModel-{num_layers}L] PASS (>{threshold})" if cs > threshold else f"FAIL (<={threshold})")
@@ -155,7 +155,7 @@ def test_text_model_28_layers(B=1, S=16, seed=42):
     cs = F.cosine_similarity(ref_out.flatten(), atb_out.flatten(), dim=0).item()
     mse = F.mse_loss(ref_out.float(), atb_out.float()).item()
     max_diff = (ref_out.float() - atb_out.float()).abs().max().item()
-    # Float16 accumulation through 28 layers: allow 0.95.
+    # 0.95: full 28-layer fp16 accumulation threshold — see THRESHOLDS.md.
     # If cosine < 0.95, diagnose per-layer precision to rule out code bugs.
     threshold = 0.95
     print(f"[TextModel-{num_layers}L] shape: {ref_out.shape}  cosine: {cs:.6f}  "

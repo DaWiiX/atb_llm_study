@@ -37,6 +37,7 @@ def test_preprocess():
     cs = F.cosine_similarity(tf_pv.float().flatten(), my_pv.flatten(), dim=0)
     print(f"pixel_values cosine: {cs:.6f}")
     print(f"grid_thw match: {torch.equal(tf_gth, my_gth)}")
+    # 0.999: single fp16 operator threshold — see THRESHOLDS.md
     print("PASS" if cs > 0.999 else "FAIL")
 
     return cs > 0.999

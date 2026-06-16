@@ -8,7 +8,7 @@
 
 | # | 严重度 | 区域 | 问题摘要 |
 |---|--------|------|----------|
-| [P1](#p1) | 🔴 高 | C++ | IMAGE_ONLY 余弦阈值 0.90 可能隐藏精度 bug |
+| [P1](#p1) | 🔴→🟢 已修复 | C++ | IMAGE_ONLY 余弦阈值 0.90 可能隐藏精度 bug | ✅ 2026-06-16 |
 | [P2](#p2) | 🔴→🟢 已修复 | C++ | Stage L2a 静默忽略低于阈值的精度结果 | ✅ 2026-06-15 |
 | [P3](#p3) | 🔴→🟢 已修复 | C++ | DecoderLayer MHA+causal mask 精度测试缺失 | ✅ 2026-06-15 |
 | [P4](#p4) | 🔴 高 | C++ | DeepSeek/Mixtral/Qwen3(non-VL) 零测试覆盖 |
@@ -17,18 +17,18 @@
 | [P7](#p7) | 🔴→🟢 已修复 | C++ | BicubicResize 参考实现自证（非独立参考） | ✅ 2026-06-16 |
 | [P8](#p8) | 🟡→🟢 已修复 | Python | test_text_attention.py 与 test_310p_diag.py 冗余 | ✅ 2026-06-15 |
 | [P9](#p9) | 🟡→🟢 已修复 | Python | test_nz_quick_verify.py 与 test_nz_format_verify.py 冗余 | ✅ 2026-06-15 |
-| [P10](#p10) | 🟡 中 | Python | test_embedder_e2e.py 与 test_e2e.py + benchmark.py 重叠 |
+| [P10](#p10) | 🟡→🟢 已修复 | Python | test_embedder_e2e.py 与 test_e2e.py + benchmark.py 重叠 | ✅ 2026-06-16 |
 | [P11](#p11) | 🟡→🟢 已修复 | C++ | test_consistency.cpp 是 test_accuracy.cpp 的子集 | ✅ 2026-06-15 |
 | [P12](#p12) | 🟡 中 | C++/Python | 预处理阶段在多个文件中重复测试 |
 | [P13](#p13) | 🟡 中 | Python | set_atb_buffer_size 调用位置不一致（7+9 个文件） |
 | [P14](#p14) | 🟡 中 | Python | 模型加载代码在 6 个文件中重复 |
 | [P15](#p15) | 🟡 中 | Python | 单元测试使用非真实模型维度 |
-| [P16](#p16) | 🟡 中 | Python | 无自动化测试运行器 / 汇总脚本 |
+| [P16](#p16) | 🟡→🟢 已修复 | Python | 无自动化测试运行器 / 汇总脚本 | ✅ 2026-06-16 |
 | [P17](#p17) | 🟡 中 | C++ | test_config_wiring.cpp 硬编码 epsilon 阈值 |
-| [P18](#p18) | 🟢 低 | Python | IMAGE_TOKEN_ID 硬编码（应从 config 读取） |
+| [P18](#p18) | 🟢→🟢 已修复 | Python | IMAGE_TOKEN_ID 硬编码（应从 config 读取） | ✅ 2026-06-16 |
 | [P19](#p19) | 🟢→🟢 已修复 | Python | 死代码：VISION_START_TOKEN_ID / run_quick_tf 未使用参数 | ✅ 2026-06-15 |
-| [P20](#p20) | 🟢 低 | Python | 测试间余弦阈值不一致且缺乏文档说明 |
-| [P21](#p21) | 🟢 低 | Python | benchmark.py 手动复制 engine._run_vision 逻辑 |
+| [P20](#p20) | 🟢→🟢 已修复 | Python | 测试间余弦阈值不一致且缺乏文档说明 | ✅ 2026-06-16 |
+| [P21](#p21) | 🟢→🟢 已修复 | Python | benchmark.py 手动复制 engine._run_vision 逻辑 | ✅ 2026-06-16 |
 
 ---
 

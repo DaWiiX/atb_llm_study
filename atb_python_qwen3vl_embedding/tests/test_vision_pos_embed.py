@@ -99,6 +99,7 @@ def run_test(engine, grid_thw, threshold):
 
 def main(argv: Optional[list] = None) -> int:
     p = argparse.ArgumentParser(description=__doc__.split('\n', 1)[0])
+    # 0.999: single fp16 operator threshold — see THRESHOLDS.md
     p.add_argument('--threshold', type=float, default=0.999,
                    help='Cosine similarity threshold for PASS (default 0.999)')
     p.add_argument('--model-dir', default=QWEN3VL_EMB_MODEL_DIR,

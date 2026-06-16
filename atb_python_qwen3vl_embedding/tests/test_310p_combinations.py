@@ -89,6 +89,7 @@ def _run_full_attention(name, num_heads, num_kv_heads, head_dim,
 
         atb_out = graph_op.forward(inputs)[0].cpu().float()
         cos = _cosine(ref_out, atb_out)
+        # 0.99: moderate fp16 accumulation (single attention, cross-framework) — see THRESHOLDS.md
         ok = cos > 0.99
         status = "PASS" if ok else f"FAIL (cos={cos:.6f})"
         print(f"    {status}")

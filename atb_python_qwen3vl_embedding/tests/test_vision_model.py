@@ -46,6 +46,7 @@ def test_vision_model(depth=1, seed=42):
                               g_first, g_block, g_merger)
     compare_tensors(ref, atb, label=f"VisionModel-D{depth}")
     cs = F.cosine_similarity(ref.flatten(), atb.flatten(), dim=0).item()
+    # 0.999: single fp16 operator threshold — see THRESHOLDS.md
     return cs > 0.999
 
 

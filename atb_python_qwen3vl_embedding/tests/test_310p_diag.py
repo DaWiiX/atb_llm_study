@@ -82,6 +82,7 @@ def _run_attention_test(name, num_heads, num_kv_heads, head_dim, use_mask, B=1, 
         cos = _cosine(ref_out, atb_out)
         mse = float(torch.mean((ref_out.float() - atb_out.float()) ** 2))
         max_diff = float(torch.max(torch.abs(ref_out.float() - atb_out.float())))
+        # 0.99: moderate fp16 accumulation (single attention, cross-framework) — see THRESHOLDS.md
         ok = cos > 0.99
         status = "PASS" if ok else f"FAIL (cos={cos:.6f})"
         print(f"    {status}  mse={mse:.8f}  max_diff={max_diff:.8f}")

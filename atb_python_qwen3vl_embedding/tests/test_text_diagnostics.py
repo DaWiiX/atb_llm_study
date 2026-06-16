@@ -56,6 +56,7 @@ def cosine(a, b):
 
 
 def report(label, cs, threshold=0.999):
+    """Report PASS/FAIL. Default 0.999: single fp16 operator threshold — see THRESHOLDS.md."""
     status = "PASS" if cs >= threshold else "FAIL"
     print(f"  [{status}] {label:<35} cosine={cs:.6f}")
     return cs >= threshold
@@ -115,6 +116,7 @@ def test_embed_weights(engine, model_dir):
     print(f"  Exact match: {exact_match}")
     print(f"  Max diff: {(atb_w - tf_w).abs().max().item():.8f}")
 
+    # 0.9999: identity check — same safetensors weights, any deviation is a loading bug
     return report("embed_tokens weight", cs, threshold=0.9999)
 
 
@@ -170,6 +172,7 @@ def test_position_ids(proc, engine, model_dir):
                 b, s, d = idx.tolist()
                 print(f"    [{b},{s},{d}]: atb={atb_pid[b,s,d].item()} tf={tf_pid[b,s,d].item()}")
 
+        # 0.9999: identity check — same position_id computation, any deviation is a logic bug
         all_ok &= report(f"position_ids ({name})", cs, threshold=0.9999)
 
     return all_ok
@@ -226,6 +229,7 @@ def test_rope_cos_sin(proc, engine, model_dir):
 
         cs_cos = cosine(atb_cos, tf_cos)
         cs_sin = cosine(atb_sin, tf_sin)
+        # 0.9999: identity check — same RoPE computation with same position_ids, any deviation is a numerical bug
         all_ok &= report(f"cos ({name})", cs_cos, threshold=0.9999)
         all_ok &= report(f"sin ({name})", cs_sin, threshold=0.9999)
 
@@ -264,6 +268,7 @@ def test_causal_mask():
             if diff_mask.any():
                 print(f"  Diff positions: {diff_mask.nonzero(as_tuple=False).tolist()[:5]}")
 
+        # 0.9999: identity check — deterministic mask construction, any deviation is a logic bug
         report(f"causal mask S={S}", cs, threshold=0.9999)
 
     return True  # always pass (just print)
@@ -340,6 +345,7 @@ def test_text_layer(proc, engine, model_dir):
     print(f"\n  S={S}  atb_out: {atb_out.shape}  tf_out: {tf_out.shape}")
     print(f"  cosine: {cs:.6f}")
 
+    # 0.99: moderate fp16 accumulation threshold (single text layer + GQA) — see THRESHOLDS.md
     if cs < 0.99:
         print("\n  DEBUG: checking individual layer weights...")
         # Compare layer weights
@@ -361,6 +367,7 @@ def test_text_layer(proc, engine, model_dir):
             }
             tf_w = ref.language_model.layers[0].get_parameter(tf_name_map[name]).cpu().float()
             w_cs = cosine(atb_w, tf_w)
+            # 0.999: single fp16 operator threshold — weight comparison for debugging per-layer precision
             status = "OK" if w_cs > 0.999 else "MISMATCH"
             print(f"    {name:<12} cosine={w_cs:.6f} [{status}]")
 

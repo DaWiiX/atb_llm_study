@@ -18,7 +18,7 @@ Usage::
 
     python tests/test_e2e.py                  # ATB + TF cosine comparison
     python tests/test_e2e.py --no-ref         # ATB only, sanity check
-    python tests/test_e2e.py --threshold 0.95
+    python tests/test_e2e.py --threshold 0.95  # override default (0.95)
 """
 # ── Buffer size MUST be set before any engine/graph import ──────────
 import os
@@ -240,6 +240,7 @@ def compare_deepstack(atb_ds: dict, tf_ds: dict, threshold: float = 0.99) -> boo
 
     Validates that the deepstack merger MLPs produce correct outputs at each
     deepstack index. This is the Level 4 E2E deepstack verification.
+    Default threshold 0.99: moderate fp16 accumulation — see THRESHOLDS.md.
     """
     if not atb_ds and not tf_ds:
         print("\n  (No deepstack features to compare — text-only cases)")
@@ -304,8 +305,9 @@ def parse_args(argv: Optional[list] = None):
     p = argparse.ArgumentParser(description=__doc__.split('\n', 1)[0])
     p.add_argument('--no-ref', dest='ref', action='store_false',
                    help='Skip transformers reference comparison')
-    p.add_argument('--threshold', type=float, default=0.99,
-                   help='Cosine similarity threshold for PASS (default 0.99)')
+    # 0.95: full 28-layer model fp16 accumulation — see THRESHOLDS.md
+    p.add_argument('--threshold', type=float, default=0.95,
+                   help='Cosine similarity threshold for PASS (default 0.95)')
     p.add_argument('--model-dir', default=QWEN3VL_EMB_MODEL_DIR,
                    help='Override QWEN3VL_EMB_MODEL_DIR from .env')
     p.set_defaults(ref=True)

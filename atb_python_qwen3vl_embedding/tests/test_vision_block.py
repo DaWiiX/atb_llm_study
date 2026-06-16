@@ -41,6 +41,7 @@ def test_vision_block(hs=128, nh=4, seqlen=24, seed=42):
         torch.tensor([seqlen], dtype=torch.int32),
     ])[0].cpu().float()
     compare_tensors(ref, atb, label="VisionBlock")
+    # 0.999: single fp16 operator threshold — see THRESHOLDS.md
     return F.cosine_similarity(ref.flatten(), atb.flatten(), dim=0).item() > 0.999
 
 

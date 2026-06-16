@@ -29,7 +29,9 @@ def cosine(a, b):
 
 
 def report(label, cs, threshold=0.99):
-    """Print a PASS/FAIL line."""
+    """Print a PASS/FAIL line.
+    Default threshold 0.99: moderate fp16 accumulation — see THRESHOLDS.md.
+    """
     status = "PASS" if cs >= threshold else "FAIL"
     print(f"  [{status}] {label:<30} cosine={cs:.6f}")
     return cs >= threshold
@@ -96,6 +98,7 @@ def test_preprocess_match(proc, engine):
 
         # pixel_values cosine
         cs = cosine(pv_atb, pv_tf.float())
+        # 0.999: single fp16 operator threshold — preprocessing path, negligible accumulation
         all_ok &= report(f"pixel_values cosine ({name})", cs, threshold=0.999)
 
         # max diff

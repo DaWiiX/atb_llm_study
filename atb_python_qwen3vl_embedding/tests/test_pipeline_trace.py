@@ -35,6 +35,7 @@ def cosine(a, b):
 
 
 def trace(label, atb, tf):
+    """Trace step-by-step comparison. Threshold 0.99: moderate fp16 accumulation — see THRESHOLDS.md."""
     cs = cosine(atb, tf)
     status = "✅" if cs > 0.99 else "❌"
     print(f"  {status} {label:<35} cosine={cs:.6f}")
@@ -210,7 +211,7 @@ def main():
         if li == 0 or li == engine.n_layer - 1 or li % 4 == 0 or li in ds_indexes:
             cs = cosine(hidden_atb.cpu(), hidden_tf.cpu())
             ds_tag = " [+ds]" if li in ds_indexes else ""
-            status = "✅" if cs > 0.99 else "❌"
+            status = "✅" if cs > 0.99 else "❌"  # 0.99: moderate fp16 accumulation — see THRESHOLDS.md
             print(f"  {status} layer {li:2d}{ds_tag:<8} cosine={cs:.6f}")
 
     # ── Step 7: Final norm ────────────────────────────────────────
