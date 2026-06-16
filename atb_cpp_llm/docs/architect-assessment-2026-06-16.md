@@ -182,3 +182,252 @@ P2 (改善项，按需):
 
 *报告生成: 2026-06-16 | Agent 总数: 8 (3 Explore + 4 Action + 1 Verify)*
 *详细发现日志: 见各 agent output file*
+
+---
+
+## 8. 已完成修复清单（第 1 批：G1, G2, G3, B1）
+
+**分支**: `fix/benchmark`（基于 `fix/tests`），已推送至 `origin`。
+
+| # | 目标 | 提交 | 状态 | 审查轮次 | 说明 |
+|---|------|------|------|----------|------|
+| G1 | gthw null guard | `c697bc7` | ✅ 已完成 | 1 轮通过 | `qwen3vl_model.cpp:302` 添加 `gthw` 空指针检查，防止 UB |
+| G2 | CopyToDevice/CopyToHost 返回值检查 | `cd529f1` | ✅ 已完成 | 1 轮通过 | 修复 16 处（超预估的 13 处）未检查返回值的调用点 |
+| G3 | 部署 checklist 文档 | `e6aa3ab` | ✅ 已完成 | 2 轮（首轮 25 问题→全部修复） | 新增 `docs/deployment-checklist.md`（692 行），所有命令与源码一致 |
+| B1 | P50/P95/P99 百分位 | `7a755ed` | ✅ 已完成 | 2 轮（7 问题→全部修复） | `benchmark.py` 添加线性插值百分位函数，集成至所有输出行和对比表 |
+
+### 8.1 G1 详情：gthw null guard
+
+在 `ForwardWithTiming` 入口添加防御性检查：
+```cpp
+if (!gthw) {
+    LOG_ERROR("ForwardWithTiming: grid_thw and metadata are both null");
+    return ERROR_INVALID_PARAM;
+}
+```
+- 位置：`qwen3vl_model.cpp` 第 306-309 行
+- 影响：防止 `gthw` 和 metadata 同时为空时的未定义行为（生产环境罕见但理论上可能）
+
+### 8.2 G2 详情：CopyToDevice/CopyToHost 返回值检查
+
+覆盖了 `qwen3vl_model.cpp` 中全部 `CopyToDevice`（15 处）和 `CopyToHost`（3 处）调用，统一使用模式：
+```cpp
+Status s = alloc->CopyToDevice(tensor, data, size);
+if (s != STATUS_OK) {
+    LOG_ERROR("FuncName: copy xxx to device failed");
+    return s;
+}
+```
+- 总计 88 行新增、28 行删除
+- 审查 agent 逐一验证了每个调用点的日志信息和错误返回路径
+
+### 8.3 G3 详情：部署 checklist 文档
+
+新增 `atb_cpp_llm/docs/deployment-checklist.md`（692 行），涵盖：
+
+| 章节 | 内容 |
+|------|------|
+| 1. 部署前验证 | 硬件检查、软件依赖、模型完整性、构建验证 |
+| 2. 运行时配置 | 环境变量、ATB buffer pool 大小表、日志路径、内存限制 |
+| 3. 健康检查 | 启动检查 `--mode all --iter 1`、运行时 cron job、监控阈值 |
+| 4. 优雅关闭 | 信号处理表、drain timeout、RAII 析构链 |
+| 5. 运维流程 | 日志轮转、模型权重更新 SOP、回滚、事故响应表 |
+| 6. 容量规划 | 吞吐量参考、并发策略、扩展指导 |
+| 附录 A | 汇总 checkbox |
+| 附录 B | `atb_diag.sh` 一键诊断脚本 |
+| 附录 C | ATB 错误码速查表 |
+
+**首轮审查 25 个问题（5 严重）的根因**：文档中虚构了不存在的 CLI 参数（`--mode load-only`、`--mode health`、`--model`、`./server` 二进制等）。第二轮通过阅读 `benchmark.cpp` 和 `CMakeLists.txt` 源码获取真实接口（`--mode all`、`QWEN3VL_EMB_MODEL_DIR` 环境变量等），全部命令重写验证。
+
+### 8.4 B1 详情：P50/P95/P99 百分位
+
+在 `benchmark.py` 中添加线性插值百分位函数：
+```python
+def percentile(vals, p):
+    """Compute p-th percentile via linear interpolation."""
+    if not (0.0 <= p <= 1.0):
+        raise ValueError(f"p must be between 0.0 and 1.0, got {p}")
+    sorted_vals = sorted(vals)
+    n = len(sorted_vals)
+    if n == 0:
+        return float('nan')
+    if n == 1:
+        return float(sorted_vals[0])
+    k = (n - 1) * p
+    f = int(k)
+    c = k - f
+    if f + 1 < n:
+        return float(sorted_vals[f] + c * (sorted_vals[f + 1] - sorted_vals[f]))
+    return float(sorted_vals[f])
+```
+- 与 NumPy `np.percentile(method='linear')` 对齐
+- 集成至 E2E、vision model、text model 输出行
+- 在 ATB-vs-TF 对比表中新增 P95 列
+- 总计 49 行新增、6 行删除
+
+**首轮审查 7 个问题（2 bug）**：
+- 返回类型不一致（`numpy.float64` vs Python `float`）→ 用 `float(...)` 包裹
+- 空数据返回 `0.0` 而非 `NaN` → 改为 `float('nan')`
+- 要求预排序输入 → 内部调用 `sorted(vals)`
+- 无 p 范围校验 → 添加 `ValueError`
+- 缩进不一致和表格宽度问题 → 格式化修复
+
+---
+
+## 9. 工作方法：Developer → Reviewer → Re-review 循环
+
+### 9.1 方法论
+
+每个修复项执行以下流程，**直到审查 agent 找不到任何问题为止**：
+
+```
+┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
+│  Developer      │────▶│  Reviewer       │────▶│  Re-review      │
+│  Agent          │     │  Agent          │     │  Agent          │
+│                 │     │                 │     │                 │
+│ · 上下文干净    │     │ · 上下文干净    │     │ · 上下文干净    │
+│ · 按计划执行    │     │ · 辩证挑刺      │     │ · 验证修复      │
+│ · 思考全面      │     │ · 逐项对照计划  │     │ · 确认零问题    │
+│ · 自省不糊弄    │     │ · 不放过小问题  │     │ · 最终裁决      │
+└─────────────────┘     └─────────────────┘     └─────────────────┘
+         │                       │                       │
+         │   发现 N 个问题       │                       │
+         │◀──────────────────────│                       │
+         │   修复后重新提交      │                       │
+         │──────────────────────▶│   0 个问题            │
+         │                       │──────────────────────▶│
+         │                       │                       │  确认通过 ✅
+```
+
+### 9.2 各修复项审查统计
+
+| 修复项 | 首轮发现问题 | 第二轮发现问题 | 总轮次 | 问题类型 |
+|--------|-------------|---------------|--------|----------|
+| G1 | 0 | — | 1 | — |
+| G2 | 0 | — | 1 | — |
+| G3 | 25（5 严重） | 0 | 2 | 虚构 CLI 参数、缺失验证步骤、文档结构 |
+| B1 | 7（2 bug） | 0 | 2 | 返回类型不一致、空数据行为、参数校验缺失 |
+
+### 9.3 方法论洞察
+
+**为什么需要审查循环**：
+
+1. **Developer agent 天然带有"建设者偏见"** — 倾向于验证自己的代码能工作，而非寻找边界情况
+2. **Reviewer agent 天然带有"破坏者视角"** — 会从相反方向思考，寻找一切可能出错的地方
+3. **首轮即通过的项（G1、G2）说明问题定义清晰、修改范围小** — 单点修复不需要多轮
+4. **需要 2 轮的项（G3、B1）说明初始需求有歧义空间** — 文档创作和新功能实现容易引入假设性错误
+
+**关键原则**：
+- Developer 和 Reviewer **必须使用不同的 agent 实例**（上下文隔离、视角独立）
+- Reviewer agent 的 prompt 应明确要求"辩证性地挑毛病"，而非"验证正确性"
+- 每个审查轮次结束后，**architect 只负责汇总发现并派发下一轮**，不参与具体修复
+- Reviewer 不会给出"这段代码写得不错"的评价 — 它只输出问题清单；零问题输出 = 通过
+
+---
+
+## 10. 预防措施：如何避免类似问题
+
+### 10.1 根因分析
+
+本轮发现的各类问题可归纳为以下根因类别：
+
+| 根因类别 | 示例 | 出现频次 |
+|----------|------|----------|
+| **接口假设错误** | G3: 虚构 `--mode load-only`/`--model`；B1: 假设输入已排序 | 高 |
+| **边界条件遗漏** | G1: `gthw` 空指针未检查；B1: 空列表返回 0.0 而非 NaN | 高 |
+| **返回值忽略** | G2: 16 处 `CopyToDevice`/`CopyToHost` 返回值未检查 | 中 |
+| **类型不一致** | B1: 返回 `np.float64` 而非 Python `float` | 低 |
+
+### 10.2 预防机制
+
+#### A. 开发阶段预防
+
+**1. 接口契约检查清单**（适用于任何新功能/文档）：
+- [ ] 所有引用的 CLI 参数/API 是否在源码中真实存在？
+- [ ] 所有引用的文件路径/二进制名称是否在构建系统中存在？
+- [ ] 所有配置项是否有对应的环境变量或配置文件定义？
+- **验证方式**: `grep` 源码确认，不可凭记忆或推断
+
+**2. 边界条件检查清单**（适用于任何函数/方法）：
+- [ ] 所有指针/引用参数是否检查了 `nullptr`/`None`？
+- [ ] 所有容器输入是否处理了空容器情况？
+- [ ] 所有数值计算是否检查了除零/空集/越界？
+- [ ] 所有返回值是否检查了错误码？
+
+**3. 代码审查检查清单**（Reviewer 视角）：
+- [ ] 是否存在"看起来合理但实际错误的假设"？（最常见陷阱）
+- [ ] 错误路径是否可达且有测试覆盖？
+- [ ] 文档中的命令是否可以直接复制粘贴执行？
+
+#### B. CI/CD 阶段预防
+
+**4. 自动化检查建议**（推荐加入 CI pipeline）：
+
+| 检查项 | 工具/方法 | 覆盖的问题类别 |
+|--------|----------|---------------|
+| 文档-二进制一致性 | 解析文档中的 `` `--flag` `` 模式，与 `--help` 输出对比 | 接口假设错误 |
+| 返回值检查 lint | C++ 扫描 `CopyToDevice`/`CopyToHost` 调用，确保返回值被消费 | 返回值忽略 |
+| 空指针检查 lint | C++ 扫描函数参数使用，确保有 null guard | 边界条件遗漏 |
+| Python 类型检查 | 对公开 API 添加类型注解，CI 中运行 `mypy` | 类型不一致 |
+
+#### C. 流程阶段预防
+
+**5. Developer-Reviewer 双人流程**（即本报告第 9 节的方法论）：
+- 所有非平凡修改（>20 行或涉及新文件）必须经过独立的 reviewer agent
+- Reviewer 必须从"这段代码哪里会出问题"的角度审阅，而非"这段代码对不对"
+- 发现问题后 developer 修复并重新提交，reviewer 重新审阅直到零问题
+
+**6. "真值验证"原则**：
+- 文档中的任何命令/参数/路径必须能追溯到源码（不可推断）
+- 性能数据的对比基线必须与生产环境一致（不可用不同配置）
+- 测试的参考实现必须是同输入下的黄金标准（本项目中为 transformers）
+
+### 10.3 与现有 CLUADE.md 测试精度原则的关系
+
+本项目 CLAUDE.md 已规定：
+> 绝不通过降低验收标准来"通过"测试。如果 C++ 和 Python 在相同输入下余弦相似度低于 0.99，说明存在 bug，必须定位并修复根因，而不是放宽阈值。
+
+本报告的预防措施是对该原则的**补充和扩展** — 精度原则覆盖"怎么验证正确性"，本报告的清单覆盖"怎么在第一时间避免写错"。
+
+---
+
+## 11. 后续工作计划
+
+### 11.1 当前状态
+
+| 维度 | 已完成 | 进行中 | 待开始 |
+|------|--------|--------|--------|
+| C++ 端鲁棒性 | G1, G2, G3 ✅ | — | — |
+| Benchmark 增强 | B1 ✅ | — | B2-B7 |
+| Python 端 P0 | — | — | P0-1 ~ P0-4 |
+| Python 端 P1/P2 | — | — | 48 项 |
+
+### 11.2 第 2 批目标建议（4 项）
+
+按"先将 C++ 端完善，Python 端提供可信参考"的既定策略：
+
+| # | 目标 | 严重程度 | 预估工作量 | 说明 |
+|---|------|----------|------------|------|
+| **B2** | NPU 内存使用量测量 | P1 | 2h | benchmark.py 添加 peak HBM 监控（`torch.npu.max_memory_allocated()`），与 C++ benchmark memory reporting 对齐 |
+| **P0-1** | engine.py sync 竞态修复 | P0 | 1h | vision block 循环后添加 `torch.npu.synchronize()`，确保 `run_merger_npu` 不会在 block N 完成前读取 hidden states |
+| **P0-2** | engine.py 资源清理 | P0 | 1.5h | 添加 `close()` 方法 + `__del__` + context manager (`__enter__`/`__exit__`)，确保 NPU 内存和 ATB graph 在异常/销毁时正确释放 |
+| **P0-3** | engine_utils.py 错误处理 | P0 | 1h | `load_config()`、`load_weights()`、`load_preprocessor_config()` 添加 try/except + 诊断错误消息 |
+
+### 11.3 后续批次概览
+
+| 批次 | 内容 | 触发条件 |
+|------|------|----------|
+| 第 3 批 | P0-4（输入校验）+ B3（冷启动 benchmark）+ B4（吞吐量 benchmark） | 第 2 批完成 |
+| 第 4 批 | Python P1 项（28 项）+ B5（回归检测） | 第 3 批完成 |
+| 第 5 批 | Python P2 项（20 项）+ B6/B7（preprocess 计时 + 硬编码数据清理） | 第 4 批完成 |
+
+每完成 4 项目标后进行状态汇报和 plan 更新。
+
+---
+
+## 12. 修订记录
+
+| 日期 | 修订内容 |
+|------|----------|
+| 2026-06-16 | 初始评估报告（8 agent：3 Explore + 4 Action + 1 Verify） |
+| 2026-06-16 | 第 1 批修复完成：G1, G2, G3, B1（4/4 ✅）；新增第 8-12 节（已完成清单、方法论、预防措施、后续计划） |
