@@ -68,6 +68,32 @@ def ms(seconds_list):
     return np.asarray(seconds_list) * 1000.0
 
 
+def percentile(vals, p):
+    """Compute p-th percentile using linear interpolation.
+
+    Args:
+        vals: iterable of numeric values (need not be pre-sorted)
+        p: percentile as fraction (0.0-1.0), e.g., 0.50 for P50
+
+    Returns:
+        Interpolated percentile value (float), or NaN if vals is empty.
+    """
+    if not (0.0 <= p <= 1.0):
+        raise ValueError(f"p must be between 0.0 and 1.0, got {p}")
+    sorted_vals = sorted(vals)
+    n = len(sorted_vals)
+    if n == 0:
+        return float('nan')
+    if n == 1:
+        return float(sorted_vals[0])
+    k = p * (n - 1)
+    f = int(k)
+    c = k - f
+    if f + 1 < n:
+        return float(sorted_vals[f] + c * (sorted_vals[f + 1] - sorted_vals[f]))
+    return float(sorted_vals[f])
+
+
 # ═══════════════════════════════════════════════════════════════════
 # Input construction (shared between ATB and TF phases)
 # ═══════════════════════════════════════════════════════════════════
@@ -381,17 +407,30 @@ def print_atb_report(resolution, S, n_vis_tokens, stages, atb_e2e):
     print(f"{'Staged sum':<18} {total:>12.2f}")
     print(f"{'E2E (no sync)':<18} {atb_arr.mean():>10.2f} ± {atb_arr.std():.2f}")
 
+    # ── Percentiles (E2E + key stages) ──────────────────────────────
+    e2e_p50 = percentile(atb_arr, 0.50)
+    e2e_p95 = percentile(atb_arr, 0.95)
+    e2e_p99 = percentile(atb_arr, 0.99)
+    print(f"E2E P50/P95/P99: {e2e_p50:.2f} / {e2e_p95:.2f} / {e2e_p99:.2f} ms")
+    for key in ['vision_model', 'text_model']:
+        stage_vals = ms(stages[key])
+        p50 = percentile(stage_vals, 0.50)
+        p95 = percentile(stage_vals, 0.95)
+        p99 = percentile(stage_vals, 0.99)
+        print(f"{STAGE_LABELS[key]} P50/P95/P99: {p50:.2f} / {p95:.2f} / {p99:.2f} ms")
+
 
 def print_atb_vs_tf_table(all_results):
     """Final ATB-vs-TF comparison table across all resolutions."""
-    print(f"\n{'=' * 90}")
+    print(f"\n{'=' * 102}")
     print(f"{'Resolution':<14}{'S':>6}{'VisTok':>9}"
-          f"{'ATB E2E (ms)':>18}{'TF E2E (ms)':>18}{'Ratio':>8}{'Cosine':>9}")
-    print(f"{'─' * 90}")
+          f"{'ATB E2E (ms)':>18}{'P95':>10}{'TF E2E (ms)':>18}{'Ratio':>8}{'Cosine':>9}")
+    print(f"{'─' * 102}")
     for (w, h), r in all_results.items():
         atb_arr = ms(r['atb_e2e'])
         tf_arr = ms(r['tf_e2e']) if r.get('tf_e2e') else None
         acc = r.get('accuracy')
+        atb_p95 = percentile(atb_arr, 0.95)
         atb_str = f"{atb_arr.mean():>8.1f} ± {atb_arr.std():<5.1f}"
         if tf_arr is not None:
             tf_str = f"{tf_arr.mean():>8.1f} ± {tf_arr.std():<5.1f}"
@@ -401,8 +440,8 @@ def print_atb_vs_tf_table(all_results):
             ratio = "—"
         acc_str = f"{acc:.4f}" if acc is not None else "—"
         print(f"{w}x{h:<8}{r['S']:>6}{r['n_vis']:>9}"
-              f"{atb_str:>18}{tf_str:>18}{ratio:>8}{acc_str:>9}")
-    print(f"{'=' * 90}")
+              f"{atb_str:>18}{atb_p95:>10.1f}{tf_str:>18}{ratio:>8}{acc_str:>9}")
+    print(f"{'=' * 102}")
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -542,7 +581,11 @@ def main(argv: Optional[list] = None) -> int:
                 e2e_times.append(now() - t_start)
 
             e2e_arr = ms(e2e_times)
-            print(f"  Text E2E: {e2e_arr.mean():.2f} ± {e2e_arr.std():.2f} ms")
+            tx_p50 = percentile(e2e_arr, 0.50)
+            tx_p95 = percentile(e2e_arr, 0.95)
+            tx_p99 = percentile(e2e_arr, 0.99)
+            print(f"  Text E2E: {e2e_arr.mean():.2f} ± {e2e_arr.std():.2f} ms  "
+                  f"(P50={tx_p50:.2f} P95={tx_p95:.2f} P99={tx_p99:.2f})")
 
             # Save pooler output as .bin
             atb_output = engine.forward(text_input_ids, None, None)
