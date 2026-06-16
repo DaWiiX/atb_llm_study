@@ -45,6 +45,7 @@ import torch_npu  # noqa: F401
 from PIL import Image
 
 from atb_python_qwen3vl_embedding.env import QWEN3VL_EMB_MODEL_DIR
+from atb_python_qwen3vl_embedding.tests.data_utils import load_tf_ref
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -56,27 +57,10 @@ def cosine(a, b):
 
 
 def report(label, cs, threshold=0.999):
+    """Report PASS/FAIL. Default 0.999: single fp16 operator threshold — see THRESHOLDS.md."""
     status = "PASS" if cs >= threshold else "FAIL"
     print(f"  [{status}] {label:<35} cosine={cs:.6f}")
     return cs >= threshold
-
-
-def load_tf_ref(model_dir: str):
-    """Load Qwen3VLModel on NPU (half precision) from safetensors."""
-    import safetensors.torch
-    from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLConfig
-    from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLModel
-
-    cfg = Qwen3VLConfig.from_pretrained(model_dir, trust_remote_code=True)
-    cfg._attn_implementation = "eager"
-    cfg.text_config._attn_implementation = "eager"
-    ref = Qwen3VLModel(cfg).eval().half().npu()
-    sd = safetensors.torch.load_file(f"{model_dir}/model.safetensors", device="cpu")
-    sd = {k.removeprefix("model."): v.half() for k, v in sd.items()}
-    missing, unexpected = ref.load_state_dict(sd, strict=False)
-    assert not missing and not unexpected, (
-        f"weight mismatch: missing={len(missing)} unexpected={len(unexpected)}")
-    return ref
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -87,19 +71,7 @@ def test_embed_weights(engine, model_dir):
     """Compare ATB embed_tokens weight vs TF embed_tokens weight (both from safetensors)."""
     print("\n── Test 1: embed_tokens weights ──")
 
-    import safetensors.torch
-    from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLConfig
-    from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLModel
-
-    cfg = Qwen3VLConfig.from_pretrained(model_dir, trust_remote_code=True)
-    ref = Qwen3VLModel(cfg).eval()
-
-    # Load safetensors into TF model (same as load_tf_ref but CPU float32)
-    sd = safetensors.torch.load_file(f"{model_dir}/model.safetensors", device="cpu")
-    sd_f32 = {k.removeprefix("model."): v.float() for k, v in sd.items()}
-    missing, unexpected = ref.load_state_dict(sd_f32, strict=False)
-    assert not missing and not unexpected, (
-        f"weight mismatch: missing={len(missing)} unexpected={len(unexpected)}")
+    ref = load_tf_ref(model_dir, precision="float32", device="cpu")
 
     # ATB weight (from engine.embed_w)
     atb_w = engine.embed_w  # CPU float32
@@ -115,6 +87,7 @@ def test_embed_weights(engine, model_dir):
     print(f"  Exact match: {exact_match}")
     print(f"  Max diff: {(atb_w - tf_w).abs().max().item():.8f}")
 
+    # 0.9999: identity check — same safetensors weights, any deviation is a loading bug
     return report("embed_tokens weight", cs, threshold=0.9999)
 
 
@@ -170,6 +143,7 @@ def test_position_ids(proc, engine, model_dir):
                 b, s, d = idx.tolist()
                 print(f"    [{b},{s},{d}]: atb={atb_pid[b,s,d].item()} tf={tf_pid[b,s,d].item()}")
 
+        # 0.9999: identity check — same position_id computation, any deviation is a logic bug
         all_ok &= report(f"position_ids ({name})", cs, threshold=0.9999)
 
     return all_ok
@@ -226,6 +200,7 @@ def test_rope_cos_sin(proc, engine, model_dir):
 
         cs_cos = cosine(atb_cos, tf_cos)
         cs_sin = cosine(atb_sin, tf_sin)
+        # 0.9999: identity check — same RoPE computation with same position_ids, any deviation is a numerical bug
         all_ok &= report(f"cos ({name})", cs_cos, threshold=0.9999)
         all_ok &= report(f"sin ({name})", cs_sin, threshold=0.9999)
 
@@ -264,6 +239,7 @@ def test_causal_mask():
             if diff_mask.any():
                 print(f"  Diff positions: {diff_mask.nonzero(as_tuple=False).tolist()[:5]}")
 
+        # 0.9999: identity check — deterministic mask construction, any deviation is a logic bug
         report(f"causal mask S={S}", cs, threshold=0.9999)
 
     return True  # always pass (just print)
@@ -277,7 +253,7 @@ def test_text_layer(proc, engine, model_dir):
     """Run ONE text decoder layer with identical inputs, compare outputs."""
     print("\n── Test 5: single text decoder layer ──")
 
-    ref = load_tf_ref(model_dir)
+    ref = load_tf_ref(model_dir, precision="half")
 
     from atb_python_qwen3vl_embedding.text_model import run_text_layer_npu, make_causal_mask
     from atb_python_qwen3vl_embedding.utils import make_seqlen_tensor, is_310p, make_causal_mask_nz_npu
@@ -340,6 +316,7 @@ def test_text_layer(proc, engine, model_dir):
     print(f"\n  S={S}  atb_out: {atb_out.shape}  tf_out: {tf_out.shape}")
     print(f"  cosine: {cs:.6f}")
 
+    # 0.99: moderate fp16 accumulation threshold (single text layer + GQA) — see THRESHOLDS.md
     if cs < 0.99:
         print("\n  DEBUG: checking individual layer weights...")
         # Compare layer weights
@@ -361,6 +338,7 @@ def test_text_layer(proc, engine, model_dir):
             }
             tf_w = ref.language_model.layers[0].get_parameter(tf_name_map[name]).cpu().float()
             w_cs = cosine(atb_w, tf_w)
+            # 0.999: single fp16 operator threshold — weight comparison for debugging per-layer precision
             status = "OK" if w_cs > 0.999 else "MISMATCH"
             print(f"    {name:<12} cosine={w_cs:.6f} [{status}]")
 

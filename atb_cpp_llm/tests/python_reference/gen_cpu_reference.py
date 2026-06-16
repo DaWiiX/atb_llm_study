@@ -458,11 +458,48 @@ def _cpp_bicubic_resize(arr_chw: np.ndarray, out_h: int, out_w: int) -> np.ndarr
     return out
 
 
+def _pil_bicubic_resize(arr_chw: np.ndarray, out_h: int, out_w: int) -> np.ndarray:
+    """Independent reference using PIL.Image.resize with BICUBIC.
+
+    PIL uses its own Catmull-Rom cubic convolution implementation with
+    symmetric boundary handling. This is an INDEPENDENT ground truth —
+    not a translation of the C++ algorithm. Differences from the C++
+    edge-clamp Catmull-Rom are expected at boundary pixels (within ~2
+    pixels of image edges) where the two implementations handle
+    out-of-bounds samples differently.
+
+    The input is processed per-channel (matching the C++ channel-loop
+    structure) to avoid any cross-channel coupling in PIL.
+
+    Args:
+        arr_chw: (C, H, W) float32 array with values in [0, 255].
+        out_h, out_w: target dimensions.
+
+    Returns:
+        (C, out_h, out_w) float32 array — the PIL BICUBIC result.
+    """
+    from PIL import Image
+
+    c, in_h, in_w = arr_chw.shape
+    # Quantize to uint8 to match what the C++ BicubicResize receives.
+    arr_u8 = np.clip(np.round(arr_chw), 0, 255).astype(np.uint8)
+    out = np.zeros((c, out_h, out_w), dtype=np.float32)
+    for ch in range(c):
+        img = Image.fromarray(arr_u8[ch], mode='L')
+        resized = img.resize((out_w, out_h), Image.BICUBIC)
+        out[ch] = np.array(resized, dtype=np.float32)
+    return out
+
+
 def _gen_bicubic_case(name: str, input_np: np.ndarray, out_h: int, out_w: int):
     """Run the C++-equivalent bicubic on `input_np` (C,H,W float32) and
     dump input + output as f32 bins. The reference exactly mirrors the
     C++ algorithm (Catmull-Rom a=-0.5 + edge clamp), so the C++ test
     validates the implementation against a Python-side reproduction.
+
+    Additionally writes a PIL BICUBIC reference as an INDEPENDENT ground
+    truth (see _pil_bicubic_resize). The PIL reference uses symmetric
+    boundary handling which differs from C++ edge-clamp at boundary pixels.
 
     NOTE: the C++ BicubicResize signature accepts uint8 input. To make
     the reference bit-for-bit comparable, we round-and-clip the input
@@ -474,9 +511,11 @@ def _gen_bicubic_case(name: str, input_np: np.ndarray, out_h: int, out_w: int):
     input_u8 = np.clip(np.round(input_np), 0.0, 255.0).astype(np.uint8)
     input_q = input_u8.astype(np.float32)
     y_np = _cpp_bicubic_resize(input_q, out_h, out_w).astype(np.float32)
+    y_pil = _pil_bicubic_resize(input_q, out_h, out_w).astype(np.float32)
     write_f32(f"{OUTPUT_DIR}/bicubic_{name}_input.bin", input_q)
     write_f32(f"{OUTPUT_DIR}/bicubic_{name}_output.bin", y_np)
-    print(f"  → bicubic_{name}: in{input_np.shape} -> out{y_np.shape}")
+    write_f32(f"{OUTPUT_DIR}/bicubic_{name}_pil_output.bin", y_pil)
+    print(f"  → bicubic_{name}: in{input_np.shape} -> out{y_np.shape} (+ PIL ref)")
 
 
 def gen_bicubic_preprocess():
@@ -1394,11 +1433,12 @@ def _sdpa_gqa(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
 
 
 def gen_text_decoder_layer():
-    """Reference data for TextDecoderLayerGraph (no-mask + GQA-with-mask).
+    """Reference data for TextDecoderLayerGraph (no-mask + GQA-with-mask + MHA-with-mask).
 
     Cases:
       * "small_nomask" — nh=4, kvh=4, hd=32, I=64,  S=4   (small debug)
       * "gqa_mask"     — nh=12, kvh=4, hd=64, I=256, S=8  (GQA + causal mask)
+      * "mha_causal"   — nh=32, kvh=32, hd=128, I=1024, S=16 (MHA + causal mask)
     """
     print("[gen] text_decoder_layer — full layer fp16 ground truth")
     eps = 1e-6
@@ -1514,8 +1554,9 @@ def gen_text_decoder_layer():
         kind = "with-mask" if use_mask else "no-mask"
         print(f"  → {name}: S={S} nh={nh} kvh={kvh} hd={hd} I={I} ({kind})")
 
-    _make("small_nomask", S=4, nh=4,  kvh=4, hd=32, I=64,  use_mask=False, seed=6001)
-    _make("gqa_mask",     S=8, nh=12, kvh=4, hd=64, I=256, use_mask=True,  seed=6002)
+    _make("small_nomask", S=4, nh=4,  kvh=4,  hd=32,  I=64,   use_mask=False, seed=6001)
+    _make("gqa_mask",     S=8, nh=12, kvh=4,  hd=64,  I=256,  use_mask=True,  seed=6002)
+    _make("mha_causal",   S=16, nh=32, kvh=32, hd=128, I=1024, use_mask=True,  seed=6003)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -2096,10 +2137,108 @@ def gen_vision_merger():
 
 
 # ═══════════════════════════════════════════════════════════════════
+# Stage: ConfigWiring — expected config values from model config.json
+#
+# Writes integer, float, and boolean fields in a fixed order so the
+# C++ test_config_wiring can load them and validate its parsed config
+# against the ground truth. No hardcoded thresholds or magic numbers —
+# every expected value comes from the actual model checkpoint.
+# ═══════════════════════════════════════════════════════════════════
+
+def gen_config_wiring_ref():
+    """Generate expected config values for test_config_wiring.
+
+    Reads config.json and preprocessor_config.json from the model directory,
+    extracts every field that Qwen3VLConfig carries (matching the C++
+    LoadQwen3VLConfig logic), and writes three reference binaries:
+
+      cpu_config_wiring_int.bin   — 26 int64 fields (order matches C++ enum)
+      cpu_config_wiring_float.bin —  3 float32 fields
+      cpu_config_wiring_bool.bin  —  1 int32 field
+
+    The C++ test reads these files and compares every value against its
+    own parsed config. If a model config changes (e.g. different epsilon),
+    the reference is regenerated and the test automatically adapts.
+    """
+    print("[gen] config_wiring — expected values from model config.json")
+
+    model_dir = MODEL_DIR
+    if not os.path.isdir(model_dir):
+        print(f"  SKIP: model dir not found: {model_dir}")
+        return
+
+    import json
+
+    with open(f"{model_dir}/config.json") as f:
+        config = json.load(f)
+    with open(f"{model_dir}/preprocessor_config.json") as f:
+        pp = json.load(f)
+
+    text = config.get("text_config", {})
+    vis = config.get("vision_config", {})
+
+    # Integer fields — order MUST match ConfigIntField enum in the C++ test.
+    # C++ uses `text_cfg.GetInt("head_dim", 128)` — simple key lookup with
+    # a hard-coded default (no fallback to hidden_size / num_heads).
+    int_vals = [
+        config.get("image_token_id", 151655),
+        config.get("vision_start_token_id", 151652),
+        text.get("hidden_size", 2048),
+        text.get("num_attention_heads", 16),
+        text.get("num_key_value_heads", 8),
+        text.get("head_dim", 128),
+        text.get("intermediate_size", 6144),
+        text.get("num_hidden_layers", 28),
+        text.get("vocab_size", 151936),
+        vis.get("hidden_size", 1024),
+        vis.get("num_heads", 16),
+        vis.get("intermediate_size", 4096),
+        vis.get("depth", 24),
+        vis.get("in_channels", 3),
+        vis.get("temporal_patch_size", 2),
+        vis.get("patch_size", 16),
+        vis.get("spatial_merge_size", 2),
+        vis.get("num_position_embeddings", 2304),
+        vis.get("out_hidden_size", 2048),
+        pp.get("patch_size", 16),
+        pp.get("temporal_patch_size", 2),
+        pp.get("merge_size", 2),
+        pp.get("min_pixels", 4096),
+        pp.get("max_pixels", 1310720),
+        # Derived fields (computed by Qwen3VLConfig methods)
+        vis.get("hidden_size", 1024) // vis.get("num_heads", 16),  # vis_head_dim
+        int(np.sqrt(vis.get("num_position_embeddings", 2304))),    # num_grid
+    ]
+
+    # Float fields — order MUST match ConfigFloatField enum in the C++ test.
+    # vis_epsilon reads "layer_norm_eps" (NOT "initializer_range" — 20 000x off!).
+    float_vals = np.array([
+        float(text.get("rms_norm_eps", 1e-6)),
+        float(text.get("rope_theta", 5000000.0)),
+        float(vis.get("layer_norm_eps", 1e-6)),
+    ], dtype=np.float32)
+
+    # Boolean fields — order MUST match ConfigBoolField enum in the C++ test.
+    bool_vals = [
+        1,  # normalize (Python default = true, C++ struct initializer = true)
+    ]
+
+    write_i64(f"{OUTPUT_DIR}/cpu_config_wiring_int.bin",
+              np.array(int_vals, dtype=np.int64))
+    write_f32(f"{OUTPUT_DIR}/cpu_config_wiring_float.bin", float_vals)
+    write_i32s(f"{OUTPUT_DIR}/cpu_config_wiring_bool.bin", bool_vals)
+
+    print(f"  → {OUTPUT_DIR}/cpu_config_wiring_int.bin ({len(int_vals)} int fields)")
+    print(f"  → {OUTPUT_DIR}/cpu_config_wiring_float.bin ({len(float_vals)} float fields)")
+    print(f"  → {OUTPUT_DIR}/cpu_config_wiring_bool.bin ({len(bool_vals)} bool fields)")
+
+
+# ═══════════════════════════════════════════════════════════════════
 # Main
 # ═══════════════════════════════════════════════════════════════════
 
 STAGES = {
+    "config_wiring":        gen_config_wiring_ref,
     "mrope_pid_simple":    gen_get_rope_index_simple,
     "mrope_pid_no_img":    gen_get_rope_index_no_image,
     "mrope_pid_image_text": gen_get_rope_index_image_text,

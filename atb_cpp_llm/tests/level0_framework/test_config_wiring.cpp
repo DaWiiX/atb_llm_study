@@ -1,14 +1,21 @@
 /**
  * Config wiring test: loads Qwen3VLConfig from an on-disk model checkpoint
- * and dumps every field to JSON.  A companion Python script diffs the dump
- * against its own config loading to catch JSON-key miswiring regressions.
+ * and compares every field against reference values generated from the same
+ * model's config.json by gen_cpu_reference.py (gen_config_wiring_ref).
+ *
+ * The reference data lives in /tmp/cpu_config_wiring_{int,float,bool}.bin.
+ * Run `python tests/python_reference/gen_all.py` to regenerate them.
+ *
+ * A companion Python script (test_config_wiring.py) also diffs the C++ JSON
+ * dump against its own config loading to catch JSON-key miswiring regressions.
  *
  * This test prevented two bugs:
  *  1. EngineConfig.normalize dead field — set but never read
  *  2. Vision epsilon read from "initializer_range" (0.02) instead of
  *     "layer_norm_eps" (1e-6) — 20 000x off
  *
- * CI-friendly: skips gracefully when the model checkpoint is absent.
+ * CI-friendly: skips gracefully when the model checkpoint or reference
+ * bins are absent.
  *
  * Run: ./test_config_wiring
  *      python3 tests/level0_framework/test_config_wiring.py
@@ -28,6 +35,106 @@
 #include <string>
 
 using atb_llm::adapters::Qwen3VLConfig;
+
+// ── Helpers for loading reference binary files ────────────────────
+
+/// Load a typed ndim+shape+data binary file (written by write_f32 / write_fp16 / write_i64 etc.).
+/// Format: [ndim: int64] [shape: int64[ndim]] [data: T[]].
+/// Returns true on success.
+template <typename T>
+static bool LoadBin(const char* path,
+                    std::vector<T>& data,
+                    std::vector<int64_t>& shape) {
+    FILE* f = std::fopen(path, "rb");
+    if (f == nullptr) return false;
+    int64_t ndim = 0;
+    if (std::fread(&ndim, sizeof(int64_t), 1, f) != 1) {
+        std::fclose(f);
+        return false;
+    }
+    if (ndim <= 0 || ndim > 8) {
+        std::fclose(f);
+        return false;
+    }
+    shape.assign(static_cast<size_t>(ndim), 0);
+    if (std::fread(shape.data(), sizeof(int64_t),
+                   static_cast<size_t>(ndim), f) !=
+        static_cast<size_t>(ndim)) {
+        std::fclose(f);
+        return false;
+    }
+    int64_t total = 1;
+    for (int64_t i = 0; i < ndim; i++) total *= shape[static_cast<size_t>(i)];
+    data.assign(static_cast<size_t>(total), T{});
+    size_t got = std::fread(data.data(), sizeof(T),
+                            static_cast<size_t>(total), f);
+    std::fclose(f);
+    return got == static_cast<size_t>(total);
+}
+
+/// Load an i32s flat-array file (written by write_i32s).
+/// Format: [count: int64] [data: int32_t[count]].
+static bool LoadI32s(const char* path, std::vector<int32_t>& data) {
+    FILE* f = std::fopen(path, "rb");
+    if (f == nullptr) return false;
+    int64_t count = 0;
+    if (std::fread(&count, sizeof(int64_t), 1, f) != 1) {
+        std::fclose(f);
+        return false;
+    }
+    data.resize(static_cast<size_t>(count));
+    size_t got = std::fread(data.data(), sizeof(int32_t),
+                            static_cast<size_t>(count), f);
+    std::fclose(f);
+    return got == static_cast<size_t>(count);
+}
+
+// ── Reference data field indices (must match gen_config_wiring_ref in Python) ──
+
+// Indices into cpu_config_wiring_int.bin (26 int64 values).
+enum ConfigIntField : size_t {
+    kImageTokenId = 0,
+    kVisionStartTokenId,
+    kTextHiddenSize,
+    kTextNumHeads,
+    kTextNumKvHeads,
+    kTextHeadDim,
+    kTextIntermediateSize,
+    kTextNumLayers,
+    kTextVocabSize,
+    kVisHiddenSize,
+    kVisNumHeads,
+    kVisIntermediateSize,
+    kVisDepth,
+    kVisInChannels,
+    kVisTemporalPatchSize,
+    kVisPatchSize,
+    kVisSpatialMergeSize,
+    kVisNumPositionEmbeddings,
+    kVisOutHiddenSize,
+    kPpPatchSize,
+    kPpTemporalPatchSize,
+    kPpMergeSize,
+    kPpMinPixels,
+    kPpMaxPixels,
+    kVisHeadDim,     // derived: vis_hidden_size / vis_num_heads
+    kNumGrid,        // derived: sqrt(vis_num_position_embeddings)
+    kNumConfigIntFields
+};
+
+// Indices into cpu_config_wiring_float.bin (3 float32 values).
+enum ConfigFloatField : size_t {
+    kTextRmsNormEps = 0,
+    kTextRopeTheta,
+    kVisEpsilon,
+    kNumConfigFloatFields
+};
+
+// Indices into cpu_config_wiring_bool.bin (1 int32 value, 0=false 1=true).
+enum ConfigBoolField : size_t {
+    kNormalize = 0,
+    kNumConfigBoolFields
+};
 
 // ── Helper: dump every Qwen3VLConfig field to JSON ───────────────
 static void DumpConfigJson(const Qwen3VLConfig& cfg, const char* path) {
@@ -100,35 +207,74 @@ TEST_CASE("Qwen3VLConfig loads without error and has correct values") {
         return;
     }
 
-    // ── Basic sanity ────────────────────────────────────────
-    CHECK(cfg.text_hidden_size == 2048);
-    CHECK(cfg.text_num_layers == 28);
-    CHECK(cfg.text_num_heads == 16);
-    CHECK(cfg.text_num_kv_heads == 8);
-    CHECK(cfg.text_head_dim == 128);
-    CHECK(cfg.text_intermediate_size == 6144);
-    CHECK(cfg.text_vocab_size == 151936);
-    CHECK(cfg.vis_hidden_size == 1024);
-    CHECK(cfg.vis_num_heads == 16);
-    CHECK(cfg.vis_depth == 24);
-    CHECK(cfg.vis_patch_size == 16);
-    CHECK(cfg.image_token_id == 151655);
-    CHECK(cfg.vision_start_token_id == 151652);
+    // ── Load reference data (generated by gen_config_wiring_ref in Python) ──
+    std::vector<int64_t> ref_ints;
+    std::vector<int64_t> ref_int_shape;
+    bool have_int_ref = LoadBin<int64_t>(
+        "/tmp/cpu_config_wiring_int.bin", ref_ints, ref_int_shape);
 
-    // ── CRITICAL: epsilon must be small (NOT 0.02 from initializer_range!) ──
-    CHECK(cfg.vis_epsilon < 1e-4);
-    CHECK(cfg.vis_epsilon > 0.0);
-    CHECK(cfg.text_rms_norm_eps < 1e-4);
-    CHECK(cfg.text_rms_norm_eps > 0.0);
+    std::vector<float> ref_floats;
+    std::vector<int64_t> ref_float_shape;
+    bool have_float_ref = LoadBin<float>(
+        "/tmp/cpu_config_wiring_float.bin", ref_floats, ref_float_shape);
 
-    // ── CRITICAL: normalize default must be true (Python default) ──
-    CHECK(cfg.normalize == true);
+    std::vector<int32_t> ref_bools;
+    bool have_bool_ref = LoadI32s(
+        "/tmp/cpu_config_wiring_bool.bin", ref_bools);
 
-    // ── Derived fields ──────────────────────────────────────
-    CHECK(cfg.vis_head_dim() == 64);   // 1024 / 16
-    CHECK(cfg.num_grid() == 48);       // sqrt(2304)
+    // ── Validate against reference data (no hardcoded values) ──
 
-    // Dump to JSON for Python comparison
+    if (have_int_ref && have_float_ref && have_bool_ref) {
+        // Verify reference data has the expected field count
+        REQUIRE(ref_ints.size() == kNumConfigIntFields);
+        REQUIRE(ref_floats.size() == kNumConfigFloatFields);
+        REQUIRE(ref_bools.size() == kNumConfigBoolFields);
+
+        // Integer fields — exact match (these are discrete config values)
+        CHECK(cfg.image_token_id == ref_ints[kImageTokenId]);
+        CHECK(cfg.vision_start_token_id == ref_ints[kVisionStartTokenId]);
+        CHECK(cfg.text_hidden_size == static_cast<int32_t>(ref_ints[kTextHiddenSize]));
+        CHECK(cfg.text_num_heads == static_cast<int32_t>(ref_ints[kTextNumHeads]));
+        CHECK(cfg.text_num_kv_heads == static_cast<int32_t>(ref_ints[kTextNumKvHeads]));
+        CHECK(cfg.text_head_dim == static_cast<int32_t>(ref_ints[kTextHeadDim]));
+        CHECK(cfg.text_intermediate_size == static_cast<int32_t>(ref_ints[kTextIntermediateSize]));
+        CHECK(cfg.text_num_layers == static_cast<int32_t>(ref_ints[kTextNumLayers]));
+        CHECK(cfg.text_vocab_size == ref_ints[kTextVocabSize]);
+        CHECK(cfg.vis_hidden_size == static_cast<int32_t>(ref_ints[kVisHiddenSize]));
+        CHECK(cfg.vis_num_heads == static_cast<int32_t>(ref_ints[kVisNumHeads]));
+        CHECK(cfg.vis_intermediate_size == static_cast<int32_t>(ref_ints[kVisIntermediateSize]));
+        CHECK(cfg.vis_depth == static_cast<int32_t>(ref_ints[kVisDepth]));
+        CHECK(cfg.vis_in_channels == static_cast<int32_t>(ref_ints[kVisInChannels]));
+        CHECK(cfg.vis_temporal_patch_size == static_cast<int32_t>(ref_ints[kVisTemporalPatchSize]));
+        CHECK(cfg.vis_patch_size == static_cast<int32_t>(ref_ints[kVisPatchSize]));
+        CHECK(cfg.vis_spatial_merge_size == static_cast<int32_t>(ref_ints[kVisSpatialMergeSize]));
+        CHECK(cfg.vis_num_position_embeddings == static_cast<int32_t>(ref_ints[kVisNumPositionEmbeddings]));
+        CHECK(cfg.vis_out_hidden_size == static_cast<int32_t>(ref_ints[kVisOutHiddenSize]));
+        CHECK(cfg.pp_patch_size == static_cast<int32_t>(ref_ints[kPpPatchSize]));
+        CHECK(cfg.pp_temporal_patch_size == static_cast<int32_t>(ref_ints[kPpTemporalPatchSize]));
+        CHECK(cfg.pp_merge_size == static_cast<int32_t>(ref_ints[kPpMergeSize]));
+        CHECK(cfg.pp_min_pixels == static_cast<int32_t>(ref_ints[kPpMinPixels]));
+        CHECK(cfg.pp_max_pixels == static_cast<int32_t>(ref_ints[kPpMaxPixels]));
+
+        // Derived fields
+        CHECK(cfg.vis_head_dim() == static_cast<int32_t>(ref_ints[kVisHeadDim]));
+        CHECK(cfg.num_grid() == static_cast<int32_t>(ref_ints[kNumGrid]));
+
+        // Float fields — epsilon-close (these are floating-point from config)
+        CHECK(cfg.text_rms_norm_eps == doctest::Approx(ref_floats[kTextRmsNormEps]));
+        CHECK(cfg.text_rope_theta == doctest::Approx(ref_floats[kTextRopeTheta]));
+        CHECK(cfg.vis_epsilon == doctest::Approx(ref_floats[kVisEpsilon]));
+
+        // Boolean fields
+        CHECK(cfg.normalize == (ref_bools[kNormalize] != 0));
+    } else {
+        // Reference bins not available — still dump JSON for Python validation
+        MESSAGE("WARNING: reference bins not found (run gen_all.py). "
+                "Skipping data-driven checks; JSON dump will be validated "
+                "by the Python companion test.");
+    }
+
+    // Dump to JSON for Python comparison (works regardless of ref data availability)
     DumpConfigJson(cfg, "/tmp/cpp_config_dump.json");
     MESSAGE("Config dumped to /tmp/cpp_config_dump.json");
 }

@@ -7,7 +7,7 @@ Produces:
   /tmp/tokens_chat_mm_{W}x{H}.bin    — chat-templated MM tokens for C++ MM mode
   /tmp/tokens_mm_{W}x{H}.bin         — mirror of tokens_chat_mm for Python e2e
 """
-import struct, os
+import json, os, struct
 from PIL import Image
 from transformers import AutoProcessor
 
@@ -31,7 +31,7 @@ GRID_MAP = {
     (1440, 2560): (1, 94, 52),
 }
 TEXT_SEQ_LENS = [100, 512, 1024, 2048, 4096]
-IMAGE_TOKEN_ID = 151655
+IMAGE_TOKEN_ID = json.load(open(os.path.join(MODEL_DIR, "config.json")))["image_token_id"]
 
 
 def save_token_ids(path, ids):

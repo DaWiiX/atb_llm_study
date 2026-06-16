@@ -28,6 +28,9 @@ from atb_python_qwen3vl_embedding.text_model import make_causal_mask
 from atb_python_qwen3vl_embedding.utils import is_310p, make_causal_mask_nz_npu
 from atb_python_qwen3vl_embedding.transformers_runner import run_attention
 
+# 300 MB for NPU memory pool (diagnostic test suite with multiple small graphs)
+utils.set_atb_buffer_size(300 * 1024 * 1024)
+
 
 def _cosine(a, b):
     """Compute cosine similarity between two tensors."""
@@ -80,9 +83,12 @@ def _run_attention_test(name, num_heads, num_kv_heads, head_dim, use_mask, B=1, 
 
         atb_out = graph_op.forward(inputs)[0].cpu().float()
         cos = _cosine(ref_out, atb_out)
+        mse = float(torch.mean((ref_out.float() - atb_out.float()) ** 2))
+        max_diff = float(torch.max(torch.abs(ref_out.float() - atb_out.float())))
+        # 0.99: moderate fp16 accumulation (single attention, cross-framework) — see THRESHOLDS.md
         ok = cos > 0.99
         status = "PASS" if ok else f"FAIL (cos={cos:.6f})"
-        print(f"    {status}")
+        print(f"    {status}  mse={mse:.8f}  max_diff={max_diff:.8f}")
         return ok, None, cos
     except RuntimeError as e:
         print(f"    ERROR: {e}")
@@ -94,8 +100,6 @@ def main():
     print(f"=== 310P Diagnostic Test Suite ===")
     print(f"Platform: {platform}")
     print(f"Device: {torch.npu.get_device_name(0)}")
-
-    utils.set_atb_buffer_size(300 * 1024 * 1024)
 
     head_dim = 64
     results = {}
@@ -145,6 +149,14 @@ def main():
     # Test 11: Real model MHA + mask + hd=128, S=880 (image-only typical seqlen)
     ok, err, cos = _run_attention_test("T11: Real MHA+mask hd=128 S=880", 16, 16, 128, use_mask=True, S=880)
     results["T11: Real MHA+mask hd=128 S=880"] = ok
+
+    # ── Full-dim GQA: Qwen3VL-Embedding-2B real text attention ──
+
+    # Test 12: Real model GQA + mask + hd=128 (nh=16, kv_nh=8 — Qwen3VL-Embedding-2B)
+    # This is the true text attention configuration: 16 heads, 8 KV heads (GQA), 128 head_dim.
+    # Slow test: full model dimensions for CI / PR validation.
+    ok, err, cos = _run_attention_test("T12: Real GQA+mask hd=128", 16, 8, 128, use_mask=True)
+    results["T12: Real GQA+mask hd=128"] = ok
 
     # ── Summary ──
     print("\n" + "=" * 60)

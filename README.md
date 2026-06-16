@@ -101,7 +101,7 @@ C++ 项目的 `build_and_test.sh` 会**自动探测**这两个根目录并 sourc
 cd atb_python_qwen3vl_embedding
 
 # 单组件单元测试
-python tests/test_text_attention.py
+python tests/test_310p_diag.py
 python tests/test_vision_model.py
 
 # 端到端推理引擎测试（text-only / image-only / text+image）

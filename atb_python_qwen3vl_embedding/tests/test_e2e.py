@@ -18,7 +18,7 @@ Usage::
 
     python tests/test_e2e.py                  # ATB + TF cosine comparison
     python tests/test_e2e.py --no-ref         # ATB only, sanity check
-    python tests/test_e2e.py --threshold 0.95
+    python tests/test_e2e.py --threshold 0.95  # override default (0.95)
 """
 # ── Buffer size MUST be set before any engine/graph import ──────────
 import os
@@ -41,6 +41,7 @@ from PIL import Image
 
 from atb_python_qwen3vl_embedding.engine import Qwen3VLEngine
 from atb_python_qwen3vl_embedding.env import QWEN3VL_EMB_MODEL_DIR
+from atb_python_qwen3vl_embedding.tests.data_utils import load_tf_ref
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -121,6 +122,7 @@ def run_atb_phase(model_dir: str, processor, cases, keep_tf_pv: bool):
                   for c in cases]
 
     results = {}
+    atb_ds_feats = {}  # name → list of CPU deepstack feature tensors
     for inputs in inputs_all:
         name = inputs['name']
         S = inputs['input_ids'].shape[1]
@@ -130,36 +132,25 @@ def run_atb_phase(model_dir: str, processor, cases, keep_tf_pv: bool):
         results[name] = out  # (1, S, hidden) float32 on CPU
         print(f"[ATB] {name:<12} S={S:<5} → {tuple(out.shape)}")
 
+        # Capture deepstack features for image cases
+        if (inputs['pv_raw'] is not None
+                and engine._last_ds_feats is not None
+                and len(engine._last_ds_feats) > 0):
+            atb_ds_feats[name] = [
+                d.cpu().float() for d in engine._last_ds_feats]
+            print(f"[ATB] {name:<12} captured {len(atb_ds_feats[name])} "
+                  f"deepstack features: {[tuple(d.shape) for d in atb_ds_feats[name]]}")
+
     # Release engine + free NPU buffers before TF model is loaded.
     del engine
     torch.npu.empty_cache()
 
-    return results, inputs_all
+    return results, inputs_all, atb_ds_feats
 
 
 # ═══════════════════════════════════════════════════════════════════
 # Phase 2: transformers reference
 # ═══════════════════════════════════════════════════════════════════
-
-def load_tf_ref(model_dir: str):
-    """Load Qwen3VLModel on NPU with weights from safetensors."""
-    import safetensors.torch
-    from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLConfig
-    from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLModel
-
-    cfg = Qwen3VLConfig.from_pretrained(model_dir, trust_remote_code=True)
-    cfg._attn_implementation = "eager"
-    cfg.text_config._attn_implementation = "eager"
-
-    ref = Qwen3VLModel(cfg).eval().half().npu()
-    sd = safetensors.torch.load_file(f"{model_dir}/model.safetensors",
-                                     device="cpu")
-    sd = {k.removeprefix("model."): v.half() for k, v in sd.items()}
-    missing, unexpected = ref.load_state_dict(sd, strict=False)
-    assert not missing and not unexpected, (
-        f"weight mismatch: missing={len(missing)} unexpected={len(unexpected)}")
-    return ref
-
 
 def run_tf_phase(model_dir: str, inputs_all):
     """Load TF ref and run forward per case, return dict[name] = hidden CPU fp32."""
@@ -168,6 +159,7 @@ def run_tf_phase(model_dir: str, inputs_all):
     print("[TF] Loaded")
 
     results = {}
+    tf_ds_feats = {}  # name → list of CPU deepstack feature tensors
     for inputs in inputs_all:
         name = inputs['name']
         input_ids = inputs['input_ids'].npu()
@@ -184,9 +176,18 @@ def run_tf_phase(model_dir: str, inputs_all):
         results[name] = out
         print(f"[TF]  {name:<12} → {tuple(out.shape)}")
 
+        # Capture deepstack features for image cases
+        if pv is not None:
+            with torch.no_grad():
+                vis_out = ref.visual(pv.half().npu(), grid_thw=gth.npu())
+                if vis_out[1] and len(vis_out[1]) > 0:
+                    tf_ds_feats[name] = [d.cpu().float() for d in vis_out[1]]
+                    print(f"[TF]  {name:<12} captured {len(tf_ds_feats[name])} "
+                          f"deepstack features: {[tuple(d.shape) for d in tf_ds_feats[name]]}")
+
     del ref
     torch.npu.empty_cache()
-    return results
+    return results, tf_ds_feats
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -206,13 +207,58 @@ def compare(atb: dict, tf: dict, threshold: float) -> bool:
             all_pass = False
             continue
         cs = F.cosine_similarity(a.flatten(), t.flatten(), dim=0).item()
-        ok = cs > threshold
+        ok = cs >= threshold
         all_pass &= ok
         status = "PASS" if ok else "FAIL"
         print(f"{name:<14} {str(tuple(a.shape)):<22} "
               f"{cs:>10.6f} {status:>8}")
     print(f"{'─' * 55}")
     return all_pass
+
+
+def compare_deepstack(atb_ds: dict, tf_ds: dict, threshold: float = 0.99) -> bool:
+    """Compare ATB deepstack features against TF reference.
+
+    Validates that the deepstack merger MLPs produce correct outputs at each
+    deepstack index. This is the Level 4 E2E deepstack verification.
+    Default threshold 0.99: moderate fp16 accumulation — see THRESHOLDS.md.
+    """
+    if not atb_ds and not tf_ds:
+        print("\n  (No deepstack features to compare — text-only cases)")
+        return True
+
+    common = set(atb_ds.keys()) & set(tf_ds.keys())
+    if not common:
+        print("\n  (No common image cases for deepstack comparison)")
+        return True
+
+    print(f"\n{'─' * 70}")
+    print(f"  Deepstack Feature Comparison (threshold={threshold})")
+    print(f"{'─' * 70}")
+    all_ok = True
+    for name in sorted(common):
+        ads = atb_ds[name]
+        tds = tf_ds[name]
+        if len(ads) != len(tds):
+            print(f"  {name}: count mismatch ATB={len(ads)} TF={len(tds)}")
+            all_ok = False
+            continue
+
+        print(f"\n  [{name}]")
+        for i, (da, dt) in enumerate(zip(ads, tds)):
+            cs = F.cosine_similarity(
+                da.flatten(), dt.flatten(), dim=0).item()
+            ok = cs >= threshold
+            all_ok &= ok
+            mse = F.mse_loss(da.float(), dt.float()).item()
+            maxd = (da.float() - dt.float()).abs().max().item()
+            status = "PASS" if ok else "FAIL"
+            print(f"    deepstack[{i}] shape={tuple(da.shape)}  "
+                  f"cosine={cs:.6f}  MSE={mse:.8f}  max_diff={maxd:.6f}  "
+                  f"{status}")
+
+    print(f"{'─' * 70}")
+    return all_ok
 
 
 def sanity_check(atb: dict) -> bool:
@@ -240,8 +286,9 @@ def parse_args(argv: Optional[list] = None):
     p = argparse.ArgumentParser(description=__doc__.split('\n', 1)[0])
     p.add_argument('--no-ref', dest='ref', action='store_false',
                    help='Skip transformers reference comparison')
-    p.add_argument('--threshold', type=float, default=0.99,
-                   help='Cosine similarity threshold for PASS (default 0.99)')
+    # 0.95: full 28-layer model fp16 accumulation — see THRESHOLDS.md
+    p.add_argument('--threshold', type=float, default=0.95,
+                   help='Cosine similarity threshold for PASS (default 0.95)')
     p.add_argument('--model-dir', default=QWEN3VL_EMB_MODEL_DIR,
                    help='Override QWEN3VL_EMB_MODEL_DIR from .env')
     p.set_defaults(ref=True)
@@ -258,15 +305,17 @@ def main(argv: Optional[list] = None) -> int:
     processor = AutoProcessor.from_pretrained(args.model_dir)
 
     cases = build_cases()
-    atb_results, inputs_all = run_atb_phase(
+    atb_results, inputs_all, atb_ds = run_atb_phase(
         args.model_dir, processor, cases, keep_tf_pv=args.ref)
 
     if not args.ref:
         ok = sanity_check(atb_results)
         return 0 if ok else 1
 
-    tf_results = run_tf_phase(args.model_dir, inputs_all)
-    ok = compare(atb_results, tf_results, args.threshold)
+    tf_results, tf_ds = run_tf_phase(args.model_dir, inputs_all)
+    ok_hidden = compare(atb_results, tf_results, args.threshold)
+    ok_ds = compare_deepstack(atb_ds, tf_ds, threshold=args.threshold)
+    ok = ok_hidden and ok_ds
     return 0 if ok else 1
 
 

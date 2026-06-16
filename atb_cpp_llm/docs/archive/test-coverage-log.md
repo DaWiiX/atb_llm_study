@@ -44,7 +44,7 @@
 ### Level 4 部分 ✅
 - [x] `test_e2e.cpp` — TEXT_ONLY 模式 E2E + EmbeddingLookup bounds
 - [x] `test_forward_error_paths.cpp` — 错误路径
-- [x] `test_consistency.cpp` — C++ vs Python TEXT_ONLY 对比
+- [x] `test_accuracy.cpp` — C++ vs Python TEXT_ONLY 对比 (replaces deleted test_consistency.cpp)
 
 ---
 
@@ -195,7 +195,7 @@ SUMMARY: 33 passed, 0 failed
 
 #### Level 4 (E2E) — 3
 - test_e2e (6 cases: Load, TEXT_ONLY, Multi-inference, Bounds, **IMAGE_ONLY**, **IMAGE_AND_TEXT**)
-- test_forward_error_paths, test_consistency
+- test_forward_error_paths
 
 ### 总精度水平
 - 所有精度测试: cosine ≥ 0.999 (绝大多数 = 1.000000)

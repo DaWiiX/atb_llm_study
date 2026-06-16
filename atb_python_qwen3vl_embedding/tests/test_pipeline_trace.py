@@ -28,6 +28,7 @@ from atb_python_qwen3vl_embedding.engine import Qwen3VLEngine
 from atb_python_qwen3vl_embedding.engine_utils import get_rope_index
 from atb_python_qwen3vl_embedding.text_model import run_text_layer_npu, run_text_norm_npu, make_causal_mask
 from atb_python_qwen3vl_embedding.utils import to_npu_half, to_cpu_float, make_seqlen_tensor, is_310p, make_causal_mask_nz_npu
+from atb_python_qwen3vl_embedding.tests.data_utils import load_tf_ref
 
 
 def cosine(a, b):
@@ -35,6 +36,7 @@ def cosine(a, b):
 
 
 def trace(label, atb, tf):
+    """Trace step-by-step comparison. Threshold 0.99: moderate fp16 accumulation — see THRESHOLDS.md."""
     cs = cosine(atb, tf)
     status = "✅" if cs > 0.99 else "❌"
     print(f"  {status} {label:<35} cosine={cs:.6f}")
@@ -47,20 +49,13 @@ def main():
 
     from transformers import AutoProcessor
     from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLConfig
-    from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLModel
-    import safetensors.torch
 
     proc = AutoProcessor.from_pretrained(model_dir)
     engine = Qwen3VLEngine(model_dir)
 
-    # ── Load TF ref ───────────────────────────────────────────────
+    # ── Load TF ref (half precision — engine stays loaded on NPU) ──
     cfg = Qwen3VLConfig.from_pretrained(model_dir, trust_remote_code=True)
-    cfg._attn_implementation = "eager"
-    cfg.text_config._attn_implementation = "eager"
-    ref = Qwen3VLModel(cfg).eval().half().npu()
-    sd = safetensors.torch.load_file(f"{model_dir}/model.safetensors", device="cpu")
-    sd = {k.removeprefix("model."): v.half() for k, v in sd.items()}
-    ref.load_state_dict(sd, strict=False)
+    ref = load_tf_ref(model_dir, precision="half")
 
     # ── Test case: Image + Text ───────────────────────────────────
     img = Image.new('RGB', (120, 200), color='red')
@@ -210,7 +205,7 @@ def main():
         if li == 0 or li == engine.n_layer - 1 or li % 4 == 0 or li in ds_indexes:
             cs = cosine(hidden_atb.cpu(), hidden_tf.cpu())
             ds_tag = " [+ds]" if li in ds_indexes else ""
-            status = "✅" if cs > 0.99 else "❌"
+            status = "✅" if cs > 0.99 else "❌"  # 0.99: moderate fp16 accumulation — see THRESHOLDS.md
             print(f"  {status} layer {li:2d}{ds_tag:<8} cosine={cs:.6f}")
 
     # ── Step 7: Final norm ────────────────────────────────────────

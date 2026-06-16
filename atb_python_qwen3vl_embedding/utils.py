@@ -32,11 +32,21 @@ def is_310p() -> bool:
 
 # ── Buffer management ───────────────────────────────────────────────
 
+_buffer_size_set = False
+
+
 def set_atb_buffer_size(size_bytes: int):
     """Set ATB internal buffer size. Must be called once before any graph build.
 
     Calling this more than once may corrupt graph outputs.
+    Subsequent calls after the first are silently ignored with a warning.
     """
+    global _buffer_size_set
+    if _buffer_size_set:
+        print(f"[WARN] set_atb_buffer_size({size_bytes}) ignored: buffer size "
+              f"already set. Only the first call takes effect.")
+        return
+    _buffer_size_set = True
     torch_atb.set_buffer_size(size_bytes)
 
 

@@ -38,7 +38,7 @@ parser.add_argument('--warmup', type=int, default=3)
 args = parser.parse_args()
 
 CPP_BIN = str(__import__('pathlib').Path(CPP_BUILD_DIR) / 'benchmark')
-CPP_SAVE = '/tmp/cpp_embedding.bin'
+CPP_SAVE = '/tmp/cpp_text_only.bin'
 TORCH_SAVE = '/tmp/torch_embedding.bin'
 
 
@@ -161,15 +161,16 @@ for line in result.stdout.split('\n'):
             elif k == 'median': cpp_median = float(v)
             elif k == 'p95': cpp_p95 = float(v)
 
-# Also run test_consistency to get the output embedding
-cons_bin = CPP_BIN.replace('benchmark', 'test_consistency')
+# Also run test_accuracy to get the output embedding
+cons_bin = CPP_BIN.replace('benchmark', 'test_accuracy')
 if os.path.exists(cons_bin):
-    print(f"Running consistency test to capture C++ embedding...")
+    print(f"Running accuracy test to capture C++ embedding...")
     subprocess.run([cons_bin], capture_output=True, text=True,
                     cwd=os.path.dirname(CPP_BIN), timeout=600)
-    print(f"Expected embedding at {CPP_SAVE}")
+    cpp_bin_path = '/tmp/cpp_text_only.bin'
+    print(f"Expected embedding at {cpp_bin_path}")
 else:
-    print(f"WARN: test_consistency not found, skipping output capture")
+    print(f"WARN: test_accuracy not found, skipping output capture")
 
 # ═══════════════════════════════════════════════════════════
 # 3. Precision Comparison (if both outputs exist)

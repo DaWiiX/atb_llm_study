@@ -352,7 +352,7 @@ export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:~/Ascend/nnal/atb/9.0.0/atb/cxx_abi_1/li
 
 1. **C++ 编译**: `cmake --build build` — 0 error
 2. **C++ 单元测试**: `cd build && ctest` — 37/37 全部 SUCCESS（含新增 test_bin_format, test_config_wiring, test_weight_precision, test_sync_safety）
-3. **C++ vs Python 精度**: `./test_consistency` + `python tests/test_consistency.py` — cosine > 0.99
+3. **C++ vs Python 精度**: `./test_accuracy` + `python tests/test_accuracy.py` — cosine > 0.99
 4. **C++ vs Python 多模式**: `./test_accuracy` + `python tests/test_accuracy.py`
 5. **全量基准**: `./benchmark --mode compare` + `python tests/test_embedder_e2e.py --mode both --bench`
 
@@ -364,7 +364,7 @@ export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:~/Ascend/nnal/atb/9.0.0/atb/cxx_abi_1/li
 | L1 CPU 纯函数 | 10 | test_mrope_cpu (9 cases), test_vision_rope_cpu, test_preprocess_cpu, test_pos_embed_cpu, test_float_utils, test_base_model_utils, test_causal_mask_fp16, test_embedder_utils, test_embedder_invariants, test_bin_format |
 | L2 算子精度 | 20 | 覆盖 RMSNorm/LayerNorm/Linear/Activation/Elewise/SplitConcat/Softmax/GatherReduce/TransposeSetValue/RoPE/SelfAttention/SwiGLU/TextDecoder/VisionAttention/VisionMLP/VisionBlock/PatchEmbed/VisionMerger + text_ops + vision_ops |
 | L3 集成 | 6 | test_text_model, test_deepstack, test_deepstack_npu_tensor, test_vision_runner_full, test_text_runner_full, test_vision_stages |
-| L4 E2E | 6 | test_e2e, test_consistency, test_accuracy, test_stage_precision, test_forward_error_paths, test_sync_safety |
+| L4 E2E | 5 | test_e2e, test_accuracy, test_stage_precision, test_forward_error_paths, test_sync_safety |
 | Benchmark | 1 | benchmark |
 | **总计** | **47** | 含新增 test_bin_format, test_config_wiring, test_weight_precision, test_sync_safety |
 

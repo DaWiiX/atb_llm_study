@@ -32,6 +32,9 @@ from atb_python_qwen3vl_embedding.text_model import make_causal_mask
 from atb_python_qwen3vl_embedding.transformers_runner import run_attention
 from atb_python_qwen3vl_embedding.utils import make_self_attention, is_310p, make_causal_mask_nz_npu
 
+# 500 MB for NPU memory pool (parameter sweep with repeated graph builds)
+utils.set_atb_buffer_size(500 * 1024 * 1024)
+
 
 def _cosine(a, b):
     """Compute cosine similarity between two tensors."""
@@ -89,6 +92,7 @@ def _run_full_attention(name, num_heads, num_kv_heads, head_dim,
 
         atb_out = graph_op.forward(inputs)[0].cpu().float()
         cos = _cosine(ref_out, atb_out)
+        # 0.99: moderate fp16 accumulation (single attention, cross-framework) — see THRESHOLDS.md
         ok = cos > 0.99
         status = "PASS" if ok else f"FAIL (cos={cos:.6f})"
         print(f"    {status}")
@@ -105,8 +109,6 @@ def main():
     print(f"=== 310P SelfAttention Parameter Combination Sweep ===")
     print(f"Platform: {platform}")
     print(f"Device: {device}")
-
-    utils.set_atb_buffer_size(500 * 1024 * 1024)
 
     nh = 16
     kv_nh = 16

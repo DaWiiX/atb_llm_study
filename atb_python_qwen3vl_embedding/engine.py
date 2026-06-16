@@ -11,6 +11,7 @@ Usage:
     engine = Qwen3VLEngine("/path/to/Qwen3-VL-Embedding-2B")
     output = engine.forward(input_ids, pixel_values, image_grid_thw)
 """
+import time
 from pathlib import Path
 
 import torch
@@ -128,6 +129,9 @@ class Qwen3VLEngine:
         # ── Build ATB graphs ────────────────────────────────────────
         self._build_graphs()
 
+        # ── Debug / test access ────────────────────────────────────
+        self._last_ds_feats = None  # populated by _run_vision
+
     def _make_vision_config(self):
         """Create a config-like object for ATB vision graph builders."""
         return VisionConfigWrapper(self.v_cfg)
@@ -176,11 +180,24 @@ class Qwen3VLEngine:
 
     # ── Vision inference ───────────────────────────────────────────
 
-    def _run_vision(self, pixel_values, grid_thw):
+    def _run_vision(self, pixel_values, grid_thw, return_intermediates=False):
         """Run full VisionModel on ATB NPU — outputs stay on NPU.
 
-        Returns (vis_npu, ds_feats_npu) — both NPU float16 tensors.
+        Args:
+            pixel_values: Preprocessed pixel values (float32 CPU tensor).
+            grid_thw: Grid dimensions tensor.
+            return_intermediates: If True, also returns a dict with per-stage
+                wall-clock timing ('vision_pos', 'vision_model') measured with
+                torch.npu.synchronize() boundaries.
+
+        Returns:
+            (vis_npu, ds_feats_npu) when return_intermediates=False (default).
+            (vis_npu, ds_feats_npu, intermediates_dict) when True.
         """
+        if return_intermediates:
+            torch.npu.synchronize()
+            t0 = time.perf_counter()
+
         # ── Position embedding + RoPE via ATB graph (NPU) ────────────
         idx_wt = compute_posemb_indices(grid_thw, self.num_grid, self.merge_size)
         rope_idx = compute_rope_indices(grid_thw, self.vis_rotary, self.merge_size)
@@ -188,6 +205,12 @@ class Qwen3VLEngine:
 
         pos_npu, cos_npu, sin_npu = run_posemb_npu(
             self.g_v_posemb, self.v_pe_w_table, idx_wt, rope_idx, freq_npu)
+
+        if return_intermediates:
+            torch.npu.synchronize()
+            t1 = time.perf_counter()
+            intermediates = {'vision_pos': t1 - t0}
+            t0 = t1
 
         # Pre-convert pixel values to NPU float16 once.
         pv_npu = to_npu_half(pixel_values.reshape(-1)
@@ -226,6 +249,14 @@ class Qwen3VLEngine:
 
         # torch.npu.synchronize()
         vis = run_merger_npu(self.g_v_merger, h, self.v_merger_w)
+
+        if return_intermediates:
+            torch.npu.synchronize()
+            intermediates['vision_model'] = time.perf_counter() - t0
+
+        self._last_ds_feats = ds_feats  # store for test introspection
+        if return_intermediates:
+            return vis, ds_feats, intermediates
         return vis, ds_feats
 
     # ── Text inference ─────────────────────────────────────────────

@@ -535,9 +535,8 @@ static bool TestL2_PositionEmbedding(int& passed, int& failed,
             LOG_INFO("  [PASS] L2a: C++ CPU pos_embed vs Python NPU pos_embed (cos=%.6f)", cos);
             passed++;
         } else {
-            LOG_WARN("  [INFO] L2a: C++ CPU vs Python NPU divergence expected (cos=%.6f) -- different precision paths", cos);
-            // Expected below 0.99 due to CPU vs NPU precision differences
-            // Not counted as failure since the precision paths differ
+            LOG_ERROR("  [FAIL] L2a: C++ CPU vs Python NPU pos_embed diverge (cos=%.6f)", cos);
+            failed++;
         }
     } else {
         LOG_WARN("  SKIP L2a: /tmp/stage_L2_pos_embed_npu.bin not found");
