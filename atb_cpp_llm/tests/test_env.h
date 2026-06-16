@@ -202,9 +202,9 @@ inline std::string GetEnv(const char* name, const char* default_value = nullptr)
  * Resolve the model checkpoint directory.
  *
  * Uses @c GetEnv("QWEN3VL_EMB_MODEL_DIR").  If the variable is absent from
- * both the shell environment and the @c .env file, prints a diagnostic and
- * calls @c std::abort() — just like the old behaviour, but now the @c .env
- * file counts as a valid source.
+ * both the shell environment and the @c .env file, prints a diagnostic to
+ * stderr and returns an empty string — the caller is responsible for
+ * validation (e.g. printing a LOG_ERROR and exiting cleanly).
  */
 inline std::string GetModelDir() {
     std::string val = GetEnv("QWEN3VL_EMB_MODEL_DIR");
@@ -216,5 +216,5 @@ inline std::string GetModelDir() {
         "           Add it to <repo>/.env (see .env.example) and re-run via\n"
         "           build_and_test.sh, or `export` it before invoking the\n"
         "           test binary directly.\n");
-    std::abort();
+    return std::string();
 }

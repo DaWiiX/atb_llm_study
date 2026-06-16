@@ -157,6 +157,13 @@ static std::vector<uint8_t> CreateGradientImage(int32_t c, int32_t h, int32_t w)
 }
 
 int main() {
+    if (MODEL_DIR.empty()) {
+        std::fprintf(stderr,
+            "QWEN3VL_EMB_MODEL_DIR is not set. "
+            "Source .env via build_and_test.sh or export the variable.\n");
+        return 1;
+    }
+
     LOG_INFO("=== Stage-by-Stage Precision Test ===");
 
     int tests_passed = 0;

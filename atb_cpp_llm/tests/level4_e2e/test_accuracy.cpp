@@ -171,6 +171,13 @@ static void PrintFirstN(const char* label, const atb_llm::InferResult& result, i
 }
 
 int main(int argc, char** argv) {
+    if (MODEL_DIR.empty()) {
+        std::fprintf(stderr,
+            "QWEN3VL_EMB_MODEL_DIR is not set. "
+            "Source .env via build_and_test.sh or export the variable.\n");
+        return 1;
+    }
+
     LOG_INFO("=== C++ Engine Accuracy Test ===");
     LOG_INFO("Image: %dx%d, Text: 'Describe the image.'", IMG_H, IMG_W);
 

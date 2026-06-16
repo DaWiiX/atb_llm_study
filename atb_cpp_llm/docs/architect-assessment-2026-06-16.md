@@ -440,6 +440,199 @@ cmake ...                                                   # ❌
 
 > ⚠️ 此规则为 2026-06-16 第 2 批审查后新增。第 1 批（G1-G3, B1）和第 2 批（P0-1~P0-3, B2）均未执行运行时审查。这 8 项修改需要在硬件可用时进行运行时回溯验证。
 
+### 9.6 ⚠️ 310P Benchmark 失败事件：流程缺陷暴露（2026-06-16）
+
+**事件描述**：在完成 `test-fix-plan.md` 的 21 项全面代码审查后，用户在 310P 上单独运行 benchmark 时发现：
+
+- **`--mode all text io mm`** 全部报错 "setup fail with status 4"（ATB "call operation setup fail"）
+- **`--mode compare`** 报错 `/tmp/tokens_chat_text_only_100.bin` 文件缺失
+
+**后续发现（910B）**：C++ benchmark 在 910B 上同样存在严重问题：
+- **`--mode all` 和 `--mode text`**：**静默崩溃** — 进程在 `main()` 之前被 `std::abort()` 杀死，无任何日志输出
+- **`--mode compare`**：同样报 token 文件缺失
+
+这意味着 **C++ benchmark 在所有平台上都已损坏，但测试套件从未运行它**。
+
+**两个问题均非 test-fix-plan.md 审查范围内发现的新问题** — 它们都是代码中已知但未修复的缺陷。
+
+#### 问题 1: Token 文件命名不匹配（已知但未修复）
+
+**症状**: C++ `benchmark --mode compare` 期望 `tokens_chat_*` 前缀的文件，Python `benchmark --save-tokens` 生成 `tokens_*` 前缀（无 `chat`、无 seq_len 后缀）。
+
+| 来源 | TEXT_ONLY | IMAGE_ONLY | IMAGE_AND_TEXT |
+|------|-----------|------------|----------------|
+| C++ 期望 | `tokens_chat_text_only_{seq}.bin` | `tokens_chat_io_{W}x{H}.bin` | `tokens_chat_mm_{W}x{H}.bin` |
+| Python 生成 | `tokens_text_only.bin` ❌ | **不生成** ❌ | `tokens_mm_{w}x{h}.bin` ❌ |
+
+**此问题在 `refactoring-plan.md:194` 中已明确记录**：
+> *"症状: C++ 读 `tokens_chat_mm_{W}x{H}.bin`，Python 读 `tokens_mm_{W}x{H}.bin`。两组文件不同步时 cosine 莫名其妙低，代码表面看不出异常。教训: 所有 benchmark .bin 由一个脚本统一生成。"*
+
+然而该问题从未被纳入 `test-fix-plan.md` 的可操作修复项 — **知识存在但未转化为行动**。
+
+#### 问题 2: 310P "call operation setup fail"（代码注释中已记录）
+
+**症状**: 310P 上所有模式（text/io/mm）的 benchmark 均失败，错误为 ATB "call operation setup fail"。
+
+**根因**: 310P 要求 causal mask 使用 FRACTAL_NZ 格式（format=29），若使用 ND 格式，ATB SelfAttention 内部 Transdata 操作失败。此行为在代码中已有明确注释：
+- `utils.py:245-246`: *"without it, ATB SelfAttention sees ND format, tries internal ND→NZ TransdataOperation, and fails on 310P with 'call operation setup fail'"*
+- `engine.py:286-288`: *"310P: causal mask in NZ layout... fails on 310P with 'call operation setup fail'"*
+
+`engine.py:_ensure_text_graph()` 已通过 `is_310p()` 判断处理此问题，但 `is_310p()` 依赖 `.env` 中的 `ASCEND_PLATFORM=310P` 变量。**如果 310P 机器上 `.env` 未正确设置此变量，`is_310p()` 返回 False，静默 fallback 到 910B 的 ND 格式 mask，导致 ATB 图编译/运行失败。**
+
+#### 问题 3: C++ benchmark `GetModelDir()` 的 `std::abort()` 导致静默崩溃（910B + 310P 均受影响）
+
+**症状**: 用户直接运行 `./build/benchmark --mode all` 或 `--mode text` 时，进程静默退出，无任何 LOG_INFO 或 LOG_ERROR 输出。`--mode compare` 能输出错误信息仅因为偶然的环境变量设置差异。
+
+**根因**: `benchmark.cpp:44` 中：
+```cpp
+static const std::string MODEL_DIR = GetModelDir();
+```
+
+这是一个**静态全局变量**，在 `main()` 之前初始化。而 `test_env.h:209-220` 中的 `GetModelDir()` 实现：
+```cpp
+inline std::string GetModelDir() {
+    std::string val = GetEnv("QWEN3VL_EMB_MODEL_DIR");
+    if (!val.empty()) return val;
+    std::fprintf(stderr, "...");
+    std::abort();  // ← 在 main() 之前杀死进程！
+}
+```
+
+当用户直接运行 benchmark 二进制（而非通过 `build_and_test.sh`）时，`QWEN3VL_EMB_MODEL_DIR` 可能未在 shell 环境中设置。此时：
+1. `GetEnv()` 检查 shell 环境 → 未设置
+2. `GetDotEnvCache()` 搜索 `.env` 文件 → 取决于 CWD，不一定能找到
+3. `GetModelDir()` 调用 `std::abort()` → **进程在静态初始化阶段被杀死，main() 从未执行**
+4. 所有 `LOG_INFO`/`LOG_ERROR` 宏从未有机会执行
+5. 只有 ATB 库自身的静态初始化日志（`mki_log delete old file:...`）被打印
+
+**为什么 CTest 和 `build_and_test.sh` 没发现**：
+- `build_and_test.sh` 在运行 ctest 前 `source .env`，将 `QWEN3VL_EMB_MODEL_DIR` 导出到 shell 环境
+- CTest 继承 shell 环境，所以所有 C++ 测试都能正常获取 model_dir
+- **但 C++ benchmark 未被注册为 CTest 测试** — `CMakeLists.txt` 中没有 `add_test(NAME benchmark ...)` 
+- 因此 `build_and_test.sh → ctest` 从不运行 benchmark 二进制
+
+**这是一个双重失败**：
+1. benchmark 在无 env 设置时静默崩溃（可用性问题）
+2. benchmark 完全不在自动化测试中（覆盖缺口）
+
+#### 为什么 test-fix-plan.md 的全面审查没有发现
+
+| 盲区类型 | 具体表现 | 严重度 |
+|----------|----------|--------|
+| **静态审查 ≠ 运行时测试** | 命名不匹配只有执行 `--mode compare` 才会暴露；mask 格式错误只有 310P 上运行才触发；`std::abort()` 只有直接运行二进制才触发 | 🔴 严重 |
+| **已知问题未追踪到修复** | `refactoring-plan.md` 记录的问题未纳入 `test-fix-plan.md` 可操作项，知识孤岛导致问题持续 | 🔴 严重 |
+| **跨平台测试缺失** | 全部测试在 910B 完成，310P 特定代码路径（NZ mask 格式）仅做目视检查 | 🔴 严重 |
+| **benchmark "通过" 具误导性** | `run_all.py --benchmarks` 仅用默认 `--mode mm` 运行；C++ benchmark 根本不在 CTest 中注册 | 🔴 严重 |
+| **工作流端到端测试缺失** | compare 模式全流程（生成tokens→C++ benchmark→Python 对比）从未端到端验证 | 🟡 中等 |
+| **环境依赖隐式假设** | `is_310p()` 依赖 `.env` 配置；`GetModelDir()` 的 `std::abort()` 在无 env 时杀死进程 | 🟡 中等 |
+
+#### 🆕 为什么架构师也没有第一时间发现（元认知缺陷）
+
+**我在派发修复 agent 之前，犯了和 test-fix-plan.md 审查相同的错误：只分析代码，不运行验证。**
+
+具体失误链：
+1. **假设基线正确** — 看到 51/51 CTest 通过，就假设 C++ benchmark 也能工作。事实是 benchmark **不在 CTest 中注册**。
+2. **跳过了复现步骤** — 直接进入代码分析模式（读 6 个文件），试图通过阅读代码推断 "status 4" 含义，而不是先在 910B 上运行 `./build/benchmark --mode all` 确认基线。
+3. **信任间接信号** — 用 Python benchmark 的通过来推断 C++ benchmark 的正常，两者是独立二进制。
+4. **未检查测试注册** — 没有验证 `CMakeLists.txt` 中 benchmark 是否被 `add_test()` 注册。
+
+**如果我先在 910B 上运行 `./build/benchmark --mode all`，30 秒内就能发现静默崩溃**，然后追踪到 `GetModelDir() → std::abort()` 根因。这会立即暴露三个问题（abort + 命名不匹配 + 未注册到 CTest），而非用户逐步提供信息后才逐个发现。
+
+**架构师教训**：
+> **收到 bug 报告后，第一步永远是复现问题、建立基线，而非直接分析代码。** "测试全部通过"不能替代"实际运行出问题的那个命令"。
+
+#### 暴露的系统性缺陷
+
+1. **审计文档之间的知识孤岛**：`refactoring-plan.md` 记录的已知问题未与 `test-fix-plan.md` 联动，导致已知缺陷持续存在。需要一个统一的缺陷追踪机制。
+
+2. **审查覆盖 ≠ 验证覆盖**：代码结构审查（覆盖矩阵、阈值合理性、冗余分析）无法替代运行时行为验证。benchmark 有 4 mode × 4 分辨率 × `--save-tokens` × `--load-pixel-values` × `--no-ref` 等多种组合，仅默认路径通过测试不等于全路径正确。
+
+3. **平台假设未显式化**：`ASCEND_PLATFORM` 环境变量的正确配置是正确性的前提条件，但无自动检测机制验证其与实际 NPU 硬件是否一致。正确行为隐式依赖人工配置。
+
+4. **"通过"的语义膨胀**：`run_all.py --benchmarks` 中 benchmark.py 退出码 0 被解读为 "benchmark 功能正常"，但实际上仅验证了默认参数的 `--mode mm` 路径。测试通过 ≠ 功能完整。
+
+#### 修正措施（已派发修复 agent）
+
+| # | 措施 | 说明 |
+|---|------|------|
+| **F1** | 修复 Python benchmark.py `--save-tokens` 命名 | 改用 `chat_tokenizer` + `tokens_chat_*` 命名，对齐 C++ 期望 |
+| **F2** | 创建 `gen_compare_tokens.py` | 一键生成 C++ compare 模式所需的全部 13 个 token 文件 |
+| **F3** | 平台自检（后续） | benchmark/engine 初始化时验证 `ASCEND_PLATFORM` 与实际 NPU 硬件一致 |
+| **F4** | 扩展 benchmark 测试覆盖（后续） | `run_all.py` 增加 `--mode all --save-tokens` 等非默认路径的测试 |
+
+### 9.7 🆕 架构师工作流 v2：经验提炼（2026-06-16）
+
+基于 §9.6 事件中暴露的流程缺陷，将工作流升级为 v2。
+
+#### 核心原则（新增/强化）
+
+| 原则 | 来源 | 含义 |
+|------|------|------|
+| **复现优先于分析** | §9.6 元认知缺陷 | 收到 bug 报告 → 先在可用硬件上运行出问题的命令 → 建立基线 → 再读代码 |
+| **审查必须复现** | 用户反馈 + §9.4 | Reviewer 的第一项工作是运行出问题的命令确认问题存在，然后再审查修复 |
+| **交叉验证** | F3 发现（910B 也失败） | C++ 修改必须验证 Python 端不受影响，反之亦然；一个平台通过 ≠ 全平台正常 |
+| **测试注册检查** | F3 发现（benchmark 不在 CTest） | 确认修改涉及的二进制/脚本已被自动化测试覆盖，未覆盖则同步添加 |
+| **已知问题搜索** | F1 发现（refactoring-plan 已记录） | 修复前搜索 `docs/*.md` 中的已知问题记录，避免重复劳动或忽视已知缺陷 |
+| **禁止假设** | 用户明确要求 | Architect 不清楚需求时，使用 grill-me skill 向用户彻底问清楚，严禁猜测 |
+
+#### 修订后的 Developer → Reviewer 循环 (v2)
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                    Architect 前置步骤（新增）                      │
+│  1. 收到任务/问题报告                                              │
+│  2. 复现问题，建立基线（先跑命令，不先读代码）                       │
+│  3. 搜索 docs/*.md 中的已知问题记录                                │
+│  4. 检查目标二进制/脚本是否在自动化测试中注册                        │
+│  5. 确定问题范围（不止用户报告的 mode，检查所有 mode/组合）          │
+│  6. 如有不明确 → grill-me skill 向用户问清楚 → 严禁猜测            │
+│  7. 编写详细的工作范围和目标（developer agent 不能自己猜测）         │
+└──────────────────────────────────────────────────────────────────┘
+         │
+         ▼
+┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
+│  Developer      │────▶│  Reviewer       │────▶│  Re-review      │
+│  Agent          │     │  Agent          │     │  Agent          │
+│                 │     │                 │     │                 │
+│ · 上下文干净    │     │ · 上下文干净    │     │ · 上下文干净    │
+│ · 按计划执行    │     │ · 辩证挑刺      │     │ · 验证修复      │
+│ · 思考全面      │     │ · 逐项对照计划  │     │ · 确认零问题    │
+│ · 自省不糊弄    │     │ · 不放过小问题  │     │ · 最终裁决      │
+│ · 有疑问→汇报  │     │ · 🆕 先复现问题 │     │                 │
+│ · 🆕 先运行测  │     │ · 🆕 运行测试   │     │                 │
+│   试验证基线   │     │                 │     │                 │
+└─────────────────┘     └─────────────────┘     └─────────────────┘
+         │                       │                       │
+         │   发现 N 个问题       │                       │
+         │◀──────────────────────│                       │
+         │   修复后重新提交      │                       │
+         │──────────────────────▶│   0 个问题            │
+         │                       │──────────────────────▶│
+         │                       │                       │  确认通过 ✅
+```
+
+#### Architect 审查通过标准 (v2)
+
+**审查通过 = 静态审查零问题 + 单元测试全部 PASS + 复现确认问题已消失**
+
+| 阶段 | 检查项 |
+|------|--------|
+| Developer 提交后 | 相关单元测试 PASS（Python: `run_all.py` / C++: `build_and_test.sh`） |
+| Reviewer 审查时 | 复现原问题 → 确认修复后问题消失 → 静态代码审查零问题 |
+| Architect 批次后 | 全量测试 PASS（Python + C++ 双端） |
+
+> ⚠️ "全量测试 PASS" 仅涵盖**已注册到测试套件的测试**。对于未注册的二进制/脚本（如 C++ benchmark），architect 必须单独验证。
+
+#### Architect 派发 agent 的 briefing 模板
+
+每个 developer agent 的 prompt 必须包含：
+1. **问题描述**：症状、影响范围、根因（如已知）
+2. **工作范围**：哪些文件需要修改，哪些**不需要**修改（防止过度修改）
+3. **验收标准**：具体的、可验证的通过条件
+4. **禁止事项**：明确列出不允许的操作（如"不要修改其他函数"）
+5. **测试要求**：需要运行的具体测试命令
+6. **上报路径**：遇到不明确的情况 → 汇报给 architect，不要自己猜测
+
 ---
 
 ## 10. 预防措施：如何避免类似问题
@@ -454,6 +647,10 @@ cmake ...                                                   # ❌
 | **边界条件遗漏** | G1: `gthw` 空指针未检查；B1: 空列表返回 0.0 而非 NaN | 高 |
 | **返回值忽略** | G2: 16 处 `CopyToDevice`/`CopyToHost` 返回值未检查 | 中 |
 | **类型不一致** | B1: 返回 `np.float64` 而非 Python `float` | 低 |
+| **🆕 文件命名约定不一致** | C++ `tokens_chat_*` vs Python `tokens_*` — 跨语言接口契约未同步 | 高 |
+| **🆕 环境配置隐式依赖** | `is_310p()` 正确性依赖 `.env`，错误配置导致静默 fallback 和运行时失败 | 高 |
+| **🆕 知识孤岛** | `refactoring-plan.md` 记录的已知问题未纳入 `test-fix-plan.md` 可操作项 | 高 |
+| **🆕 多模式测试覆盖不完整** | benchmark 4 种 mode × 多种选项，仅默认路径被测试覆盖 | 中 |
 
 ### 10.2 预防机制
 
@@ -477,6 +674,9 @@ cmake ...                                                   # ❌
 - [ ] 文档中的命令是否可以直接复制粘贴执行？
 - [ ] ⚠️ **是否已运行相关单元测试并全部 PASS？**（纯静态审查不可接受 — 见 §9.4）
 - [ ] 修改的 API 返回值/副作用是否在 NPU 硬件上验证过？
+- [ ] 🆕 **C++ 和 Python 之间的文件命名/接口契约是否一致？**（跨语言接口必须对照检查）
+- [ ] 🆕 **所有 benchmark/test mode 组合是否都经过测试？**（不只默认路径）
+- [ ] 🆕 **环境变量依赖是否在代码中显式验证？**（不应隐式依赖外部配置的正确性）
 
 #### B. CI/CD 阶段预防
 
@@ -500,6 +700,42 @@ cmake ...                                                   # ❌
 - 文档中的任何命令/参数/路径必须能追溯到源码（不可推断）
 - 性能数据的对比基线必须与生产环境一致（不可用不同配置）
 - 测试的参考实现必须是同输入下的黄金标准（本项目中为 transformers）
+
+**7. 🆕 跨语言接口契约检查**（适用于 C++/Python 互操作）：
+- [ ] C++ 和 Python 是否使用相同的文件命名约定？逐文件对照检查
+- [ ] 所有 `.bin` 文件的生成者和消费者是否使用同一份格式定义？
+- [ ] 新增跨语言文件依赖时，是否同时更新生成脚本和消费代码？
+- **验证方式**: 运行完整的跨语言工作流（生成→消费→对比），不只分别测试两端
+
+**8. 🆕 审计文档联动机制**：
+- 任何审计/回顾文档中标记的已知问题必须同步到 `test-fix-plan.md` 或对应的可操作追踪文档
+- 定期扫描 `docs/*.md` 中的"症状"/"根因"/"教训"关键词，提取未修复项并排优先级
+- **教训来源**: `refactoring-plan.md:194` 记录了 `tokens_chat_*` 命名不匹配 6 个月以上但从未修复
+
+**9. 🆕 平台自检机制**：
+- 关键环境变量（如 `ASCEND_PLATFORM`）在引擎初始化时与实际 NPU 硬件对比验证
+- 不匹配时发出明确警告（而非静默 fallback 到错误行为）
+- **教训来源**: 310P 上 benchmark 全部失败但 910B 上全 PASS，环境配置错误被静默掩盖
+
+**10. 🆕 Benchmark 多模式测试**：
+- `run_all.py --benchmarks` 应测试非默认 mode（至少 `--mode all`），不只是默认 `--mode mm`
+- 关键功能组合（`--save-tokens`、`--load-pixel-values`）应有独立测试用例
+- 每个 benchmark mode 至少有一条"冒烟测试"（1 warmup + 1 iter + 1 resolution）
+
+#### D. 🆕 架构师自我检查清单
+
+**11. 🆕 收到 bug 报告后的第一步：复现，不是分析代码**：
+- [ ] **在分析任何代码之前**，先在当前可用硬件上运行用户报告的确切命令
+- [ ] 如果当前硬件与用户不同（如用户在 310P，我在 910B），先在可用硬件上运行同等命令建立基线
+- [ ] "测试全部通过"不等于"出问题的那个命令能工作" — 验证用户实际执行的命令
+- [ ] 检查目标二进制/脚本是否在自动化测试中注册（CTest / run_all.py）
+- [ ] **只有复现问题后，才开始阅读代码分析根因**
+
+**12. 🆕 派发 agent 前的验证**：
+- [ ] 是否已确认问题的完整范围（不只是用户报告的症状，还包括同一二进制/脚本的其他 mode）
+- [ ] 是否已验证问题在多个 mode/平台上的表现（如 text + io + mm + compare + all）
+- [ ] 是否已检查相关二进制是否被自动化测试覆盖
+- **教训来源**: 本次事件 — 架构师直接分析代码而跳过复现，导致第三个根因（`std::abort()`）完全遗漏，需用户提供额外信息才发现
 
 ### 10.3 与现有 CLUADE.md 测试精度原则的关系
 
@@ -530,14 +766,16 @@ cmake ...                                                   # ❌
 | B2 | NPU 内存使用量测量 | `394acc5` | ✅ | 3 轮（7→6→0 问题） | ⚠️ 未执行 |
 | P0-1+P0-2 | sync 竞态修复 + 资源清理 | `2cb1dbe` | ✅ | 2 轮（2+5→0 问题） | ⚠️ 未执行 |
 
-### 11.3 第 3 批目标建议（4 项）
+### 11.3 第 3 批目标建议（6 项 — 含紧急修复 F1-F2）
 
 | # | 目标 | 严重程度 | 预估工作量 | 说明 |
 |---|------|----------|------------|------|
+| **F1** | 🔴 修复 benchmark.py token 命名不匹配 | P0 | 1h | 改用 chat_tokenizer + `tokens_chat_*` 命名，对齐 C++ 期望 |
+| **F2** | 🔴 创建 `gen_compare_tokens.py` | P0 | 0.5h | 一键生成 C++ compare 模式所需的 13 个 token 文件 |
 | **P0-4** | engine.py forward() 输入校验 | P0 | 1h | 检查 input_ids dtype/shape、pixel_values/image_grid_thw 一致性、token_id 范围 |
 | **B3** | 冷启动 benchmark | P2 | 1.5h | 测量首次推理的 H2D 拷贝和 graph 编译开销 |
 | **B4** | 吞吐量 benchmark | P2 | 2h | 多 stream/批量并发吞吐量测试 |
-| **回溯验证** | 运行全量测试验证第 1-2 批修改 | P0 | 1h | `python tests/run_all.py` 验证 8 项修改不破坏现有功能 |
+| **回溯验证** | 运行全量测试验证第 1-2 批修改 | P0 | 1h | `python tests/run_all.py` + `bash atb_cpp_llm/build_and_test.sh` |
 
 ### 11.4 后续批次概览
 
@@ -558,3 +796,4 @@ cmake ...                                                   # ❌
 | 2026-06-16 | 初始评估报告（8 agent：3 Explore + 4 Action + 1 Verify） |
 | 2026-06-16 | 第 1 批修复完成：G1, G2, G3, B1（4/4 ✅）；新增第 8-12 节 |
 | 2026-06-16 | 第 2 批修复完成：P0-1, P0-2, P0-3, B2（4/4 ✅）；新增 §9.4 强制性运行时测试规则；新增 §10 审查清单中的运行时验证要求 |
+| 2026-06-16 | 🔴 **310P+910B benchmark 失败事件**：新增 §9.6（3 个根因分析 + 元认知缺陷分析）；更新 §10.1 根因表（+4 行）；更新 §10.2 审查清单（+5 项）+ 架构师自我检查清单（+2 项）；更新 §11.3 第 3 批计划（含 F1-F3 紧急修复） |

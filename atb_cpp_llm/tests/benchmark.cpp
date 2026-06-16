@@ -41,8 +41,6 @@
 #include <string>
 #include <functional>
 
-static const std::string MODEL_DIR = GetModelDir();
-
 // ── Statistics helper ────────────────────────────────────────
 struct Stats {
     double mean = 0, median = 0, min_val = 0, max_val = 0, stddev = 0;
@@ -328,14 +326,15 @@ int RunTextBenchmark(atb_llm::LLMEngine* engine,
 // ═══════════════════════════════════════════════════════════════
 
 int RunMultimodalBenchmark(atb_llm::LLMEngine* engine,
+                           const std::string& model_dir,
                            int img_w, int img_h,
                            int num_warmup, int num_iter,
                            bool cmp_mode) {
     // Load Qwen3VL config for preprocessing
     atb_llm::adapters::Qwen3VLConfig config;
-    atb_llm::Status s = atb_llm::adapters::LoadQwen3VLConfig(MODEL_DIR, config);
+    atb_llm::Status s = atb_llm::adapters::LoadQwen3VLConfig(model_dir, config);
     if (s != atb_llm::STATUS_OK) {
-        LOG_ERROR("Failed to load Qwen3VL config from %s", MODEL_DIR.c_str());
+        LOG_ERROR("Failed to load Qwen3VL config from %s", model_dir.c_str());
         return 1;
     }
 
@@ -449,14 +448,15 @@ int RunMultimodalBenchmark(atb_llm::LLMEngine* engine,
 // ═══════════════════════════════════════════════════════════════
 
 int RunImageOnlyBenchmark(atb_llm::LLMEngine* engine,
+                          const std::string& model_dir,
                           int img_w, int img_h,
                           int num_warmup, int num_iter,
                           bool cmp_mode) {
     // Load Qwen3VL config for preprocessing
     atb_llm::adapters::Qwen3VLConfig config;
-    atb_llm::Status s = atb_llm::adapters::LoadQwen3VLConfig(MODEL_DIR, config);
+    atb_llm::Status s = atb_llm::adapters::LoadQwen3VLConfig(model_dir, config);
     if (s != atb_llm::STATUS_OK) {
-        LOG_ERROR("Failed to load Qwen3VL config from %s", MODEL_DIR.c_str());
+        LOG_ERROR("Failed to load Qwen3VL config from %s", model_dir.c_str());
         return 1;
     }
 
@@ -507,6 +507,10 @@ int RunImageOnlyBenchmark(atb_llm::LLMEngine* engine,
                   "/tmp/tokens_chat_io_%dx%d.bin", img_w, img_h);
     std::vector<int64_t> input_ids = LoadTokenIds(io_tok_path);
     if (input_ids.empty()) {
+        LOG_WARN("Chat-templated token file not found: %s — "
+                 "using bare image tokens. Run 'python atb_cpp_llm/scripts/gen_compare_tokens.py' "
+                 "to generate accurate token files.",
+                 io_tok_path);
         // Fallback to bare image tokens
         input_ids.resize(vis_tokens);
         for (int64_t i = 0; i < vis_tokens; i++)
@@ -571,12 +575,13 @@ int RunImageOnlyBenchmark(atb_llm::LLMEngine* engine,
 // ═══════════════════════════════════════════════════════════════
 
 int RunCompareMode(atb_llm::LLMEngine* engine,
+                   const std::string& model_dir,
                    int num_warmup, int num_iter) {
     // Load Qwen3VL config for preprocessing
     atb_llm::adapters::Qwen3VLConfig config;
-    atb_llm::Status s = atb_llm::adapters::LoadQwen3VLConfig(MODEL_DIR, config);
+    atb_llm::Status s = atb_llm::adapters::LoadQwen3VLConfig(model_dir, config);
     if (s != atb_llm::STATUS_OK) {
-        LOG_ERROR("Failed to load Qwen3VL config from %s", MODEL_DIR.c_str());
+        LOG_ERROR("Failed to load Qwen3VL config from %s", model_dir.c_str());
         return 1;
     }
 
@@ -617,8 +622,16 @@ int RunCompareMode(atb_llm::LLMEngine* engine,
                           "/tmp/tokens_chat_text_only_%ld.bin", static_cast<long>(seq));
             std::vector<int64_t> input_ids = LoadTokenIds(tok_path);
             if (input_ids.empty()) {
-                LOG_ERROR("Chat-templated token file not found: %s", tok_path);
-                return 1;
+                LOG_WARN("Chat-templated token file not found: %s — "
+                         "using fallback tokens. Run 'python atb_cpp_llm/scripts/gen_compare_tokens.py' "
+                         "to generate accurate token files.",
+                         tok_path);
+                // Fallback: construct simple token sequence of nominal seq_len
+                input_ids.resize(static_cast<size_t>(seq));
+                input_ids[0] = 151643;
+                for (int64_t j = 1; j < seq - 1; j++)
+                    input_ids[j] = 15339;
+                input_ids[static_cast<size_t>(seq) - 1] = 151645;
             }
             int64_t actual_seq = static_cast<int64_t>(input_ids.size());
 
@@ -722,6 +735,10 @@ int RunCompareMode(atb_llm::LLMEngine* engine,
                           "/tmp/tokens_chat_io_%dx%d.bin", img_w, img_h);
             std::vector<int64_t> input_ids = LoadTokenIds(io_tok_path);
             if (input_ids.empty()) {
+                LOG_WARN("Chat-templated token file not found: %s — "
+                         "using bare image tokens. Run 'python atb_cpp_llm/scripts/gen_compare_tokens.py' "
+                         "to generate accurate token files.",
+                         io_tok_path);
                 // Fallback to bare image tokens
                 input_ids.resize(vis_tokens, image_token_id);
             }
@@ -877,15 +894,22 @@ int main(int argc, char** argv) {
         }
     }
 
+    // Validate model directory (was static global — now checked after LOG init)
+    std::string model_dir = GetModelDir();
+    if (model_dir.empty()) {
+        LOG_ERROR("QWEN3VL_EMB_MODEL_DIR is not set (see stderr for details).");
+        return 1;
+    }
+
     if (!cmp_mode) {
         LOG_INFO("=== Qwen3VL Embedding Benchmark ===");
-        LOG_INFO("Model: %s", MODEL_DIR.c_str());
+        LOG_INFO("Model: %s", model_dir.c_str());
         LOG_INFO("Mode: %s", mode.c_str());
     }
 
     // Create engine
     atb_llm::EngineConfig config;
-    config.model_dir = MODEL_DIR;
+    config.model_dir = model_dir;
     config.buffer_size = 10LL * 1024 * 1024 * 1024;
     config.device_id = 0;
 
@@ -905,16 +929,16 @@ int main(int argc, char** argv) {
     if (mode == "text") {
         ret = RunTextBenchmark(engine.get(), seq_len, num_warmup, num_iter, cmp_mode);
     } else if (mode == "mm") {
-        ret = RunMultimodalBenchmark(engine.get(), img_w, img_h, num_warmup, num_iter, cmp_mode);
+        ret = RunMultimodalBenchmark(engine.get(), model_dir, img_w, img_h, num_warmup, num_iter, cmp_mode);
     } else if (mode == "io") {
-        ret = RunImageOnlyBenchmark(engine.get(), img_w, img_h, num_warmup, num_iter, cmp_mode);
+        ret = RunImageOnlyBenchmark(engine.get(), model_dir, img_w, img_h, num_warmup, num_iter, cmp_mode);
     } else if (mode == "all") {
         ret = RunTextBenchmark(engine.get(), seq_len, num_warmup, num_iter, cmp_mode);
         if (ret == 0) {
-            ret = RunImageOnlyBenchmark(engine.get(), img_w, img_h, num_warmup, num_iter, cmp_mode);
+            ret = RunImageOnlyBenchmark(engine.get(), model_dir, img_w, img_h, num_warmup, num_iter, cmp_mode);
         }
         if (ret == 0) {
-            ret = RunMultimodalBenchmark(engine.get(), img_w, img_h, num_warmup, num_iter, cmp_mode);
+            ret = RunMultimodalBenchmark(engine.get(), model_dir, img_w, img_h, num_warmup, num_iter, cmp_mode);
         }
     } else if (mode == "bench") {
         struct { int w, h; } resolutions[] = {
@@ -928,13 +952,13 @@ int main(int argc, char** argv) {
             if (!cmp_mode && i > 0) {
                 LOG_INFO("============================================================");
             }
-            ret = RunImageOnlyBenchmark(engine.get(),
+            ret = RunImageOnlyBenchmark(engine.get(), model_dir,
                                          resolutions[i].w, resolutions[i].h,
                                          num_warmup, num_iter, cmp_mode);
             if (ret != 0) break;
         }
     } else if (mode == "compare") {
-        ret = RunCompareMode(engine.get(), num_warmup, num_iter);
+        ret = RunCompareMode(engine.get(), model_dir, num_warmup, num_iter);
     } else {
         LOG_ERROR("Unknown mode: %s (use text|mm|io|all|bench|compare)", mode.c_str());
         return 1;

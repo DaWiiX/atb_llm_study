@@ -11,7 +11,7 @@
  * Requires: NPU device + ATB/ACL runtime + model checkpoint
  */
 
-#define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+#define DOCTEST_CONFIG_IMPLEMENT
 #include "doctest.h"
 
 #include "atb_llm/types.h"
@@ -33,6 +33,22 @@
 #define IS_OK(s) ((s) == atb_llm::STATUS_OK)
 
 static const std::string MODEL_DIR = GetModelDir();
+
+// ═════════════════════════════════════════════════════════════════════
+// Main
+// ═════════════════════════════════════════════════════════════════════
+int main(int argc, char** argv) {
+    if (MODEL_DIR.empty()) {
+        std::fprintf(stderr,
+            "QWEN3VL_EMB_MODEL_DIR is not set. "
+            "Source .env via build_and_test.sh or export the variable.\n");
+        return 1;
+    }
+
+    doctest::Context context;
+    context.applyCommandLine(argc, argv);
+    return context.run();
+}
 
 // ═════════════════════════════════════════════════════════════════════
 // Test: Engine creation and model load
