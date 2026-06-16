@@ -11,6 +11,7 @@ Usage:
     engine = Qwen3VLEngine("/path/to/Qwen3-VL-Embedding-2B")
     output = engine.forward(input_ids, pixel_values, image_grid_thw)
 """
+import threading
 import time
 from pathlib import Path
 
@@ -52,6 +53,8 @@ class Qwen3VLEngine:
     """
 
     def __init__(self, model_dir: str):
+        self._closed = False
+        self._lock = threading.Lock()
         import torch_npu  # noqa: F401 — required for ATB NPU ops
 
         self.model_dir = Path(model_dir)
@@ -131,6 +134,140 @@ class Qwen3VLEngine:
 
         # ── Debug / test access ────────────────────────────────────
         self._last_ds_feats = None  # populated by _run_vision
+
+    # ── Resource cleanup ─────────────────────────────────────────────
+
+    def close(self):
+        """Release all NPU resources (tensors, ATB graphs, cached buffers).
+
+        Idempotent — safe to call multiple times.  Individual resource
+        release failures are logged but do not prevent releasing the
+        remaining resources.
+
+        Thread-safe: the _closed flag is protected by _lock so that
+        concurrent calls to close() / forward() / encode() cannot race
+        and cause double-free.
+        """
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+
+        resource_errors = []
+
+        # ── Release ATB graphs ──────────────────────────────────────
+        for attr in (
+            "g_v_first", "g_v_block", "g_v_merger", "g_v_ds",
+            "g_v_posemb", "g_t_norm", "g_t_layer",
+        ):
+            try:
+                obj = getattr(self, attr, None)
+                if obj is not None:
+                    setattr(self, attr, None)
+                    del obj
+            except Exception as e:
+                resource_errors.append(f"{attr}: {e}")
+
+        # ── Release NPU weight tensors ──────────────────────────────
+        # Large nested structures — use pop/clear where possible.
+        weight_attrs = [
+            "embed_w", "norm_w", "v_pe_w", "v_pe_b",
+            "v_pe_w_table", "v_pos_embed",
+        ]
+        for attr in weight_attrs:
+            try:
+                obj = getattr(self, attr, None)
+                if obj is not None:
+                    setattr(self, attr, None)
+                    del obj
+            except Exception as e:
+                resource_errors.append(f"{attr}: {e}")
+
+        # Nested weight lists / dicts
+        for top_attr in (
+            "t_layer_weights", "v_block_weights",
+            "v_merger_w", "v_ds_w",
+        ):
+            try:
+                container = getattr(self, top_attr, None)
+                if container is None:
+                    continue
+                # Clear each sub-list/item
+                if isinstance(container, (list, tuple)):
+                    for item in container:
+                        if isinstance(item, (list, tuple)):
+                            item.clear()
+                    container.clear()
+                setattr(self, top_attr, None)
+                del container
+            except Exception as e:
+                resource_errors.append(f"{top_attr}: {e}")
+
+        # ── Release cached mask ─────────────────────────────────────
+        try:
+            mask = getattr(self, '_cached_mask', None)
+            if mask is not None:
+                self._cached_mask = None
+                del mask
+        except Exception as e:
+            resource_errors.append(f"_cached_mask: {e}")
+
+        # ── Release CPU weight dict ─────────────────────────────────
+        try:
+            weights = getattr(self, 'weights', None)
+            if weights is not None:
+                weights.clear()
+                self.weights = None
+                del weights
+        except Exception as e:
+            resource_errors.append(f"weights: {e}")
+
+        # ── Release RoPE objects (CPU side) ─────────────────────────
+        for attr in ("text_rope", "vis_rotary"):
+            try:
+                obj = getattr(self, attr, None)
+                if obj is not None:
+                    setattr(self, attr, None)
+                    del obj
+            except Exception as e:
+                resource_errors.append(f"{attr}: {e}")
+
+        # ── Reclaim NPU memory ──────────────────────────────────────
+        try:
+            torch.npu.empty_cache()
+        except Exception as e:
+            resource_errors.append(f"empty_cache: {e}")
+
+        # Log any errors that occurred during cleanup.
+        if resource_errors:
+            try:
+                import sys
+                print(
+                    f"[Qwen3VLEngine.close] {len(resource_errors)} resource "
+                    f"release error(s): {resource_errors}", file=sys.stderr)
+            except Exception:
+                pass
+
+    def __del__(self):
+        """Destructor — release NPU resources on garbage collection."""
+        try:
+            self.close()
+        except Exception:
+            # Must not raise from __del__, and we cannot assume that
+            # torch / torch_npu / ATB are still importable at this point.
+            pass
+
+    def __enter__(self):
+        """Enter context manager — returns self for use in `with` block."""
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Exit context manager — always closes resources.
+
+        Does not suppress exceptions; the caller must handle them.
+        """
+        self.close()
+        return False  # do not suppress any exception
 
     def _make_vision_config(self):
         """Create a config-like object for ATB vision graph builders."""
@@ -245,9 +382,19 @@ class Qwen3VLEngine:
                               cos_npu, sin_npu, seqlen_v)
             if li in self.ds_indexes:
                 ds_idx = self.ds_indexes.index(li)
+                # Sync: the deepstack merger graph may run on a different
+                # internal NPU stream than the VisionBlock graph above.
+                # Without this barrier it can read h before the block
+                # output is fully written.
+                torch.npu.synchronize()
                 ds_feats.append(run_merger_npu(self.g_v_ds, h, self.v_ds_w[ds_idx]))
 
-        # torch.npu.synchronize()
+        # Sync: the last VisionBlock in the loop above is async (ATB
+        # graph.Run() returns immediately).  Without this barrier the
+        # subsequent merger graph may read h before the block output is
+        # fully computed — silent data corruption when graphs execute on
+        # different internal NPU streams.
+        torch.npu.synchronize()
         vis = run_merger_npu(self.g_v_merger, h, self.v_merger_w)
 
         if return_intermediates:
@@ -294,10 +441,18 @@ class Qwen3VLEngine:
                                         cos_npu, sin_npu, seqlen_t,
                                         causal_mask=self._cached_mask)
             if deepstack_features and li < len(deepstack_features):
-                # clone + add + writeback (matches TF _deepstack_process)
+                # Sync: run_text_layer_npu returns immediately (ATB graph
+                # executes on a separate NPU stream).  Without this barrier
+                # the PyTorch clone/read below may see stale hidden data.
+                torch.npu.synchronize()
                 local = hidden[0, visual_mask, :].clone() + deepstack_features[li]
                 hidden[0, visual_mask, :] = local
 
+        # Sync: the last DecoderLayer execution in the loop above is async
+        # (ATB graph.Run() returns immediately).  Without this barrier,
+        # FinalNorm may read hidden states before the last layer's output
+        # is fully available on the NPU.
+        torch.npu.synchronize()
         return run_text_norm_npu(self.g_t_norm, hidden, self.norm_w).cpu().float()
 
     # ── Full pipeline ───────────────────────────────────────────────
@@ -314,7 +469,13 @@ class Qwen3VLEngine:
             image_grid_thw: (N, 3) LongTensor or None.
 
         Returns (B, S, hidden_size) float32 on CPU.
+
+        Raises:
+            RuntimeError: if the engine has been closed.
         """
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("Engine is closed and cannot be used.")
         # 1. Text embeddings → NPU
         inputs_embeds = F.embedding(input_ids, self.embed_w).half().npu()
 
@@ -323,9 +484,11 @@ class Qwen3VLEngine:
         vis_mask = None
         if pixel_values is not None and image_grid_thw is not None:
             vis_embeds, ds_feats = self._run_vision(pixel_values, image_grid_thw)
-            # CPU: compute mask; async H2D: vis_mask.npu(); async NPU: scatter.
-            # Sync so the scatter sees a fully-transferred mask AND valid
-            # vis_embeds from the (async) ATB vision graph.
+            # Sync: vis_embeds was produced by async ATB vision graphs
+            # (run_merger_npu returns immediately).  Without this barrier,
+            # the scatter below may read stale/partial vis_embeds data.
+            # The mask H2D (vis_mask.npu()) is on the same PyTorch NPU
+            # stream as the scatter — stream ordering handles the mask.
             torch.npu.synchronize()
             vis_mask = input_ids.squeeze(0) == self.img_tok
             inputs_embeds[0, vis_mask.npu(), :] = vis_embeds
@@ -368,7 +531,13 @@ class Qwen3VLEngine:
         """Full encode → pool → (optionally normalize).
 
         Returns (B, hidden_size) embedding vector.
+
+        Raises:
+            RuntimeError: if the engine has been closed.
         """
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("Engine is closed and cannot be used.")
         output = self.forward(input_ids, pixel_values, image_grid_thw)
         if attention_mask is None:
             attention_mask = torch.ones_like(input_ids)
