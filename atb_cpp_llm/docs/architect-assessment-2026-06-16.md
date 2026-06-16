@@ -335,19 +335,105 @@ def percentile(vals, p):
 | 兼容性 | torch_npu 版本差异、ATB 图编译失败 — 只有实际运行才能发现 |
 | 数值精度 | 修改后余弦相似度是否仍然 ≥ 0.99 — 必须用真实模型推理 |
 
-**强制规则**：
+### 9.5 测试执行规范：使用项目工具而非手动设置环境变量
+
+**严格遵守下述测试执行方式，不可手动设置环境变量或绕过项目工具。**
+
+#### Python 测试
+
+**环境变量加载**：所有测试脚本通过 `from atb_python_qwen3vl_embedding.env import QWEN3VL_EMB_MODEL_DIR` 自动加载 `.env` 配置。`env.py` 的查找逻辑：
+1. 检查 `ATB_DOTENV_PATH` 环境变量（可选覆盖）
+2. 从 `env.py` 所在目录向上遍历 6 级查找 `.env` 文件
+3. 优先级：`os.environ > .env > default`
+
+**推荐运行方式**：
+```bash
+# 全量测试（自动使用 .env 中的 QWEN3VL_EMB_MODEL_DIR）
+python atb_python_qwen3vl_embedding/tests/run_all.py
+
+# 带 benchmark
+python atb_python_qwen3vl_embedding/tests/run_all.py --benchmarks
+
+# 仅特定测试
+python atb_python_qwen3vl_embedding/tests/run_all.py --include '*e2e*'
+
+# 排除 310P 特定测试（在 910B 上运行）
+python atb_python_qwen3vl_embedding/tests/run_all.py --exclude '*310p*'
+```
+
+**❌ 禁止**：
+```bash
+# 不要手动 export 模型路径
+export QWEN3VL_EMB_MODEL_DIR=/some/path   # ❌ 绕过 .env
+# 不要手动设置 ASCEND_PLATFORM
+export ASCEND_PLATFORM=910B               # ❌ 绕过 .env
+```
+
+#### C++ 测试
+
+**必须使用 `build_and_test.sh`**，它会自动：
+1. 加载 repo root 的 `.env`（`set -a; source .env; set +a`）
+2. 依次 source Ascend 环境脚本（`ascend-toolkit/set_env.sh` → `cann/set_env.sh` → `atb/set_env.sh --cxx_abi=1`）
+3. CMake configure + build（自动设置 `ATB_BUILD_DEPENDENCY_PATH`）
+4. 生成 Python 参考数据（`gen_all.py`）或复用已有数据
+5. 检测 NPU（`npu-smi`），有 NPU 时运行 CTest
+
+**推荐运行方式**：
+```bash
+# 完整构建 + 测试
+bash atb_cpp_llm/build_and_test.sh
+
+# 仅构建（不运行测试）
+bash atb_cpp_llm/build_and_test.sh --no-test
+
+# 复用已有参考数据（不重新生成 /tmp/*.bin）
+bash atb_cpp_llm/build_and_test.sh --no-refresh-refdata
+
+# 跳过参考数据生成和依赖它的测试（28 个 needs_refdata 测试）
+bash atb_cpp_llm/build_and_test.sh --no-refdata
+
+# 仅测试（跳过构建，需已有 build/）
+bash atb_cpp_llm/build_and_test.sh --test-only
+
+# Debug 构建
+bash atb_cpp_llm/build_and_test.sh --debug
+
+# 仅运行特定级别（level1_cpu_pure / level2_op_precision / level3_integration / level4_e2e）
+bash atb_cpp_llm/build_and_test.sh level1_cpu_pure
+
+# 仅运行特定测试名
+bash atb_cpp_llm/build_and_test.sh test_text_model
+
+# 列出所有注册的测试
+bash atb_cpp_llm/build_and_test.sh --list
+```
+
+**❌ 禁止**：
+```bash
+# 不要手写 cmake 命令
+cmake -S atb_cpp_llm -B atb_cpp_llm/build -DATB_DIR=...  # ❌ 绕过 build_and_test.sh
+# 不要手写 ctest 命令
+ctest --test-dir atb_cpp_llm/build                         # ❌ 绕过 build_and_test.sh
+# 不要手动 source Ascend 脚本后再手动 cmake
+source /usr/local/Ascend/.../set_env.sh                    # ❌ build_and_test.sh 已处理
+cmake ...                                                   # ❌
+```
+
+#### 架构师运行时验证流程（修订版）
 
 ```
-审查流程（修订版）：
+审查流程（修订版 v2）：
 
 1. Developer Agent 完成代码修改
 2. Developer Agent 必须运行相关单元测试，证明修改不破坏现有功能
+   - Python 修改 → python atb_python_qwen3vl_embedding/tests/run_all.py
+   - C++ 修改 → bash atb_cpp_llm/build_and_test.sh
 3. Reviewer Agent 进行静态代码审查（逐行阅读 + 对照参考实现）
 4. Reviewer Agent 必须运行相关单元测试，验证输出与预期一致
 5. Architect 在每个批次完成后运行全量测试套件
-
-每批次的 4 项修复完成后：
-  → python atb_python_qwen3vl_embedding/tests/run_all.py  ← 强制全量测试
+   - Python 全量: python atb_python_qwen3vl_embedding/tests/run_all.py
+   - C++ 全量: bash atb_cpp_llm/build_and_test.sh
+   - 两者均须 PASS（0 失败）
 ```
 
 **审查通过 = 静态审查零问题 + 单元测试全部 PASS**
