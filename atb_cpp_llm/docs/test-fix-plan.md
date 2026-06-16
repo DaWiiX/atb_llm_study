@@ -12,9 +12,9 @@
 | [P2](#p2) | 🔴→🟢 已修复 | C++ | Stage L2a 静默忽略低于阈值的精度结果 | ✅ 2026-06-15 |
 | [P3](#p3) | 🔴→🟢 已修复 | C++ | DecoderLayer MHA+causal mask 精度测试缺失 | ✅ 2026-06-15 |
 | [P4](#p4) | 🔴 高 | C++ | DeepSeek/Mixtral/Qwen3(non-VL) 零测试覆盖 |
-| [P5](#p5) | 🔴 高 | Python | Deepstack 跨模态融合无自动化测试 |
+| [P5](#p5) | 🔴→🟢 已修复 | Python | Deepstack 跨模态融合无自动化测试 | ✅ 2026-06-16 |
 | [P6](#p6) | 🔴→🟢 已修复 | Python | test_text_model.py 只用 2 层测试（真实模型 28 层） | ✅ 2026-06-15 |
-| [P7](#p7) | 🔴 高 | C++ | BicubicResize 参考实现自证（非独立参考） |
+| [P7](#p7) | 🔴→🟢 已修复 | C++ | BicubicResize 参考实现自证（非独立参考） | ✅ 2026-06-16 |
 | [P8](#p8) | 🟡→🟢 已修复 | Python | test_text_attention.py 与 test_310p_diag.py 冗余 | ✅ 2026-06-15 |
 | [P9](#p9) | 🟡→🟢 已修复 | Python | test_nz_quick_verify.py 与 test_nz_format_verify.py 冗余 | ✅ 2026-06-15 |
 | [P10](#p10) | 🟡 中 | Python | test_embedder_e2e.py 与 test_e2e.py + benchmark.py 重叠 |

@@ -458,11 +458,48 @@ def _cpp_bicubic_resize(arr_chw: np.ndarray, out_h: int, out_w: int) -> np.ndarr
     return out
 
 
+def _pil_bicubic_resize(arr_chw: np.ndarray, out_h: int, out_w: int) -> np.ndarray:
+    """Independent reference using PIL.Image.resize with BICUBIC.
+
+    PIL uses its own Catmull-Rom cubic convolution implementation with
+    symmetric boundary handling. This is an INDEPENDENT ground truth —
+    not a translation of the C++ algorithm. Differences from the C++
+    edge-clamp Catmull-Rom are expected at boundary pixels (within ~2
+    pixels of image edges) where the two implementations handle
+    out-of-bounds samples differently.
+
+    The input is processed per-channel (matching the C++ channel-loop
+    structure) to avoid any cross-channel coupling in PIL.
+
+    Args:
+        arr_chw: (C, H, W) float32 array with values in [0, 255].
+        out_h, out_w: target dimensions.
+
+    Returns:
+        (C, out_h, out_w) float32 array — the PIL BICUBIC result.
+    """
+    from PIL import Image
+
+    c, in_h, in_w = arr_chw.shape
+    # Quantize to uint8 to match what the C++ BicubicResize receives.
+    arr_u8 = np.clip(np.round(arr_chw), 0, 255).astype(np.uint8)
+    out = np.zeros((c, out_h, out_w), dtype=np.float32)
+    for ch in range(c):
+        img = Image.fromarray(arr_u8[ch], mode='L')
+        resized = img.resize((out_w, out_h), Image.BICUBIC)
+        out[ch] = np.array(resized, dtype=np.float32)
+    return out
+
+
 def _gen_bicubic_case(name: str, input_np: np.ndarray, out_h: int, out_w: int):
     """Run the C++-equivalent bicubic on `input_np` (C,H,W float32) and
     dump input + output as f32 bins. The reference exactly mirrors the
     C++ algorithm (Catmull-Rom a=-0.5 + edge clamp), so the C++ test
     validates the implementation against a Python-side reproduction.
+
+    Additionally writes a PIL BICUBIC reference as an INDEPENDENT ground
+    truth (see _pil_bicubic_resize). The PIL reference uses symmetric
+    boundary handling which differs from C++ edge-clamp at boundary pixels.
 
     NOTE: the C++ BicubicResize signature accepts uint8 input. To make
     the reference bit-for-bit comparable, we round-and-clip the input
@@ -474,9 +511,11 @@ def _gen_bicubic_case(name: str, input_np: np.ndarray, out_h: int, out_w: int):
     input_u8 = np.clip(np.round(input_np), 0.0, 255.0).astype(np.uint8)
     input_q = input_u8.astype(np.float32)
     y_np = _cpp_bicubic_resize(input_q, out_h, out_w).astype(np.float32)
+    y_pil = _pil_bicubic_resize(input_q, out_h, out_w).astype(np.float32)
     write_f32(f"{OUTPUT_DIR}/bicubic_{name}_input.bin", input_q)
     write_f32(f"{OUTPUT_DIR}/bicubic_{name}_output.bin", y_np)
-    print(f"  → bicubic_{name}: in{input_np.shape} -> out{y_np.shape}")
+    write_f32(f"{OUTPUT_DIR}/bicubic_{name}_pil_output.bin", y_pil)
+    print(f"  → bicubic_{name}: in{input_np.shape} -> out{y_np.shape} (+ PIL ref)")
 
 
 def gen_bicubic_preprocess():

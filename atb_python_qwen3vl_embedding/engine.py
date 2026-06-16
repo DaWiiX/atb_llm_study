@@ -128,6 +128,9 @@ class Qwen3VLEngine:
         # ── Build ATB graphs ────────────────────────────────────────
         self._build_graphs()
 
+        # ── Debug / test access ────────────────────────────────────
+        self._last_ds_feats = None  # populated by _run_vision
+
     def _make_vision_config(self):
         """Create a config-like object for ATB vision graph builders."""
         return VisionConfigWrapper(self.v_cfg)
@@ -226,6 +229,7 @@ class Qwen3VLEngine:
 
         # torch.npu.synchronize()
         vis = run_merger_npu(self.g_v_merger, h, self.v_merger_w)
+        self._last_ds_feats = ds_feats  # store for test introspection
         return vis, ds_feats
 
     # ── Text inference ─────────────────────────────────────────────
