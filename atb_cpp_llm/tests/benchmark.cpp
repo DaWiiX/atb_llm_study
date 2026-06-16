@@ -787,9 +787,9 @@ int RunCompareMode(atb_llm::LLMEngine* engine,
 
             if (input_ids.empty()) {
                 // Fallback: hardcoded construction
-                LOG_WARN("Token file %s not found — using hardcoded tokens. "
-                            "Run 'python benchmark.py --save-tokens --mode mm' "
-                            "for accurate tokenization.", token_path);
+                LOG_WARN("Chat-templated token file not found: %s — "
+                         "using hardcoded tokens. Run 'python atb_cpp_llm/scripts/gen_compare_tokens.py' "
+                         "to generate accurate token files.", token_path);
                 input_ids.push_back(TOK_DESCRIBE);
                 for (int64_t j = 0; j < vis_tokens; j++) {
                     input_ids.push_back(image_token_id);
