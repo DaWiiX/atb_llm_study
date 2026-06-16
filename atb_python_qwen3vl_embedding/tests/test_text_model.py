@@ -20,6 +20,9 @@ from atb_python_qwen3vl_embedding.text_model import (
     build_text_layer_graph, build_text_norm_graph, run_text_model,
 )
 
+# 500 MB for NPU memory pool (medium-sized graph with GQA attention + MLP + weights)
+set_atb_buffer_size(500 * 1024 * 1024)
+
 
 def test_text_model(B=1, S=16, num_layers=2, seed=42):
     """Fast smoke test: 2 layers with small dimensions.
@@ -47,7 +50,6 @@ def test_text_model(B=1, S=16, num_layers=2, seed=42):
     ref_out, weights = run_tf(gen, seed=seed)
 
     # Build ATB graphs
-    set_atb_buffer_size(500 * 1024 * 1024)
     g_layer = build_text_layer_graph(4, 4, d, 512, B=B, S=S, use_mask=True)
     g_norm = build_text_norm_graph(config.hidden_size)
 
@@ -119,7 +121,6 @@ def test_text_model_28_layers(B=1, S=16, seed=42):
     ref_out, weights = run_tf(gen, seed=seed)
 
     # Build ATB graphs (split-graph: one layer graph reused for all 28 layers)
-    set_atb_buffer_size(500 * 1024 * 1024)
     g_layer = build_text_layer_graph(32, 4, d, 6144, B=B, S=S, use_mask=True)
     g_norm = build_text_norm_graph(config.hidden_size)
 

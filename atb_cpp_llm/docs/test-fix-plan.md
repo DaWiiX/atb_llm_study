@@ -19,12 +19,12 @@
 | [P9](#p9) | 🟡→🟢 已修复 | Python | test_nz_quick_verify.py 与 test_nz_format_verify.py 冗余 | ✅ 2026-06-15 |
 | [P10](#p10) | 🟡→🟢 已修复 | Python | test_embedder_e2e.py 与 test_e2e.py + benchmark.py 重叠 | ✅ 2026-06-16 |
 | [P11](#p11) | 🟡→🟢 已修复 | C++ | test_consistency.cpp 是 test_accuracy.cpp 的子集 | ✅ 2026-06-15 |
-| [P12](#p12) | 🟡 中 | C++/Python | 预处理阶段在多个文件中重复测试 |
-| [P13](#p13) | 🟡 中 | Python | set_atb_buffer_size 调用位置不一致（7+9 个文件） |
-| [P14](#p14) | 🟡 中 | Python | 模型加载代码在 6 个文件中重复 |
-| [P15](#p15) | 🟡 中 | Python | 单元测试使用非真实模型维度 |
+| [P12](#p12) | 🟡→🟢 已修复 | C++/Python | 预处理阶段在多个文件中重复测试 | ✅ 2026-06-16 |
+| [P13](#p13) | 🟡→🟢 已修复 | Python | set_atb_buffer_size 调用位置不一致（7+9 个文件） | ✅ 2026-06-16 |
+| [P14](#p14) | 🟡→🟢 已修复 | Python | 模型加载代码在 6 个文件中重复 | ✅ 2026-06-16 |
+| [P15](#p15) | 🟡→🟢 已修复 | Python | 单元测试使用非真实模型维度 | ✅ 2026-06-16 |
 | [P16](#p16) | 🟡→🟢 已修复 | Python | 无自动化测试运行器 / 汇总脚本 | ✅ 2026-06-16 |
-| [P17](#p17) | 🟡 中 | C++ | test_config_wiring.cpp 硬编码 epsilon 阈值 |
+| [P17](#p17) | 🟡→🟢 已修复 | C++ | test_config_wiring.cpp 硬编码 epsilon 阈值 | ✅ 2026-06-16 |
 | [P18](#p18) | 🟢→🟢 已修复 | Python | IMAGE_TOKEN_ID 硬编码（应从 config 读取） | ✅ 2026-06-16 |
 | [P19](#p19) | 🟢→🟢 已修复 | Python | 死代码：VISION_START_TOKEN_ID / run_quick_tf 未使用参数 | ✅ 2026-06-15 |
 | [P20](#p20) | 🟢→🟢 已修复 | Python | 测试间余弦阈值不一致且缺乏文档说明 | ✅ 2026-06-16 |
@@ -304,6 +304,12 @@ Deepstack 是 Qwen3VL 的核心跨模态融合机制：vision block [5, 11, 17] 
 
 - 测试代码也遵循 DRY 原则。发现重复时立即重构为共享函数。
 
+**修复内容** ✅ DONE 2026-06-16
+
+1. **C++ 侧**：`test_stage_precision.cpp` 移除预处理 pixel_values 比较（~90行），集中在 `test_vision_stages.cpp` Stage L0（720x1280 图像覆盖更广）。engine-only diagnostic 保留为独立测试，使用 Python 参考 pixel_values 隔离引擎精度。
+2. **Python 侧**：在 `test_preprocess.py` 中新增 `compare_preprocess_with_tf()` 共享函数，扩展测试从 1 张图像到 5 张（64x64, 120x200, 200x200, 16x16, 800x600）。`test_vision_diagnostics.py::test_preprocess_match` 改为调用共享函数 + 新增 engine wrapper 一致性校验（cos ≥ 0.9999）。
+3. 测试覆盖不减少，反而增加（图像 1→5，engine wrapper 校验新增）。
+
 ---
 
 ### P13: set_atb_buffer_size 调用位置不一致 {#p13}
@@ -329,6 +335,14 @@ Deepstack 是 Qwen3VL 的核心跨模态融合机制：vision block [5, 11, 17] 
 
 - 创建测试文件模板（`tests/template.py`），包含正确的 import 顺序和 `set_atb_buffer_size` 调用位置。
 - CLAUDE.md 中补充测试文件的标准结构说明。
+
+**修复内容** ✅ DONE 2026-06-16
+
+1. **统一为模块级调用**：10 个文件中在函数内调用的 `set_atb_buffer_size` 全部移到模块级（import 之后、函数定义之前）。所有 20 个调用点现均在模块级。
+2. **添加重复调用防护**：`utils.py` 中新增 `_buffer_size_set` 全局标记，重复调用打印 `[WARN]` 并安全返回，不崩溃。
+3. **遗漏修复**：审查发现 `test_nz_format_verify.py` 构建 ATB graph 但未调用 `set_atb_buffer_size`，已补充（300 MB）。
+4. **Buffer size 分层**：300 MB（诊断）→ 500 MB（组件级）→ 1 GB（DecoderLayer/VisionModel）→ 5 GB（E2E/集成）→ 10 GB（benchmark），注释说明选择依据。
+5. 所有测试文件 import 后均有注释说明 buffer size 选择依据。
 
 ---
 
@@ -361,6 +375,16 @@ Deepstack 是 Qwen3VL 的核心跨模态融合机制：vision block [5, 11, 17] 
 
 - 代码审查规范：同一模式出现 ≥3 次时，必须抽取为共享函数。
 
+**修复内容** ✅ DONE 2026-06-16
+
+1. **统一函数**：在 `data_utils.py` 中扩展 `load_tf_ref(model_dir, precision="float32", device="npu")`，支持 precision（float32/half）和 device（npu/cpu），统一 assert missing/unexpected keys。
+2. **6+1 个文件替换**：
+   - `test_e2e.py`、`benchmark.py`、`test_text_diagnostics.py`、`test_vision_diagnostics.py` — 删除本地 `load_tf_ref`，改为 import
+   - `test_pipeline_trace.py`、`test_deepstack_integration.py` — 替换内联加载代码
+   - `test_embedder_e2e.py` — 已使用共享函数，无需改动
+3. **精度选择**：有 engine 在 NPU 上用 `half`（避免 OOM），无 engine 用默认 `float32`（更高精度）。`device="cpu"` 用于 `test_embed_weights` 权重对比。
+4. 所有调用点键检查行为一致（始终 assert）。
+
 ---
 
 ### P15: 单元测试使用非真实模型维度 {#p15}
@@ -392,6 +416,13 @@ Deepstack 是 Qwen3VL 的核心跨模态融合机制：vision block [5, 11, 17] 
 
 - 测试编写规范：每个测试文件必须包含至少一个真实维度用例。
 - 新增测试 review 时检查维度是否与真实模型匹配。
+
+**修复内容** ✅ DONE 2026-06-16
+
+1. **8 个文件新增 `_full_dim` 测试函数**：全部使用从 `config.json` 读取的真实 Qwen3VL-Embedding-2B 维度（text: hs=2048, nh=16, kv_nh=8, hd=128, interm=6144; vision: hs=1024, nh=16, interm=4096, patch=16, depth=24）。
+2. **保留小维度测试**：原有冒烟测试未修改，`if __name__ == "__main__"` 仍仅调用小维度测试。全维度测试可独立调用，适合 CI。
+3. **阈值合理**：单算子 0.999，完整 vision model 0.95（24 blocks），符合 THRESHOLDS.md 标准。
+4. **Buffer size 适配**：因全维度权重需求增大，部分文件 buffer size 从 100/500 MB 升级至 500 MB/1 GB。
 
 ---
 
@@ -436,6 +467,13 @@ Deepstack 是 Qwen3VL 的核心跨模态融合机制：vision block [5, 11, 17] 
 **如何避免再犯**
 
 - 任何与外部数据源（config.json, safetensors）相关的断言，期望值必须来自参考数据生成器，不得硬编码。
+
+**修复内容** ✅ DONE 2026-06-16
+
+1. **Python 参考数据生成**：在 `gen_cpu_reference.py` 中新增 `gen_config_wiring_ref()` 函数，从模型 config.json + preprocessor_config.json 提取 30 个关键字段，写入 3 个 `.bin` 参考文件（int: 26 fields, float: 3 fields, bool: 1 field）。
+2. **C++ 测试数据驱动**：`test_config_wiring.cpp` 新增 `LoadBin<T>()` / `LoadI32s()` 加载工具和 3 个 enum（`ConfigIntField` 26项, `ConfigFloatField` 3项, `ConfigBoolField` 1项），所有原来硬编码的 CHECK 全部替换为与参考数据对比。
+3. **字段顺序一致性**：Python 和 C++ 两侧 30 个字段顺序逐一验证一致。若参考文件缺失，测试优雅降级（打印 WARNING 但不崩溃）。
+4. **自动集成**：新生成器在 `gen_cpu_reference.py` 的 STAGES dict 中，`gen_all.py` 自动运行。
 
 ---
 

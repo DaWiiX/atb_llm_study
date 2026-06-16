@@ -50,8 +50,21 @@ def pool_and_normalize(last_hidden: torch.Tensor,
 # TF reference model loading
 # ═══════════════════════════════════════════════════════════════════
 
-def load_tf_ref(model_dir: str):
-    """Load Qwen3VLModel on NPU with weights from safetensors."""
+def load_tf_ref(model_dir: str, precision: str = "float32", device: str = "npu"):
+    """Load Qwen3VLModel from safetensors.
+
+    Unified TF reference model loader for all test files.  Always checks for
+    missing / unexpected keys so weight-loading bugs are caught immediately.
+
+    Args:
+        model_dir: Path to model directory containing config.json and
+            model.safetensors.
+        precision: ``"float32"`` (default) or ``"half"`` / ``"float16"``.
+        device: Target device — ``"npu"`` (default) or ``"cpu"``.
+
+    Returns:
+        Qwen3VLModel in eval mode with weights loaded from safetensors.
+    """
     import safetensors.torch
     from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLConfig
     from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLModel
@@ -60,10 +73,26 @@ def load_tf_ref(model_dir: str):
     cfg._attn_implementation = "eager"
     cfg.text_config._attn_implementation = "eager"
 
-    model = Qwen3VLModel(cfg).eval().half().npu()
+    model = Qwen3VLModel(cfg).eval()
+
+    if precision in ("half", "float16"):
+        model = model.half()
+    elif precision != "float32":
+        raise ValueError(
+            f"Unknown precision: {precision!r}, expected 'float32' or 'half'")
+
+    if device == "npu":
+        model = model.npu()
+    elif device != "cpu":
+        raise ValueError(
+            f"Unknown device: {device!r}, expected 'npu' or 'cpu'")
+
     sd = safetensors.torch.load_file(f"{model_dir}/model.safetensors",
                                      device="cpu")
-    sd = {k.removeprefix("model."): v.half() for k, v in sd.items()}
+    sd = {k.removeprefix("model."): v for k, v in sd.items()}
+    if precision in ("half", "float16"):
+        sd = {k: v.half() for k, v in sd.items()}
+
     missing, unexpected = model.load_state_dict(sd, strict=False)
     assert not missing and not unexpected, \
         f"TF weight load failed: missing={missing}, unexpected={unexpected}"

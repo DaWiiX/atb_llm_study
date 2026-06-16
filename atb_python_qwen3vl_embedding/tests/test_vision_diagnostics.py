@@ -17,6 +17,7 @@ import torch_npu  # noqa: F401
 from PIL import Image
 
 from atb_python_qwen3vl_embedding.env import QWEN3VL_EMB_MODEL_DIR
+from atb_python_qwen3vl_embedding.tests.data_utils import load_tf_ref
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -37,25 +38,6 @@ def report(label, cs, threshold=0.99):
     return cs >= threshold
 
 
-def load_tf_ref(model_dir: str):
-    """Load Qwen3VLModel on NPU (half precision) from safetensors."""
-    import safetensors.torch
-    from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLConfig
-    from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLModel
-
-    cfg = Qwen3VLConfig.from_pretrained(model_dir, trust_remote_code=True)
-    cfg._attn_implementation = "eager"
-    cfg.text_config._attn_implementation = "eager"
-
-    ref = Qwen3VLModel(cfg).eval().half().npu()
-    sd = safetensors.torch.load_file(f"{model_dir}/model.safetensors", device="cpu")
-    sd = {k.removeprefix("model."): v.half() for k, v in sd.items()}
-    missing, unexpected = ref.load_state_dict(sd, strict=False)
-    assert not missing and not unexpected, (
-        f"weight mismatch: missing={len(missing)} unexpected={len(unexpected)}")
-    return ref
-
-
 # ═══════════════════════════════════════════════════════════════════
 # Test images — same as test_e2e.py
 # ═══════════════════════════════════════════════════════════════════
@@ -71,39 +53,54 @@ TEST_IMAGES = [
 # ═══════════════════════════════════════════════════════════════════
 
 def test_preprocess_match(proc, engine):
-    """ATB preprocess_image vs TF processor pixel_values."""
+    """ATB preprocess_image vs TF processor pixel_values.
+
+    Uses the shared compare_preprocess_with_tf() from test_preprocess.py
+    and additionally validates that engine.preprocess_image (thin wrapper)
+    returns the same result as the standalone preprocess_image.
+    """
     print("\n── Test 1: preprocess match ──")
+    from atb_python_qwen3vl_embedding.tests.test_preprocess import (
+        compare_preprocess_with_tf,
+    )
+
+    ip = proc.image_processor
     all_ok = True
     for name, img in TEST_IMAGES:
-        img_arr = torch.from_numpy(np.array(img)).permute(2, 0, 1)
+        result = compare_preprocess_with_tf(
+            img, proc, patch_size=ip.patch_size,
+            temporal_patch_size=ip.temporal_patch_size,
+            merge_size=ip.merge_size,
+            min_pixels=ip.min_pixels, max_pixels=ip.max_pixels)
 
-        # ATB path
-        pv_atb, gth_atb = engine.preprocess_image(img_arr)
-
-        # TF path — processor returns {pixel_values, image_grid_thw}
-        msgs = [{'role': 'user', 'content': [
-            {'type': 'image', 'image': img}, {'type': 'text', 'text': 'x'}]}]
-        tf_out = proc.apply_chat_template(
-            msgs, tokenize=True, return_dict=True, return_tensors='pt')
-        pv_tf = tf_out['pixel_values']       # (N, C*tp*p*p)
-        gth_tf = tf_out['image_grid_thw']    # (1, 3)
-
-        print(f"\n  [{name}]  atb: {pv_atb.shape} grid={gth_atb.tolist()}"
-              f"   tf: {pv_tf.shape} grid={gth_tf.tolist()}")
+        print(f"\n  [{name}]  atb: {result['atb_pv'].shape}"
+              f" grid={result['atb_gth'].tolist()}"
+              f"   tf: {result['tf_pv'].shape}"
+              f" grid={result['tf_gth'].tolist()}")
 
         # grid_thw must match exactly
-        grid_ok = gth_atb.tolist() == gth_tf.tolist()
-        all_ok &= grid_ok
-        print(f"    grid_thw match: {grid_ok}")
+        print(f"    grid_thw match: {result['grid_match']}")
+        all_ok &= result['grid_match']
 
         # pixel_values cosine
-        cs = cosine(pv_atb, pv_tf.float())
-        # 0.999: single fp16 operator threshold — preprocessing path, negligible accumulation
-        all_ok &= report(f"pixel_values cosine ({name})", cs, threshold=0.999)
+        all_ok &= report(f"pixel_values cosine ({name})",
+                         result['cosine'], threshold=0.999)
 
         # max diff
-        md = (pv_atb - pv_tf.float()).abs().max().item()
-        print(f"    max_diff={md:.4f}")
+        print(f"    max_diff={result['max_diff']:.4f}")
+
+        # Verify engine.preprocess_image (thin wrapper) matches standalone
+        img_arr = torch.from_numpy(np.array(img)).permute(2, 0, 1)
+        eng_pv, eng_gth = engine.preprocess_image(img_arr)
+        if not torch.equal(eng_gth, result['atb_gth']):
+            print("    [WARN] engine.preprocess_image grid_thw differs from standalone")
+            all_ok = False
+        eng_cs = F.cosine_similarity(
+            result['atb_pv'].float().flatten(),
+            eng_pv.float().flatten(), dim=0).item()
+        if eng_cs < 0.9999:
+            print(f"    [WARN] engine.preprocess_image pv cosine vs standalone: {eng_cs:.6f}")
+            all_ok = False
 
     return all_ok
 
@@ -119,7 +116,7 @@ def test_vision_only(proc, engine, model_dir):
     """
     print("\n── Test 2: vision encoder only (same pixel_values) ──")
 
-    ref = load_tf_ref(model_dir)
+    ref = load_tf_ref(model_dir, precision="half")
 
     all_ok = True
     for name, img in TEST_IMAGES:
@@ -171,7 +168,7 @@ def test_text_with_tf_vision(proc, engine, model_dir):
     """
     print("\n── Test 3: text model with TF vision embeds (isolate deepstack) ──")
 
-    ref = load_tf_ref(model_dir)
+    ref = load_tf_ref(model_dir, precision="half")
 
     name, img = TEST_IMAGES[0]  # use 120x200-red
     img_arr = torch.from_numpy(np.array(img)).permute(2, 0, 1)
@@ -240,7 +237,7 @@ def test_e2e_with_tf_preprocess(proc, engine, model_dir):
     """
     print("\n── Test 4: e2e with TF preprocess (fast check) ──")
 
-    ref = load_tf_ref(model_dir)
+    ref = load_tf_ref(model_dir, precision="half")
 
     all_ok = True
     for name, img in TEST_IMAGES:

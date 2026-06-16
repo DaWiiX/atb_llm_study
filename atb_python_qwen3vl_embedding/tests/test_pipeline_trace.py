@@ -28,6 +28,7 @@ from atb_python_qwen3vl_embedding.engine import Qwen3VLEngine
 from atb_python_qwen3vl_embedding.engine_utils import get_rope_index
 from atb_python_qwen3vl_embedding.text_model import run_text_layer_npu, run_text_norm_npu, make_causal_mask
 from atb_python_qwen3vl_embedding.utils import to_npu_half, to_cpu_float, make_seqlen_tensor, is_310p, make_causal_mask_nz_npu
+from atb_python_qwen3vl_embedding.tests.data_utils import load_tf_ref
 
 
 def cosine(a, b):
@@ -48,20 +49,13 @@ def main():
 
     from transformers import AutoProcessor
     from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLConfig
-    from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLModel
-    import safetensors.torch
 
     proc = AutoProcessor.from_pretrained(model_dir)
     engine = Qwen3VLEngine(model_dir)
 
-    # ── Load TF ref ───────────────────────────────────────────────
+    # ── Load TF ref (half precision — engine stays loaded on NPU) ──
     cfg = Qwen3VLConfig.from_pretrained(model_dir, trust_remote_code=True)
-    cfg._attn_implementation = "eager"
-    cfg.text_config._attn_implementation = "eager"
-    ref = Qwen3VLModel(cfg).eval().half().npu()
-    sd = safetensors.torch.load_file(f"{model_dir}/model.safetensors", device="cpu")
-    sd = {k.removeprefix("model."): v.half() for k, v in sd.items()}
-    ref.load_state_dict(sd, strict=False)
+    ref = load_tf_ref(model_dir, precision="half")
 
     # ── Test case: Image + Text ───────────────────────────────────
     img = Image.new('RGB', (120, 200), color='red')

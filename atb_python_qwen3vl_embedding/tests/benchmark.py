@@ -48,6 +48,7 @@ from PIL import Image
 from atb_python_qwen3vl_embedding.engine import Qwen3VLEngine
 from atb_python_qwen3vl_embedding.env import QWEN3VL_EMB_MODEL_DIR
 from atb_python_qwen3vl_embedding.engine_utils import get_rope_index
+from atb_python_qwen3vl_embedding.tests.data_utils import load_tf_ref
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -289,24 +290,6 @@ def benchmark_atb_e2e(engine, inputs, n_warmup, n_iter):
 # ═══════════════════════════════════════════════════════════════════
 # Transformers reference benchmark
 # ═══════════════════════════════════════════════════════════════════
-
-def load_tf_ref(model_dir: str):
-    import safetensors.torch
-    from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLConfig
-    from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLModel
-
-    cfg = Qwen3VLConfig.from_pretrained(model_dir, trust_remote_code=True)
-    cfg._attn_implementation = "eager"
-    cfg.text_config._attn_implementation = "eager"
-
-    ref = Qwen3VLModel(cfg).eval().half().npu()
-    sd = safetensors.torch.load_file(f"{model_dir}/model.safetensors",
-                                     device="cpu")
-    sd = {k.removeprefix("model."): v.half() for k, v in sd.items()}
-    missing, unexpected = ref.load_state_dict(sd, strict=False)
-    assert not missing and not unexpected
-    return ref
-
 
 def benchmark_tf_e2e(ref, inputs, n_warmup, n_iter):
     input_ids = inputs['input_ids'].npu()

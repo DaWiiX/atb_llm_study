@@ -18,6 +18,7 @@ from atb_python_qwen3vl_embedding.utils import (
     make_causal_mask_nz_npu,
 )
 from atb_python_qwen3vl_embedding.env import QWEN3VL_EMB_MODEL_DIR
+from atb_python_qwen3vl_embedding.tests.data_utils import load_tf_ref
 
 set_atb_buffer_size(5 * 1024 * 1024 * 1024)  # 5 GB
 
@@ -63,7 +64,6 @@ def test_deepstack_extraction(model_dir=None):
         model_dir = QWEN3VL_EMB_MODEL_DIR
 
     import torch_npu  # noqa: F401
-    import safetensors.torch
 
     print(f"\n{'='*60}")
     print("Deepstack Integration: Vision Feature Extraction")
@@ -137,18 +137,8 @@ def test_deepstack_extraction(model_dir=None):
     g_v_ds = build_deepstack_merger(vision_config)
     g_v_posemb = build_vision_posemb_graph()
 
-    # ── Load TF reference ────────────────────────────────────────
-    from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLConfig
-    from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLModel
-
-    tf_cfg = Qwen3VLConfig.from_pretrained(model_dir, trust_remote_code=True)
-    tf_cfg._attn_implementation = "eager"
-    tf_cfg.text_config._attn_implementation = "eager"
-
-    ref = Qwen3VLModel(tf_cfg).eval().half().npu()
-    sd = safetensors.torch.load_file(f"{model_dir}/model.safetensors", device="cpu")
-    sd = {k.removeprefix("model."): v.half() for k, v in sd.items()}
-    ref.load_state_dict(sd, strict=False)
+    # ── Load TF reference (half precision — ATB graphs stay loaded) ──
+    ref = load_tf_ref(model_dir, precision="half")
 
     # ── Test image ───────────────────────────────────────────────
     img = Image.new('RGB', (120, 200), color='red')
@@ -243,7 +233,6 @@ def test_deepstack_injection(model_dir=None):
         model_dir = QWEN3VL_EMB_MODEL_DIR
 
     import torch_npu  # noqa: F401
-    import safetensors.torch
 
     print(f"\n{'='*60}")
     print("Deepstack Integration: Text Injection")
@@ -273,18 +262,8 @@ def test_deepstack_injection(model_dir=None):
         for i in range(n_layer)
     ]
 
-    # ── Load TF reference ────────────────────────────────────────
-    from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLConfig
-    from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLModel
-
-    tf_cfg = Qwen3VLConfig.from_pretrained(model_dir, trust_remote_code=True)
-    tf_cfg._attn_implementation = "eager"
-    tf_cfg.text_config._attn_implementation = "eager"
-
-    ref = Qwen3VLModel(tf_cfg).eval().half().npu()
-    sd = safetensors.torch.load_file(f"{model_dir}/model.safetensors", device="cpu")
-    sd = {k.removeprefix("model."): v.half() for k, v in sd.items()}
-    ref.load_state_dict(sd, strict=False)
+    # ── Load TF reference (half precision — ATB graphs stay loaded) ──
+    ref = load_tf_ref(model_dir, precision="half")
 
     # ── Generate deepstack features from TF ──────────────────────
     # (We use TF deepstack features so the comparison isolates text injection logic)
@@ -318,7 +297,7 @@ def test_deepstack_injection(model_dir=None):
         # Use TF's own image injection (same as pipeline_trace)
         ie_tf = ref.get_input_embeddings()(input_ids.npu()).half()
         tok_emb = ref.get_input_embeddings()(
-            torch.tensor(tf_cfg.image_token_id, dtype=torch.long, device=ie_tf.device))
+            torch.tensor(img_tok, dtype=torch.long, device=ie_tf.device))
         special_image_mask = (ie_tf == tok_emb)
         image_mask = special_image_mask.all(-1, keepdim=True).expand_as(ie_tf)
         ie_tf = ie_tf.masked_scatter(image_mask, vis_tf_merged.to(ie_tf.device, ie_tf.dtype))

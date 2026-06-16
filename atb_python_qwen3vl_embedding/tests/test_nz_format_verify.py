@@ -19,11 +19,13 @@ import torch_npu  # noqa: F401
 import torch.nn.functional as F
 
 from atb_python_qwen3vl_embedding.env import ASCEND_PLATFORM
-from atb_python_qwen3vl_embedding.utils import make_causal_mask_nz
+from atb_python_qwen3vl_embedding.utils import make_causal_mask_nz, set_atb_buffer_size
 
 # ACL format constants
 FRACTAL_NZ = 29  # ACL_FORMAT_FRACTAL_NZ
 ND_FORMAT = 2    # ACL_FORMAT_ND
+
+set_atb_buffer_size(300 * 1024 * 1024)  # 300 MB for NPU memory pool (small diagnostic SA graph)
 
 
 def test_01_create_nz_tensor():

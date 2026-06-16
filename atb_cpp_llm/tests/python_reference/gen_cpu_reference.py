@@ -2137,10 +2137,108 @@ def gen_vision_merger():
 
 
 # ═══════════════════════════════════════════════════════════════════
+# Stage: ConfigWiring — expected config values from model config.json
+#
+# Writes integer, float, and boolean fields in a fixed order so the
+# C++ test_config_wiring can load them and validate its parsed config
+# against the ground truth. No hardcoded thresholds or magic numbers —
+# every expected value comes from the actual model checkpoint.
+# ═══════════════════════════════════════════════════════════════════
+
+def gen_config_wiring_ref():
+    """Generate expected config values for test_config_wiring.
+
+    Reads config.json and preprocessor_config.json from the model directory,
+    extracts every field that Qwen3VLConfig carries (matching the C++
+    LoadQwen3VLConfig logic), and writes three reference binaries:
+
+      cpu_config_wiring_int.bin   — 26 int64 fields (order matches C++ enum)
+      cpu_config_wiring_float.bin —  3 float32 fields
+      cpu_config_wiring_bool.bin  —  1 int32 field
+
+    The C++ test reads these files and compares every value against its
+    own parsed config. If a model config changes (e.g. different epsilon),
+    the reference is regenerated and the test automatically adapts.
+    """
+    print("[gen] config_wiring — expected values from model config.json")
+
+    model_dir = MODEL_DIR
+    if not os.path.isdir(model_dir):
+        print(f"  SKIP: model dir not found: {model_dir}")
+        return
+
+    import json
+
+    with open(f"{model_dir}/config.json") as f:
+        config = json.load(f)
+    with open(f"{model_dir}/preprocessor_config.json") as f:
+        pp = json.load(f)
+
+    text = config.get("text_config", {})
+    vis = config.get("vision_config", {})
+
+    # Integer fields — order MUST match ConfigIntField enum in the C++ test.
+    # C++ uses `text_cfg.GetInt("head_dim", 128)` — simple key lookup with
+    # a hard-coded default (no fallback to hidden_size / num_heads).
+    int_vals = [
+        config.get("image_token_id", 151655),
+        config.get("vision_start_token_id", 151652),
+        text.get("hidden_size", 2048),
+        text.get("num_attention_heads", 16),
+        text.get("num_key_value_heads", 8),
+        text.get("head_dim", 128),
+        text.get("intermediate_size", 6144),
+        text.get("num_hidden_layers", 28),
+        text.get("vocab_size", 151936),
+        vis.get("hidden_size", 1024),
+        vis.get("num_heads", 16),
+        vis.get("intermediate_size", 4096),
+        vis.get("depth", 24),
+        vis.get("in_channels", 3),
+        vis.get("temporal_patch_size", 2),
+        vis.get("patch_size", 16),
+        vis.get("spatial_merge_size", 2),
+        vis.get("num_position_embeddings", 2304),
+        vis.get("out_hidden_size", 2048),
+        pp.get("patch_size", 16),
+        pp.get("temporal_patch_size", 2),
+        pp.get("merge_size", 2),
+        pp.get("min_pixels", 4096),
+        pp.get("max_pixels", 1310720),
+        # Derived fields (computed by Qwen3VLConfig methods)
+        vis.get("hidden_size", 1024) // vis.get("num_heads", 16),  # vis_head_dim
+        int(np.sqrt(vis.get("num_position_embeddings", 2304))),    # num_grid
+    ]
+
+    # Float fields — order MUST match ConfigFloatField enum in the C++ test.
+    # vis_epsilon reads "layer_norm_eps" (NOT "initializer_range" — 20 000x off!).
+    float_vals = np.array([
+        float(text.get("rms_norm_eps", 1e-6)),
+        float(text.get("rope_theta", 5000000.0)),
+        float(vis.get("layer_norm_eps", 1e-6)),
+    ], dtype=np.float32)
+
+    # Boolean fields — order MUST match ConfigBoolField enum in the C++ test.
+    bool_vals = [
+        1,  # normalize (Python default = true, C++ struct initializer = true)
+    ]
+
+    write_i64(f"{OUTPUT_DIR}/cpu_config_wiring_int.bin",
+              np.array(int_vals, dtype=np.int64))
+    write_f32(f"{OUTPUT_DIR}/cpu_config_wiring_float.bin", float_vals)
+    write_i32s(f"{OUTPUT_DIR}/cpu_config_wiring_bool.bin", bool_vals)
+
+    print(f"  → {OUTPUT_DIR}/cpu_config_wiring_int.bin ({len(int_vals)} int fields)")
+    print(f"  → {OUTPUT_DIR}/cpu_config_wiring_float.bin ({len(float_vals)} float fields)")
+    print(f"  → {OUTPUT_DIR}/cpu_config_wiring_bool.bin ({len(bool_vals)} bool fields)")
+
+
+# ═══════════════════════════════════════════════════════════════════
 # Main
 # ═══════════════════════════════════════════════════════════════════
 
 STAGES = {
+    "config_wiring":        gen_config_wiring_ref,
     "mrope_pid_simple":    gen_get_rope_index_simple,
     "mrope_pid_no_img":    gen_get_rope_index_no_image,
     "mrope_pid_image_text": gen_get_rope_index_image_text,

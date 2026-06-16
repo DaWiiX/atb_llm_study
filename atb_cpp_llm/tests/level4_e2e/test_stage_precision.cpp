@@ -1,16 +1,19 @@
 /**
- * Stage-by-stage precision test — compares C++ intermediates against
+ * Stage-by-stage precision test — compares C++ engine output against
  * Python reference values from test_stage_reference.py.
+ *
+ * Preprocessing precision is verified separately in
+ * test_vision_stages.cpp (Stage L0), which provides a dedicated
+ * per-stage breakdown of the vision pipeline.
  *
  * Prerequisites:
  *     1. python tests/test_stage_reference.py  (generates /tmp/stage_*.bin)
  *     2. Model checkpoint at MODEL_DIR
  *
  * Tests:
- *     1. Preprocessing — pixel_values match
- *     2. TEXT_ONLY — final embedding match
- *     3. IMAGE_ONLY — final embedding match
- *     4. IMAGE_AND_TEXT — final embedding match
+ *     1. TEXT_ONLY — final embedding match
+ *     2. IMAGE_ONLY — final embedding match (incl. engine-only diagnostic)
+ *     3. IMAGE_AND_TEXT — final embedding match
  *
  * Run: ./test_stage_precision
  */
@@ -159,97 +162,7 @@ int main() {
     int tests_passed = 0;
     int tests_total = 0;
 
-    // ═══════════════════════════════════════════════════════════
-    // Test 1: Preprocessing — pixel_values match
-    // ═══════════════════════════════════════════════════════════
-    {
-        LOG_INFO("\n=== Test 1: Preprocessing (pixel_values) ===");
-        tests_total++;
-
-        // Load Python reference
-        LoadedArray ref;
-        if (!LoadFloat32("/tmp/stage_pixels.bin", ref)) {
-            LOG_ERROR("SKIP: /tmp/stage_pixels.bin not found (run test_stage_reference.py first)");
-        } else {
-            LOG_INFO("  Python ref: shape=[%ld, %ld], first 8: %.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f",
-                     ref.shape[0], ref.shape[1],
-                     ref.data_f32[0], ref.data_f32[1], ref.data_f32[2], ref.data_f32[3],
-                     ref.data_f32[4], ref.data_f32[5], ref.data_f32[6], ref.data_f32[7]);
-
-            // Run C++ preprocessing
-            atb_llm::adapters::Qwen3VLConfig pp_config;
-            int32_t img_h = 672, img_w = 476, img_c = 3;
-            auto image = CreateGradientImage(img_c, img_h, img_w);
-
-            int32_t factor = pp_config.pp_patch_size * pp_config.pp_merge_size;
-            int32_t new_h, new_w;
-            atb_llm::adapters::SmartResize(img_h, img_w, factor,
-                                            pp_config.pp_min_pixels, pp_config.pp_max_pixels,
-                                            new_h, new_w);
-
-            int32_t grid_h = new_h / pp_config.pp_patch_size;
-            int32_t grid_w = new_w / pp_config.pp_patch_size;
-            int32_t grid_t = 1;
-            int64_t num_patches = static_cast<int64_t>(grid_t) * grid_h * grid_w;
-            int64_t patch_dim = static_cast<int64_t>(img_c) * pp_config.pp_temporal_patch_size *
-                                pp_config.pp_patch_size * pp_config.pp_patch_size;
-
-            std::vector<uint16_t> pixel_values(num_patches * patch_dim, 0);
-            int64_t out_num_patches = 0;
-            int64_t grid_thw[3] = {};
-
-            atb_llm::Status s = atb_llm::adapters::PreprocessImage(
-                image.data(), img_c, img_h, img_w, pp_config,
-                pixel_values.data(), out_num_patches, grid_thw);
-
-            if (!IS_OK(s)) {
-                LOG_ERROR("  PreprocessImage failed: %d", static_cast<int>(s));
-            } else {
-                // Convert C++ fp16 pixel_values to fp32 for comparison
-                int64_t total = out_num_patches * patch_dim;
-                std::vector<float> cpp_f32(total);
-                for (int64_t i = 0; i < total; i++) {
-                    cpp_f32[i] = atb_llm::Fp16ToF32(pixel_values[i]);
-                }
-
-                LOG_INFO("  C++ pixels: shape=[%ld, %ld], first 8: %.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f",
-                         out_num_patches, patch_dim,
-                         cpp_f32[0], cpp_f32[1], cpp_f32[2], cpp_f32[3],
-                         cpp_f32[4], cpp_f32[5], cpp_f32[6], cpp_f32[7]);
-
-                // Compare
-                int64_t ref_total = ref.total_elements;
-                int64_t cmp_n = std::min(total, ref_total);
-                float cos = CosineSim(cpp_f32.data(), ref.data_f32.data(), cmp_n);
-                float max_d = MaxAbsDiff(cpp_f32.data(), ref.data_f32.data(), cmp_n);
-
-                LOG_INFO("  Cosine: %.6f, MaxDiff: %.6f, elements: C++=%ld, Python=%ld",
-                         cos, max_d, total, ref_total);
-
-                // Note: bicubic vs bilinear causes ~0.22 max diff at overshoot points.
-                // Threshold relaxed to account for interpolation differences.
-                if (cos > 0.999f && max_d < 0.3f) {
-                    LOG_INFO("  [PASS] Preprocessing pixel_values match");
-                    tests_passed++;
-                } else {
-                    LOG_ERROR("  [FAIL] Preprocessing pixel_values diverge (cos=%.6f, max_diff=%.6f)", cos, max_d);
-
-                    // Show first differing elements
-                    int diffs_shown = 0;
-                    for (int64_t i = 0; i < cmp_n && diffs_shown < 5; i++) {
-                        float d = std::fabs(cpp_f32[i] - ref.data_f32[i]);
-                        if (d > 0.01f) {
-                            LOG_ERROR("    [%ld] C++=%.6f Python=%.6f diff=%.6f",
-                                      i, cpp_f32[i], ref.data_f32[i], d);
-                            diffs_shown++;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // ── Create engine for remaining tests ─────────────────────
+    // ── Create engine for tests ─────────────────────────────────
     atb_llm::EngineConfig config;
     config.model_dir = MODEL_DIR;
     config.buffer_size = 15LL * 1024 * 1024 * 1024;
@@ -264,10 +177,10 @@ int main() {
     LOG_INFO("Engine created successfully");
 
     // ═══════════════════════════════════════════════════════════
-    // Test 2: TEXT_ONLY
+    // Test 1: TEXT_ONLY
     // ═══════════════════════════════════════════════════════════
     {
-        LOG_INFO("\n=== Test 2: TEXT_ONLY ===");
+        LOG_INFO("\n=== Test 1: TEXT_ONLY ===");
         tests_total++;
 
         LoadedArray ref;
@@ -304,10 +217,10 @@ int main() {
     }
 
     // ═══════════════════════════════════════════════════════════
-    // Test 3: IMAGE_ONLY
+    // Test 2: IMAGE_ONLY
     // ═══════════════════════════════════════════════════════════
     {
-        LOG_INFO("\n=== Test 3: IMAGE_ONLY ===");
+        LOG_INFO("\n=== Test 2: IMAGE_ONLY ===");
         tests_total++;
 
         LoadedArray ref;
@@ -453,10 +366,10 @@ int main() {
     }
 
     // ═══════════════════════════════════════════════════════════
-    // Test 4: IMAGE_AND_TEXT
+    // Test 3: IMAGE_AND_TEXT
     // ═══════════════════════════════════════════════════════════
     {
-        LOG_INFO("\n=== Test 4: IMAGE_AND_TEXT ===");
+        LOG_INFO("\n=== Test 3: IMAGE_AND_TEXT ===");
         tests_total++;
 
         LoadedArray ref;

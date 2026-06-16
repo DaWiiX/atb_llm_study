@@ -41,6 +41,7 @@ from PIL import Image
 
 from atb_python_qwen3vl_embedding.engine import Qwen3VLEngine
 from atb_python_qwen3vl_embedding.env import QWEN3VL_EMB_MODEL_DIR
+from atb_python_qwen3vl_embedding.tests.data_utils import load_tf_ref
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -150,26 +151,6 @@ def run_atb_phase(model_dir: str, processor, cases, keep_tf_pv: bool):
 # ═══════════════════════════════════════════════════════════════════
 # Phase 2: transformers reference
 # ═══════════════════════════════════════════════════════════════════
-
-def load_tf_ref(model_dir: str):
-    """Load Qwen3VLModel on NPU with weights from safetensors."""
-    import safetensors.torch
-    from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLConfig
-    from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLModel
-
-    cfg = Qwen3VLConfig.from_pretrained(model_dir, trust_remote_code=True)
-    cfg._attn_implementation = "eager"
-    cfg.text_config._attn_implementation = "eager"
-
-    ref = Qwen3VLModel(cfg).eval().half().npu()
-    sd = safetensors.torch.load_file(f"{model_dir}/model.safetensors",
-                                     device="cpu")
-    sd = {k.removeprefix("model."): v.half() for k, v in sd.items()}
-    missing, unexpected = ref.load_state_dict(sd, strict=False)
-    assert not missing and not unexpected, (
-        f"weight mismatch: missing={len(missing)} unexpected={len(unexpected)}")
-    return ref
-
 
 def run_tf_phase(model_dir: str, inputs_all):
     """Load TF ref and run forward per case, return dict[name] = hidden CPU fp32."""
