@@ -303,6 +303,10 @@ Status Qwen3VLModel::ForwardWithTiming(const InferRequest& request,
         if (!gthw && request.preprocessed.metadata) {
             gthw = static_cast<const int64_t*>(request.preprocessed.metadata);
         }
+        if (!gthw) {
+            LOG_ERROR("ForwardWithTiming: grid_thw and metadata are both null");
+            return ERROR_INVALID_PARAM;
+        }
         grid_thw_host.assign(gthw, gthw + 3);
         num_images = 1;
 
