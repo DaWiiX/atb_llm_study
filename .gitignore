@@ -53,6 +53,8 @@ extra-info/data-dump/
 # Local env (machine-specific paths; copy .env.example to .env to bootstrap)
 .env
 .claude
+.agents/
+skills-lock.json
 
 # Node.js (dev tooling)
 package.json
