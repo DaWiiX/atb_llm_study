@@ -39,11 +39,20 @@
 #include <numeric>
 #include <cmath>
 #include <string>
+#include <tuple>
 #include <functional>
 
 // ── Statistics helper ────────────────────────────────────────
 struct Stats {
     double mean = 0, median = 0, min_val = 0, max_val = 0, stddev = 0;
+};
+
+// ── Cold-start metrics ──────────────────────────────────────
+struct ColdMetrics {
+    double cold_e2e_ms = 0;
+    double warm_e2e_ms = 0;
+    double penalty_pct = 0;
+    bool valid = false;
 };
 
 Stats ComputeStats(std::vector<double>& times) {
@@ -166,8 +175,13 @@ std::vector<TimedResult> RunBenchmark(
         atb_llm::LLMEngine* engine,
         const atb_llm::InferRequest& request,
         int num_warmup, int num_iter, bool verbose,
-        const char* save_bin_path = nullptr) {
+        const char* save_bin_path = nullptr,
+        ColdMetrics* cold = nullptr) {
     atb_llm::Status s;
+
+    if (cold && num_warmup < 1) {
+        cold->valid = false;
+    }
 
     // Warmup
     for (int i = 0; i < num_warmup; i++) {
@@ -177,6 +191,11 @@ std::vector<TimedResult> RunBenchmark(
         if (s != atb_llm::STATUS_OK) {
             LOG_ERROR("Warmup iteration %d failed: %d", i, static_cast<int>(s));
             return {};
+        }
+        // All ATB graphs were compiled during LLMEngine::Create(); no lazy graph init in cold path
+        // Capture cold start from the very first forward
+        if (cold && i == 0) {
+            cold->cold_e2e_ms = timings.e2e_ms;
         }
         if (verbose) {
             LOG_INFO("  Warmup %d: %.2f ms", i, timings.e2e_ms);
@@ -203,6 +222,19 @@ std::vector<TimedResult> RunBenchmark(
             LOG_INFO("  Iter %d: %.2f ms", i, timings.e2e_ms);
         }
     }
+
+    // Compute cold-start penalty
+    if (cold && cold->cold_e2e_ms > 0 && results.size() > 0) {
+        double sum = 0;
+        for (auto& r : results) sum += r.e2e_ms;
+        cold->warm_e2e_ms = sum / results.size();
+        if (cold->warm_e2e_ms > 0) {
+            cold->penalty_pct = (cold->cold_e2e_ms - cold->warm_e2e_ms)
+                                / cold->warm_e2e_ms * 100.0;
+            cold->valid = true;
+        }
+    }
+
     if (save_bin_path) {
         if (!SavePoolerOutput(save_bin_path, last_result)) {
             LOG_ERROR("Failed to save pooler output to %s", save_bin_path);
@@ -278,13 +310,46 @@ void ReportStagesCompact(const std::vector<TimedResult>& results,
            pooling, staged_sum, e2e_stats.mean, e2e_stats.stddev);
 }
 
+// ── Report cold-start results (dual-format) ────────────────────
+void ReportColdStart(const std::vector<std::tuple<std::string, std::string, ColdMetrics>>& cold_results) {
+    if (cold_results.empty()) return;
+
+    // Human-readable table
+    LOG_INFO("============================================================");
+    LOG_INFO("  === Cold-Start Benchmark ===");
+    LOG_INFO("============================================================");
+    LOG_INFO("  mode   resolution     cold_e2e_ms  warm_e2e_ms  penalty_pct");
+    LOG_INFO("  ------ -------------- ------------ ------------ -----------");
+    for (const auto& entry : cold_results) {
+        const std::string& mode = std::get<0>(entry);
+        const std::string& resolution = std::get<1>(entry);
+        const ColdMetrics& cm = std::get<2>(entry);
+        char buf[128];
+        std::snprintf(buf, sizeof(buf), "%+.1f%%", cm.penalty_pct);
+        LOG_INFO("  %-6s %-14s %12.2f %12.2f %11s",
+                 mode.c_str(), resolution.c_str(),
+                 cm.cold_e2e_ms, cm.warm_e2e_ms, buf);
+    }
+    LOG_INFO("============================================================");
+
+    // Machine-parseable lines
+    for (const auto& entry : cold_results) {
+        const std::string& mode = std::get<0>(entry);
+        const std::string& resolution = std::get<1>(entry);
+        const ColdMetrics& cm = std::get<2>(entry);
+        printf("BENCH_COLD: mode=%s resolution=%s cold_ms=%.2f warm_ms=%.2f penalty_pct=%.1f\n",
+               mode.c_str(), resolution.c_str(), cm.cold_e2e_ms, cm.warm_e2e_ms, cm.penalty_pct);
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════
 // Text-only benchmark
 // ═══════════════════════════════════════════════════════════════
 
 int RunTextBenchmark(atb_llm::LLMEngine* engine,
                      int seq_len, int num_warmup, int num_iter,
-                     bool cmp_mode) {
+                     bool cmp_mode,
+                     ColdMetrics* cold = nullptr) {
     // Input: [151643, 15339, ..., 15339, 151645]
     std::vector<int64_t> input_ids(seq_len);
     input_ids[0] = 151643;
@@ -305,7 +370,8 @@ int RunTextBenchmark(atb_llm::LLMEngine* engine,
         LOG_INFO("Iterations: %d (warmup: %d)", num_iter, num_warmup);
     }
 
-    auto results = RunBenchmark(engine, request, num_warmup, num_iter, !cmp_mode);
+    auto results = RunBenchmark(engine, request, num_warmup, num_iter, !cmp_mode,
+                                nullptr, cold);
     if (results.empty()) return 1;
 
     std::vector<double> e2e_times;
@@ -329,7 +395,8 @@ int RunMultimodalBenchmark(atb_llm::LLMEngine* engine,
                            const std::string& model_dir,
                            int img_w, int img_h,
                            int num_warmup, int num_iter,
-                           bool cmp_mode) {
+                           bool cmp_mode,
+                           ColdMetrics* cold = nullptr) {
     // Load Qwen3VL config for preprocessing
     atb_llm::adapters::Qwen3VLConfig config;
     atb_llm::Status s = atb_llm::adapters::LoadQwen3VLConfig(model_dir, config);
@@ -417,7 +484,8 @@ int RunMultimodalBenchmark(atb_llm::LLMEngine* engine,
         LOG_INFO("Iterations: %d (warmup: %d)", num_iter, num_warmup);
     }
 
-    auto results = RunBenchmark(engine, request, num_warmup, num_iter, !cmp_mode);
+    auto results = RunBenchmark(engine, request, num_warmup, num_iter, !cmp_mode,
+                                nullptr, cold);
     if (results.empty()) return 1;
     double pre_ms = std::chrono::duration<double, std::milli>(pre_end - pre_start).count();
     for (auto& r : results) {
@@ -451,7 +519,8 @@ int RunImageOnlyBenchmark(atb_llm::LLMEngine* engine,
                           const std::string& model_dir,
                           int img_w, int img_h,
                           int num_warmup, int num_iter,
-                          bool cmp_mode) {
+                          bool cmp_mode,
+                          ColdMetrics* cold = nullptr) {
     // Load Qwen3VL config for preprocessing
     atb_llm::adapters::Qwen3VLConfig config;
     atb_llm::Status s = atb_llm::adapters::LoadQwen3VLConfig(model_dir, config);
@@ -544,7 +613,8 @@ int RunImageOnlyBenchmark(atb_llm::LLMEngine* engine,
         LOG_INFO("Iterations: %d (warmup: %d)", num_iter, num_warmup);
     }
 
-    auto results = RunBenchmark(engine, request, num_warmup, num_iter, !cmp_mode);
+    auto results = RunBenchmark(engine, request, num_warmup, num_iter, !cmp_mode,
+                                nullptr, cold);
     if (results.empty()) return 1;
     double pre_ms = std::chrono::duration<double, std::milli>(pre_end - pre_start).count();
     for (auto& r : results) {
@@ -907,23 +977,33 @@ int main(int argc, char** argv) {
         LOG_INFO("Mode: %s", mode.c_str());
     }
 
-    // Create engine
+    // Engine config (shared by all factory calls)
     atb_llm::EngineConfig config;
     config.model_dir = model_dir;
     config.buffer_size = 10LL * 1024 * 1024 * 1024;
     config.device_id = 0;
 
-    std::unique_ptr<atb_llm::LLMEngine> engine;
-    auto t0 = std::chrono::high_resolution_clock::now();
-    atb_llm::Status s = atb_llm::LLMEngine::Create(config, engine);
-    auto t1 = std::chrono::high_resolution_clock::now();
-    auto load_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+    // Helper: create engine and return via unique_ptr
+    auto CreateEngine = [&]() -> std::unique_ptr<atb_llm::LLMEngine> {
+        std::unique_ptr<atb_llm::LLMEngine> eng;
+        auto t0 = std::chrono::high_resolution_clock::now();
+        atb_llm::Status st = atb_llm::LLMEngine::Create(config, eng);
+        auto t1 = std::chrono::high_resolution_clock::now();
+        auto load_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+        if (st != atb_llm::STATUS_OK || !eng) {
+            LOG_ERROR("Failed to create engine: %d", static_cast<int>(st));
+            return nullptr;
+        }
+        if (!cmp_mode) LOG_INFO("Engine load time: %ld ms", static_cast<long>(load_ms));
+        return eng;
+    };
 
-    if (s != atb_llm::STATUS_OK || !engine) {
-        LOG_ERROR("Failed to create engine: %d", static_cast<int>(s));
-        return 1;
+    // Create engine for single modes; all/cold create engines per mode below
+    std::unique_ptr<atb_llm::LLMEngine> engine;
+    if (mode != "all" && mode != "cold") {
+        engine = CreateEngine();
+        if (!engine) return 1;
     }
-    if (!cmp_mode) LOG_INFO("Engine load time: %ld ms", static_cast<long>(load_ms));
 
     int ret = 0;
     if (mode == "text") {
@@ -933,13 +1013,87 @@ int main(int argc, char** argv) {
     } else if (mode == "io") {
         ret = RunImageOnlyBenchmark(engine.get(), model_dir, img_w, img_h, num_warmup, num_iter, cmp_mode);
     } else if (mode == "all") {
-        ret = RunTextBenchmark(engine.get(), seq_len, num_warmup, num_iter, cmp_mode);
-        if (ret == 0) {
-            ret = RunImageOnlyBenchmark(engine.get(), model_dir, img_w, img_h, num_warmup, num_iter, cmp_mode);
+        std::vector<std::tuple<std::string, std::string, ColdMetrics>> cold_results;
+
+        // ── Text mode (per-mode engine) ─────────────────────────
+        {
+            auto eng = CreateEngine();
+            if (!eng) return 1;
+            ColdMetrics cold;
+            ret = RunTextBenchmark(eng.get(), seq_len, num_warmup, num_iter, cmp_mode, &cold);
+            if (ret == 0 && cold.valid) {
+                cold_results.push_back({"text", "seq=" + std::to_string(seq_len), cold});
+            }
         }
+
+        // ── Image-only mode (per-mode engine) ───────────────────
         if (ret == 0) {
-            ret = RunMultimodalBenchmark(engine.get(), model_dir, img_w, img_h, num_warmup, num_iter, cmp_mode);
+            auto eng = CreateEngine();
+            if (!eng) return 1;
+            ColdMetrics cold;
+            char res[32];
+            std::snprintf(res, sizeof(res), "%dx%d", img_w, img_h);
+            ret = RunImageOnlyBenchmark(eng.get(), model_dir, img_w, img_h,
+                                        num_warmup, num_iter, cmp_mode, &cold);
+            if (ret == 0 && cold.valid) {
+                cold_results.push_back({"io", res, cold});
+            }
         }
+
+        // ── Multimodal mode (per-mode engine) ───────────────────
+        if (ret == 0) {
+            auto eng = CreateEngine();
+            if (!eng) return 1;
+            ColdMetrics cold;
+            char res[32];
+            std::snprintf(res, sizeof(res), "%dx%d", img_w, img_h);
+            ret = RunMultimodalBenchmark(eng.get(), model_dir, img_w, img_h,
+                                         num_warmup, num_iter, cmp_mode, &cold);
+            if (ret == 0 && cold.valid) {
+                cold_results.push_back({"mm", res, cold});
+            }
+        }
+
+        ReportColdStart(cold_results);
+    } else if (mode == "cold") {
+        std::vector<std::tuple<std::string, std::string, ColdMetrics>> cold_results;
+
+        // ── Text cold: seq=2048 ─────────────────────────────────
+        {
+            auto eng = CreateEngine();
+            if (!eng) return 1;
+            ColdMetrics cold;
+            ret = RunTextBenchmark(eng.get(), 2048, num_warmup, num_iter, cmp_mode, &cold);
+            if (ret == 0 && cold.valid) {
+                cold_results.push_back({"text", "seq=2048", cold});
+            }
+        }
+
+        // ── IO cold: 1080x1920 ──────────────────────────────────
+        if (ret == 0) {
+            auto eng = CreateEngine();
+            if (!eng) return 1;
+            ColdMetrics cold;
+            ret = RunImageOnlyBenchmark(eng.get(), model_dir, 1080, 1920,
+                                        num_warmup, num_iter, cmp_mode, &cold);
+            if (ret == 0 && cold.valid) {
+                cold_results.push_back({"io", "1080x1920", cold});
+            }
+        }
+
+        // ── MM cold: 1080x1920 ──────────────────────────────────
+        if (ret == 0) {
+            auto eng = CreateEngine();
+            if (!eng) return 1;
+            ColdMetrics cold;
+            ret = RunMultimodalBenchmark(eng.get(), model_dir, 1080, 1920,
+                                         num_warmup, num_iter, cmp_mode, &cold);
+            if (ret == 0 && cold.valid) {
+                cold_results.push_back({"mm", "1080x1920", cold});
+            }
+        }
+
+        ReportColdStart(cold_results);
     } else if (mode == "bench") {
         struct { int w, h; } resolutions[] = {
             {224, 224},
@@ -960,7 +1114,7 @@ int main(int argc, char** argv) {
     } else if (mode == "compare") {
         ret = RunCompareMode(engine.get(), model_dir, num_warmup, num_iter);
     } else {
-        LOG_ERROR("Unknown mode: %s (use text|mm|io|all|bench|compare)", mode.c_str());
+        LOG_ERROR("Unknown mode: %s (use text|mm|io|all|bench|compare|cold)", mode.c_str());
         return 1;
     }
 

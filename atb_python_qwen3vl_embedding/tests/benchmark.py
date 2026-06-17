@@ -380,6 +380,89 @@ def benchmark_atb_e2e(engine, inputs, n_warmup, n_iter):
 
 
 # ═══════════════════════════════════════════════════════════════════
+# Cold-start benchmark
+# ═══════════════════════════════════════════════════════════════════
+
+
+def _run_cold_benchmark(engine, inputs, n_warmup, n_iter):
+    """Capture cold-start penalty: first forward vs hot-iteration mean.
+
+    The very first ``engine.forward()`` is timed as ``cold_e2e_ms``.
+    Remaining warmup iterations are discarded, then hot iterations are
+    collected for the warm mean.
+
+    Args:
+        engine: An already-constructed Qwen3VLEngine (graphs built,
+                weights loaded).
+        inputs: Input dict from ``make_inputs()`` or ``make_image_only_inputs()``.
+        n_warmup: Total warmup count (first iteration IS the cold one).
+        n_iter: Number of hot (timed) iterations.
+
+    Returns:
+        (cold_e2e_ms, warm_e2e_times_seconds, valid)
+    """
+    # TODO: refactor to share warmup/hot iteration loops with benchmark_atb_e2e
+    if n_warmup < 1 or n_iter < 1:
+        return (0.0, [], False)
+
+    input_ids = inputs['input_ids']
+    pv_raw = inputs.get('pv_raw')
+    grid_thw = inputs.get('grid_thw')
+    S = input_ids.shape[1]
+
+    # C++ builds all graphs in Create(); Python's DecoderLayer is lazy per S,
+    # so we pre-build here to match C++ behavior (both have graphs ready before cold timing)
+    engine._ensure_text_graph(S)
+
+    # ── Cold start: very first forward ───────────────────────────
+    sync(); t0 = now()
+    engine.forward(input_ids, pv_raw, grid_thw)
+    sync()
+    cold_e2e_ms = (now() - t0) * 1000.0
+
+    # ── Remaining warmup (discard timings) ───────────────────────
+    for _ in range(max(0, n_warmup - 1)):
+        engine.forward(input_ids, pv_raw, grid_thw)
+    sync()
+
+    # ── Hot iterations ───────────────────────────────────────────
+    warm_times = []
+    for _ in range(n_iter):
+        sync(); t0 = now()
+        engine.forward(input_ids, pv_raw, grid_thw)
+        sync()
+        warm_times.append(now() - t0)
+
+    return cold_e2e_ms, warm_times, True
+
+
+def _report_cold_start(results):
+    """Print cold-start report in human-readable and machine-parseable formats.
+
+    Args:
+        results: List of dicts with keys:
+            mode, resolution, cold_ms, warm_ms, penalty_pct, valid
+    """
+    valid_results = [r for r in results if r.get('valid', False)]
+
+    # ── Human-readable table ─────────────────────────────────────
+    print(f"\n{'─' * 76}")
+    print("  === Cold-Start Benchmark ===")
+    print(f"{'─' * 76}")
+    print(f"  {'mode':<6} {'resolution':<14} {'cold_e2e_ms':>12} {'warm_e2e_ms':>12} {'penalty_pct':>11}")
+    print(f"  {'─' * 6} {'─' * 14} {'─' * 12} {'─' * 12} {'─' * 11}")
+    for r in valid_results:
+        penalty_str = f"{r['penalty_pct']:+.1f}%"
+        print(f"  {r['mode']:<6} {r['resolution']:<14} {r['cold_ms']:>12.2f} {r['warm_ms']:>12.2f} {penalty_str:>11}")
+    print(f"{'─' * 76}")
+
+    # ── Machine-parseable lines ──────────────────────────────────
+    for r in valid_results:
+        print(f"BENCH_COLD: mode={r['mode']} resolution={r['resolution']} cold_ms={r['cold_ms']:.2f} "
+              f"warm_ms={r['warm_ms']:.2f} penalty_pct={r['penalty_pct']:.1f}")
+
+
+# ═══════════════════════════════════════════════════════════════════
 # Transformers reference benchmark
 # ═══════════════════════════════════════════════════════════════════
 
@@ -571,9 +654,10 @@ def parse_args(argv: Optional[list] = None):
     p.add_argument('--seq', type=str, default='100,512,1024,2048,4096',
                    help='Comma-separated sequence lengths for TEXT_ONLY mode')
     p.add_argument('--mode', type=str, default='mm',
-                   choices=['text', 'io', 'mm', 'all'],
+                   choices=['text', 'io', 'mm', 'all', 'cold'],
                    help='Benchmark mode: text (TEXT_ONLY), io (IMAGE_ONLY), '
-                        'mm (IMAGE_AND_TEXT, default), all (run all three)')
+                        'mm (IMAGE_AND_TEXT, default), all (run all three), '
+                        'cold (cold-start measurement: text seq=2048, io/mm 1080x1920)')
     p.add_argument('--load-pixel-values', action='store_true',
                    help='Load C++-preprocessed pixel_values from '
                         '/tmp/cpp_pv_{W}x{H}.bin (saved by '
@@ -592,7 +676,13 @@ def parse_args(argv: Optional[list] = None):
 
 def main(argv: Optional[list] = None) -> int:
     args = parse_args(argv)
-    modes_to_run = ['text', 'io', 'mm'] if args.mode == 'all' else [args.mode]
+    if args.mode == 'cold':
+        modes_to_run = ['cold']
+    elif args.mode == 'all':
+        modes_to_run = ['text', 'io', 'mm']
+    else:
+        modes_to_run = [args.mode]
+    cold_results = []  # aggregated for --mode all and --mode cold
     resolutions = parse_resolutions(args.resolutions)
     seq_lengths = parse_seq_lengths(args.seq)
     print(f"Model dir : {args.model_dir}")
@@ -607,17 +697,82 @@ def main(argv: Optional[list] = None) -> int:
     from transformers import AutoProcessor
     processor = AutoProcessor.from_pretrained(args.model_dir)
 
-    # ── Load engine (shared across modes) ──────────────────────────
-    print("\n[ATB] Loading Qwen3VLEngine ...")
-    engine = Qwen3VLEngine(args.model_dir)
-    print(f"[ATB] {engine.n_layer} text layers, {engine.v_depth} vision blocks")
+    # ── Load engine (shared for single-mode; per-mode for --mode all/cold) ──
+    engine = None
+    if args.mode not in ('all', 'cold'):
+        print("\n[ATB] Loading Qwen3VLEngine ...")
+        engine = Qwen3VLEngine(args.model_dir)
+        print(f"[ATB] {engine.n_layer} text layers, {engine.v_depth} vision blocks")
 
     all_results = {}
+
+    # ═════════════════════════════════════════════════════════════════
+    # Mode: COLD — standalone cold-start measurement
+    # ═════════════════════════════════════════════════════════════════
+    if 'cold' in modes_to_run:
+        cold_configs = [
+            ('text', None, None, 2048),       # mode, w, h, seq
+            ('io', 1080, 1920, None),
+            ('mm', 1080, 1920, None),
+        ]
+        for mode_name, w, h, seq in cold_configs:
+            print(f"\n[Cold] Loading engine for {mode_name} ...")
+            engine = Qwen3VLEngine(args.model_dir)
+
+            if mode_name == 'text':
+                # Build seq=2048 text inputs
+                text = "Describe the image."
+                base_tokens = processor.tokenizer(text,
+                                                  add_special_tokens=False)['input_ids']
+                if len(base_tokens) >= seq:
+                    ids = base_tokens[:seq]
+                else:
+                    repeats = (seq + len(base_tokens) - 1) // len(base_tokens)
+                    ids = (base_tokens * repeats)[:seq]
+                text_input_ids = torch.tensor([ids], dtype=torch.long)
+                inputs = {'input_ids': text_input_ids, 'pv_raw': None, 'grid_thw': None}
+            elif mode_name == 'io':
+                inputs = make_image_only_inputs(engine, processor, w, h,
+                                                load_pv=args.load_pixel_values)
+            else:  # mm
+                inputs = make_inputs(engine, processor, w, h,
+                                     load_pv=args.load_pixel_values)
+
+            cold_ms, warm_times, valid = _run_cold_benchmark(engine, inputs,
+                                                      args.warmup, args.iter)
+            warm_e2e_arr = ms(warm_times)
+            warm_ms_val = warm_e2e_arr.mean()
+            if warm_ms_val > 0:
+                penalty = (cold_ms - warm_ms_val) / warm_ms_val * 100.0
+            else:
+                penalty = float('nan')
+
+            resolution_str = f"seq={seq}" if mode_name == 'text' else f"{w}x{h}"
+            cold_results.append({
+                'mode': mode_name, 'resolution': resolution_str,
+                'cold_ms': cold_ms, 'warm_ms': warm_ms_val,
+                'penalty_pct': penalty,
+                'valid': valid,
+            })
+
+            torch.npu.synchronize()
+            del engine
+            torch.npu.synchronize()
+            torch.npu.empty_cache()
+
+        _report_cold_start(cold_results)
+        return 0
 
     # ═════════════════════════════════════════════════════════════════
     # Mode: TEXT_ONLY
     # ═════════════════════════════════════════════════════════════════
     if 'text' in modes_to_run:
+        # Per-mode engine for --mode all
+        if engine is None:
+            print("\n[ATB] Loading Qwen3VLEngine ...")
+            engine = Qwen3VLEngine(args.model_dir)
+            print(f"[ATB] {engine.n_layer} text layers, {engine.v_depth} vision blocks")
+
         print(f"\n{'─' * 70}")
         print("  Mode: TEXT_ONLY  (no image)")
         print(f"{'─' * 70}")
@@ -654,7 +809,7 @@ def main(argv: Optional[list] = None) -> int:
 
         torch.npu.synchronize()
 
-        for seq in seq_lengths:
+        for seq_idx, seq in enumerate(seq_lengths):
             # Build input_ids by repeating base tokens to reach target length
             if len(base_tokens) >= seq:
                 ids = base_tokens[:seq]
@@ -669,9 +824,22 @@ def main(argv: Optional[list] = None) -> int:
 
             # E2E timing (no staged breakdown — no vision stages)
             engine._ensure_text_graph(S)
-            for _ in range(args.warmup):
+
+            if seq_idx == 0 and args.mode == 'all':
+                # Cold start: time the very first forward
+                sync(); t0 = now()
                 engine.forward(text_input_ids, None, None)
-            sync()
+                sync()
+                cold_e2e_ms = (now() - t0) * 1000.0
+
+                # Remaining warmup
+                for _ in range(max(0, args.warmup - 1)):
+                    engine.forward(text_input_ids, None, None)
+                sync()
+            else:
+                for _ in range(args.warmup):
+                    engine.forward(text_input_ids, None, None)
+                sync()
 
             baseline_mem = _start_npu_peak_measurement()
 
@@ -700,15 +868,45 @@ def main(argv: Optional[list] = None) -> int:
                   f"(baseline: {mem_info['baseline_mb']:.1f} MB,  "
                   f"delta: {delta_mb:.1f} MB)")
 
+            # Record cold metrics from first seq (--mode all only)
+            if seq_idx == 0 and args.mode == 'all':
+                if args.warmup >= 1 and args.iter >= 1:
+                    warm_mean = e2e_arr.mean()
+                    if warm_mean > 0:
+                        penalty = (cold_e2e_ms - warm_mean) / warm_mean * 100.0
+                    else:
+                        penalty = float('nan')
+                    cold_results.append({
+                        'mode': 'text', 'resolution': f'seq={seq}',
+                        'cold_ms': cold_e2e_ms,
+                        'warm_ms': warm_mean,
+                        'penalty_pct': penalty,
+                        'valid': True,
+                    })
+
+        # Destroy per-mode engine for --mode all
+        if args.mode == 'all':
+            torch.npu.synchronize()
+            del engine
+            engine = None
+            torch.npu.synchronize()
+            torch.npu.empty_cache()
+
     # ═════════════════════════════════════════════════════════════════
     # Mode: IMAGE_ONLY
     # ═════════════════════════════════════════════════════════════════
     if 'io' in modes_to_run:
+        # Per-mode engine for --mode all
+        if engine is None:
+            print("\n[ATB] Loading Qwen3VLEngine ...")
+            engine = Qwen3VLEngine(args.model_dir)
+            print(f"[ATB] {engine.n_layer} text layers, {engine.v_depth} vision blocks")
+
         print(f"\n{'=' * 70}")
         print("  Mode: IMAGE_ONLY")
         print(f"{'=' * 70}")
 
-        for (w, h) in resolutions:
+        for res_idx, (w, h) in enumerate(resolutions):
             print(f"\n[IO] Preparing {w}x{h} ...")
             inputs = make_image_only_inputs(engine, processor, w, h,
                                               load_pv=args.load_pixel_values)
@@ -730,6 +928,24 @@ def main(argv: Optional[list] = None) -> int:
 
             torch.npu.synchronize()
 
+            # Cold-start capture for first resolution
+            if res_idx == 0 and args.mode == 'all':
+                cold_ms, warm_times, valid = _run_cold_benchmark(engine, inputs,
+                                                          args.warmup, args.iter)
+                warm_cold_arr = ms(warm_times)
+                warm_mean = warm_cold_arr.mean()
+                if warm_mean > 0:
+                    penalty = (cold_ms - warm_mean) / warm_mean * 100.0
+                else:
+                    penalty = float('nan')
+                cold_results.append({
+                    'mode': 'io', 'resolution': f'{w}x{h}',
+                    'cold_ms': cold_ms,
+                    'warm_ms': warm_mean,
+                    'penalty_pct': penalty,
+                    'valid': valid,
+                })
+
             stages, staged_mem = benchmark_atb_staged(engine, inputs,
                                                         args.warmup, args.iter)
             atb_e2e, e2e_mem = benchmark_atb_e2e(engine, inputs,
@@ -744,15 +960,29 @@ def main(argv: Optional[list] = None) -> int:
             print_atb_report((w, h), S, n_vis, stages, atb_e2e,
                              staged_mem=staged_mem, e2e_mem=e2e_mem)
 
+        # Destroy per-mode engine for --mode all
+        if args.mode == 'all':
+            torch.npu.synchronize()
+            del engine
+            engine = None
+            torch.npu.synchronize()
+            torch.npu.empty_cache()
+
     # ═════════════════════════════════════════════════════════════════
     # Mode: IMAGE_AND_TEXT  (multimodal — default, keeps existing behavior)
     # ═════════════════════════════════════════════════════════════════
     if 'mm' in modes_to_run:
+        # Per-mode engine for --mode all
+        if engine is None:
+            print("\n[ATB] Loading Qwen3VLEngine ...")
+            engine = Qwen3VLEngine(args.model_dir)
+            print(f"[ATB] {engine.n_layer} text layers, {engine.v_depth} vision blocks")
+
         print(f"\n{'=' * 70}")
         print("  Mode: IMAGE_AND_TEXT")
         print(f"{'=' * 70}")
 
-        for (w, h) in resolutions:
+        for res_idx, (w, h) in enumerate(resolutions):
             print(f"\n[ATB] Preparing {w}x{h} ...")
             inputs = make_inputs(engine, processor, w, h,
                                    load_pv=args.load_pixel_values)
@@ -774,6 +1004,24 @@ def main(argv: Optional[list] = None) -> int:
                       f"/tmp/tokens_chat_mm_{w}x{h}.bin")
 
             torch.npu.synchronize()
+
+            # Cold-start capture for first resolution
+            if res_idx == 0 and args.mode == 'all':
+                cold_ms, warm_times, valid = _run_cold_benchmark(engine, inputs,
+                                                          args.warmup, args.iter)
+                warm_cold_arr = ms(warm_times)
+                warm_mean = warm_cold_arr.mean()
+                if warm_mean > 0:
+                    penalty = (cold_ms - warm_mean) / warm_mean * 100.0
+                else:
+                    penalty = float('nan')
+                cold_results.append({
+                    'mode': 'mm', 'resolution': f'{w}x{h}',
+                    'cold_ms': cold_ms,
+                    'warm_ms': warm_mean,
+                    'penalty_pct': penalty,
+                    'valid': valid,
+                })
 
             stages, staged_mem = benchmark_atb_staged(engine, inputs,
                                                         args.warmup, args.iter)
@@ -826,8 +1074,19 @@ def main(argv: Optional[list] = None) -> int:
                 'accuracy': None,
             }
 
-    del engine
-    torch.npu.empty_cache()
+        # Destroy per-mode engine for --mode all
+        if args.mode == 'all':
+            torch.npu.synchronize()
+            del engine
+            engine = None
+            torch.npu.synchronize()
+            torch.npu.empty_cache()
+
+    if engine is not None:
+        torch.npu.synchronize()
+        del engine
+        torch.npu.synchronize()
+        torch.npu.empty_cache()
 
     # ── Phase 2: TF reference (optional, only for mm mode) ─────────
     if args.ref and all_results:
@@ -846,6 +1105,11 @@ def main(argv: Optional[list] = None) -> int:
 
     if all_results:
         print_atb_vs_tf_table(all_results)
+
+    # ── Cold-start report for --mode all ────────────────────────────
+    if args.mode == 'all' and cold_results:
+        _report_cold_start(cold_results)
+
     return 0
 
 
