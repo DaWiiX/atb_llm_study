@@ -457,6 +457,159 @@ class Qwen3VLEngine:
 
     # ── Full pipeline ───────────────────────────────────────────────
 
+    def _validate_inputs(self, input_ids, pixel_values, image_grid_thw):
+        """Validate forward() inputs — raises TypeError / ValueError with
+        clear diagnostic messages for each violation.
+
+        Checks (in order):
+          1. input_ids device → cpu
+          2. input_ids dtype  → int64
+          3. input_ids shape  → 2D (B, S)
+          4. batch_size       → B == 1
+          5. pixel_values / image_grid_thw consistency → both None or both set
+          6. pixel_values / image_grid_thw Tensor type guard
+          7. pixel_values dtype   → float32 (when set)
+          8. pixel_values shape   → 1D or 2D (when set)
+          9. image_grid_thw dtype → int64 (when set)
+         10. image_grid_thw shape → 2D (*, 3) (when set)
+         11. image_grid_thw empty → shape[0] > 0
+         12. image_grid_thw grid values → T, H, W all >= 1
+         13. pixel_values length ↔ grid_thw consistency
+         14. token_id non-empty → numel > 0
+         15. token_id range  → [0, vocab_size)
+        """
+        # 1 ─ input_ids device ──────────────────────────────────────────
+        if input_ids.device.type != 'cpu':
+            raise ValueError(
+                f"forward(): input_ids must be on CPU, "
+                f"got device={input_ids.device}")
+
+        # 2 ─ input_ids dtype ───────────────────────────────────────────
+        if input_ids.dtype != torch.int64:
+            raise TypeError(
+                f"forward(): input_ids must be int64 (LongTensor), "
+                f"got {input_ids.dtype}")
+
+        # 3 ─ input_ids shape ───────────────────────────────────────────
+        if input_ids.ndim != 2:
+            raise ValueError(
+                f"forward(): input_ids must be 2D (B, S), "
+                f"got shape {tuple(input_ids.shape)}")
+
+        # 4 ─ batch_size ────────────────────────────────────────────────
+        B = input_ids.shape[0]
+        if B != 1:
+            raise ValueError(
+                f"forward(): batch_size must be 1, got {B}")
+
+        # 5 ─ pixel_values / image_grid_thw consistency ─────────────────
+        pv_set = pixel_values is not None
+        thw_set = image_grid_thw is not None
+        if pv_set != thw_set:
+            raise ValueError(
+                f"forward(): pixel_values and image_grid_thw must both "
+                f"be None or both be provided, "
+                f"got pixel_values={'provided' if pv_set else 'None'}, "
+                f"image_grid_thw={'provided' if thw_set else 'None'}")
+
+        if pixel_values is not None:
+            # 6 ─ Tensor type guards ────────────────────────────────────
+            if not isinstance(pixel_values, torch.Tensor):
+                raise TypeError(
+                    f"forward(): pixel_values must be a torch.Tensor, "
+                    f"got {type(pixel_values).__name__}")
+            if not isinstance(image_grid_thw, torch.Tensor):
+                raise TypeError(
+                    f"forward(): image_grid_thw must be a torch.Tensor, "
+                    f"got {type(image_grid_thw).__name__}")
+
+            # 7 ─ pixel_values dtype (must be float32) ──────────────────
+            if pixel_values.dtype != torch.float32:
+                raise TypeError(
+                    f"forward(): pixel_values must be float32, "
+                    f"got {pixel_values.dtype}")
+
+            # 8 ─ pixel_values shape (1D or 2D) ─────────────────────────
+            if pixel_values.ndim not in (1, 2):
+                raise ValueError(
+                    f"forward(): pixel_values must be 1D (N,) or 2D, "
+                    f"got shape {tuple(pixel_values.shape)}")
+
+            # 9 ─ image_grid_thw dtype (must be int64) ──────────────────
+            if image_grid_thw.dtype != torch.int64:
+                raise TypeError(
+                    f"forward(): image_grid_thw must be int64 "
+                    f"(LongTensor), got {image_grid_thw.dtype}")
+
+            # 10 ─ image_grid_thw shape (2D, last dim == 3) ─────────────
+            if image_grid_thw.ndim != 2 or image_grid_thw.shape[-1] != 3:
+                raise ValueError(
+                    f"forward(): image_grid_thw must be 2D (*, 3), "
+                    f"got shape {tuple(image_grid_thw.shape)}")
+
+            # 11 ─ image_grid_thw non-empty ─────────────────────────────
+            if image_grid_thw.shape[0] == 0:
+                raise ValueError(
+                    f"forward(): image_grid_thw has 0 rows — "
+                    f"use None for no images")
+
+            # 12 ─ grid value range (T, H, W all >= 1) ──────────────────
+            for i in range(image_grid_thw.shape[0]):
+                t = image_grid_thw[i, 0].item()
+                h = image_grid_thw[i, 1].item()
+                w = image_grid_thw[i, 2].item()
+                if t < 1:
+                    raise ValueError(
+                        f"forward(): image_grid_thw[{i}, 0] (T) must be >= 1, "
+                        f"got {t}")
+                if h < 1:
+                    raise ValueError(
+                        f"forward(): image_grid_thw[{i}, 1] (H) must be >= 1, "
+                        f"got {h}")
+                if w < 1:
+                    raise ValueError(
+                        f"forward(): image_grid_thw[{i}, 2] (W) must be >= 1, "
+                        f"got {w}")
+
+            # 13 ─ pixel_values length ↔ grid_thw consistency ───────────
+            expected_patches = 0
+            for i in range(image_grid_thw.shape[0]):
+                expected_patches += int(image_grid_thw[i, 0].item() *
+                                        image_grid_thw[i, 1].item() *
+                                        image_grid_thw[i, 2].item())
+            if pixel_values.ndim == 2:
+                if pixel_values.shape[0] != expected_patches:
+                    raise ValueError(
+                        f"forward(): pixel_values.shape[0] "
+                        f"({pixel_values.shape[0]}) does not match "
+                        f"expected patches ({expected_patches}) "
+                        f"from image_grid_thw")
+            else:  # 1D
+                expected_len = (expected_patches * self.patch_size *
+                                self.patch_size * self.v_cfg["in_channels"] *
+                                self.tp)
+                if pixel_values.shape[0] != expected_len:
+                    raise ValueError(
+                        f"forward(): pixel_values length "
+                        f"({pixel_values.shape[0]}) does not match "
+                        f"expected length ({expected_len}) "
+                        f"from image_grid_thw")
+
+        # 14 ─ token_id non-empty ───────────────────────────────────────
+        if input_ids.numel() == 0:
+            raise ValueError(
+                f"forward(): input_ids cannot be empty "
+                f"(got shape {tuple(input_ids.shape)})")
+
+        # 15 ─ token_id range ───────────────────────────────────────────
+        vocab_size = self.embed_w.shape[0]
+        min_id = input_ids.min().item()
+        max_id = input_ids.max().item()
+        if min_id < 0 or max_id >= vocab_size:
+            raise ValueError(
+                f"forward(): all token_ids must be in range [0, {vocab_size}), "
+                f"got min={min_id}, max={max_id}")
+
     def forward(self, input_ids: torch.LongTensor,
                 pixel_values: torch.Tensor | None = None,
                 image_grid_thw: torch.LongTensor | None = None,
@@ -472,10 +625,15 @@ class Qwen3VLEngine:
 
         Raises:
             RuntimeError: if the engine has been closed.
+            TypeError:    if any tensor has the wrong dtype.
+            ValueError:   if any tensor has the wrong shape or values.
         """
         with self._lock:
             if self._closed:
                 raise RuntimeError("Engine is closed and cannot be used.")
+
+        self._validate_inputs(input_ids, pixel_values, image_grid_thw)
+
         # 1. Text embeddings → NPU
         inputs_embeds = F.embedding(input_ids, self.embed_w).half().npu()
 
