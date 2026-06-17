@@ -55,6 +55,14 @@ struct ColdMetrics {
     bool valid = false;
 };
 
+// ── Throughput metrics ──────────────────────────────────────
+struct ThroughputMetrics {
+    int requests = 0;
+    int64_t total_tokens = 0;
+    double tokens_per_sec = 0.0;
+    double avg_latency_ms = 0.0;
+};
+
 Stats ComputeStats(std::vector<double>& times) {
     Stats st;
     int n = static_cast<int>(times.size());
@@ -342,6 +350,78 @@ void ReportColdStart(const std::vector<std::tuple<std::string, std::string, Cold
     }
 }
 
+// ── Throughput benchmark (continuous forward loop) ──────────────
+ThroughputMetrics RunThroughputBenchmark(
+        atb_llm::LLMEngine* engine,
+        const atb_llm::InferRequest& request,
+        double duration_sec,
+        int64_t tokens_per_request) {
+    ThroughputMetrics metrics;
+
+    auto start = std::chrono::steady_clock::now();
+    int requests = 0;
+
+    while (true) {
+        atb_llm::InferResult result;
+        atb_llm::StageTimings timings;
+        atb_llm::Status s = engine->EncodeWithTiming(request, result, timings);
+        if (s != atb_llm::STATUS_OK) {
+            LOG_ERROR("Throughput iteration %d failed: %d", requests, static_cast<int>(s));
+            return metrics;
+        }
+        requests++;
+
+        auto now = std::chrono::steady_clock::now();
+        double elapsed = std::chrono::duration<double>(now - start).count();
+        if (elapsed >= duration_sec) break;
+    }
+
+    auto end = std::chrono::steady_clock::now();
+    double elapsed = std::chrono::duration<double>(end - start).count();
+
+    if (requests > 0 && elapsed > 0) {
+        metrics.requests = requests;
+        metrics.total_tokens = requests * tokens_per_request;
+        metrics.tokens_per_sec = static_cast<double>(metrics.total_tokens) / elapsed;
+        metrics.avg_latency_ms = (elapsed * 1000.0) / static_cast<double>(requests);
+    }
+
+    return metrics;
+}
+
+// ── Report throughput results (dual-format) ──────────────────────
+void ReportThroughput(const std::vector<std::tuple<std::string, std::string, ThroughputMetrics>>& results) {
+    if (results.empty()) return;
+
+    // Human-readable table
+    LOG_INFO("============================================================");
+    LOG_INFO("  === Throughput Benchmark (20s) ===");
+    LOG_INFO("============================================================");
+    LOG_INFO("  mode   resolution     requests  total_tokens  tokens/sec  avg_lat_ms");
+    LOG_INFO("  ------ -------------- --------  ------------  ----------  ----------");
+    for (const auto& entry : results) {
+        const std::string& mode = std::get<0>(entry);
+        const std::string& resolution = std::get<1>(entry);
+        const ThroughputMetrics& m = std::get<2>(entry);
+        LOG_INFO("  %-6s %-14s %8d  %12ld  %10.0f  %10.1f",
+                 mode.c_str(), resolution.c_str(),
+                 m.requests, static_cast<long>(m.total_tokens),
+                 m.tokens_per_sec, m.avg_latency_ms);
+    }
+    LOG_INFO("============================================================");
+
+    // Machine-parseable lines
+    for (const auto& entry : results) {
+        const std::string& mode = std::get<0>(entry);
+        const std::string& resolution = std::get<1>(entry);
+        const ThroughputMetrics& m = std::get<2>(entry);
+        printf("BENCH_TPUT: mode=%s resolution=%s requests=%d total_tokens=%ld tps=%.0f avg_ms=%.1f\n",
+               mode.c_str(), resolution.c_str(),
+               m.requests, static_cast<long>(m.total_tokens),
+               m.tokens_per_sec, m.avg_latency_ms);
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════
 // Text-only benchmark
 // ═══════════════════════════════════════════════════════════════
@@ -349,7 +429,8 @@ void ReportColdStart(const std::vector<std::tuple<std::string, std::string, Cold
 int RunTextBenchmark(atb_llm::LLMEngine* engine,
                      int seq_len, int num_warmup, int num_iter,
                      bool cmp_mode,
-                     ColdMetrics* cold = nullptr) {
+                     ColdMetrics* cold = nullptr,
+                     ThroughputMetrics* throughput = nullptr) {
     // Input: [151643, 15339, ..., 15339, 151645]
     std::vector<int64_t> input_ids(seq_len);
     input_ids[0] = 151643;
@@ -384,6 +465,12 @@ int RunTextBenchmark(atb_llm::LLMEngine* engine,
         ReportStages(results, "text-only", seq_len, 0, e2e_stats);
     }
 
+    // B4: Throughput benchmark (after warmup+hot iterations, engine is warm)
+    if (throughput) {
+        *throughput = RunThroughputBenchmark(engine, request, 20.0,
+                                             static_cast<int64_t>(seq_len));
+    }
+
     return 0;
 }
 
@@ -396,7 +483,8 @@ int RunMultimodalBenchmark(atb_llm::LLMEngine* engine,
                            int img_w, int img_h,
                            int num_warmup, int num_iter,
                            bool cmp_mode,
-                           ColdMetrics* cold = nullptr) {
+                           ColdMetrics* cold = nullptr,
+                           ThroughputMetrics* throughput = nullptr) {
     // Load Qwen3VL config for preprocessing
     atb_llm::adapters::Qwen3VLConfig config;
     atb_llm::Status s = atb_llm::adapters::LoadQwen3VLConfig(model_dir, config);
@@ -508,6 +596,12 @@ int RunMultimodalBenchmark(atb_llm::LLMEngine* engine,
                      static_cast<int>(vis_tokens), e2e_stats);
     }
 
+    // B4: Throughput benchmark (after warmup+hot iterations, engine is warm)
+    if (throughput) {
+        *throughput = RunThroughputBenchmark(engine, request, 20.0,
+                                             static_cast<int64_t>(seq_len));
+    }
+
     return 0;
 }
 
@@ -520,7 +614,8 @@ int RunImageOnlyBenchmark(atb_llm::LLMEngine* engine,
                           int img_w, int img_h,
                           int num_warmup, int num_iter,
                           bool cmp_mode,
-                          ColdMetrics* cold = nullptr) {
+                          ColdMetrics* cold = nullptr,
+                          ThroughputMetrics* throughput = nullptr) {
     // Load Qwen3VL config for preprocessing
     atb_llm::adapters::Qwen3VLConfig config;
     atb_llm::Status s = atb_llm::adapters::LoadQwen3VLConfig(model_dir, config);
@@ -635,6 +730,12 @@ int RunImageOnlyBenchmark(atb_llm::LLMEngine* engine,
         ReportStages(results, label,
                      static_cast<int>(seq_len),
                      static_cast<int>(vis_tokens), e2e_stats);
+    }
+
+    // B4: Throughput benchmark (after warmup+hot iterations, engine is warm)
+    if (throughput) {
+        *throughput = RunThroughputBenchmark(engine, request, 20.0,
+                                             static_cast<int64_t>(seq_len));
     }
 
     return 0;
@@ -998,9 +1099,9 @@ int main(int argc, char** argv) {
         return eng;
     };
 
-    // Create engine for single modes; all/cold create engines per mode below
+    // Create engine for single modes; all/cold/throughput create engines per mode below
     std::unique_ptr<atb_llm::LLMEngine> engine;
-    if (mode != "all" && mode != "cold") {
+    if (mode != "all" && mode != "cold" && mode != "throughput") {
         engine = CreateEngine();
         if (!engine) return 1;
     }
@@ -1014,15 +1115,20 @@ int main(int argc, char** argv) {
         ret = RunImageOnlyBenchmark(engine.get(), model_dir, img_w, img_h, num_warmup, num_iter, cmp_mode);
     } else if (mode == "all") {
         std::vector<std::tuple<std::string, std::string, ColdMetrics>> cold_results;
+        std::vector<std::tuple<std::string, std::string, ThroughputMetrics>> tput_results;
 
         // ── Text mode (per-mode engine) ─────────────────────────
         {
             auto eng = CreateEngine();
             if (!eng) return 1;
             ColdMetrics cold;
-            ret = RunTextBenchmark(eng.get(), seq_len, num_warmup, num_iter, cmp_mode, &cold);
-            if (ret == 0 && cold.valid) {
-                cold_results.push_back({"text", "seq=" + std::to_string(seq_len), cold});
+            ThroughputMetrics tput;
+            ret = RunTextBenchmark(eng.get(), seq_len, num_warmup, num_iter, cmp_mode, &cold, &tput);
+            if (ret == 0) {
+                if (cold.valid) {
+                    cold_results.push_back({"text", "seq_" + std::to_string(seq_len), cold});
+                }
+                tput_results.push_back({"text", "seq_" + std::to_string(seq_len), tput});
             }
         }
 
@@ -1031,12 +1137,16 @@ int main(int argc, char** argv) {
             auto eng = CreateEngine();
             if (!eng) return 1;
             ColdMetrics cold;
+            ThroughputMetrics tput;
             char res[32];
             std::snprintf(res, sizeof(res), "%dx%d", img_w, img_h);
             ret = RunImageOnlyBenchmark(eng.get(), model_dir, img_w, img_h,
-                                        num_warmup, num_iter, cmp_mode, &cold);
-            if (ret == 0 && cold.valid) {
-                cold_results.push_back({"io", res, cold});
+                                        num_warmup, num_iter, cmp_mode, &cold, &tput);
+            if (ret == 0) {
+                if (cold.valid) {
+                    cold_results.push_back({"io", res, cold});
+                }
+                tput_results.push_back({"io", res, tput});
             }
         }
 
@@ -1045,16 +1155,62 @@ int main(int argc, char** argv) {
             auto eng = CreateEngine();
             if (!eng) return 1;
             ColdMetrics cold;
+            ThroughputMetrics tput;
             char res[32];
             std::snprintf(res, sizeof(res), "%dx%d", img_w, img_h);
             ret = RunMultimodalBenchmark(eng.get(), model_dir, img_w, img_h,
-                                         num_warmup, num_iter, cmp_mode, &cold);
-            if (ret == 0 && cold.valid) {
-                cold_results.push_back({"mm", res, cold});
+                                         num_warmup, num_iter, cmp_mode, &cold, &tput);
+            if (ret == 0) {
+                if (cold.valid) {
+                    cold_results.push_back({"mm", res, cold});
+                }
+                tput_results.push_back({"mm", res, tput});
             }
         }
 
         ReportColdStart(cold_results);
+        ReportThroughput(tput_results);
+    } else if (mode == "throughput") {
+        // Three modes sequentially, each with a pre-warmed per-mode engine
+        std::vector<std::tuple<std::string, std::string, ThroughputMetrics>> tput_results;
+
+        // ── Text mode (seq=2048) ─────────────────────────────────
+        {
+            auto eng = CreateEngine();
+            if (!eng) return 1;
+            ThroughputMetrics tput;
+            ret = RunTextBenchmark(eng.get(), 2048, num_warmup, num_iter,
+                                   cmp_mode, nullptr, &tput);
+            if (ret == 0) {
+                tput_results.push_back({"text", "seq_2048", tput});
+            }
+        }
+
+        // ── IO mode (1080x1920) ───────────────────────────────────
+        if (ret == 0) {
+            auto eng = CreateEngine();
+            if (!eng) return 1;
+            ThroughputMetrics tput;
+            ret = RunImageOnlyBenchmark(eng.get(), model_dir, 1080, 1920,
+                                        num_warmup, num_iter, cmp_mode, nullptr, &tput);
+            if (ret == 0) {
+                tput_results.push_back({"io", "1080x1920", tput});
+            }
+        }
+
+        // ── MM mode (1080x1920) ───────────────────────────────────
+        if (ret == 0) {
+            auto eng = CreateEngine();
+            if (!eng) return 1;
+            ThroughputMetrics tput;
+            ret = RunMultimodalBenchmark(eng.get(), model_dir, 1080, 1920,
+                                         num_warmup, num_iter, cmp_mode, nullptr, &tput);
+            if (ret == 0) {
+                tput_results.push_back({"mm", "1080x1920", tput});
+            }
+        }
+
+        ReportThroughput(tput_results);
     } else if (mode == "cold") {
         std::vector<std::tuple<std::string, std::string, ColdMetrics>> cold_results;
 
@@ -1065,7 +1221,7 @@ int main(int argc, char** argv) {
             ColdMetrics cold;
             ret = RunTextBenchmark(eng.get(), 2048, num_warmup, num_iter, cmp_mode, &cold);
             if (ret == 0 && cold.valid) {
-                cold_results.push_back({"text", "seq=2048", cold});
+                cold_results.push_back({"text", "seq_2048", cold});
             }
         }
 
@@ -1114,7 +1270,7 @@ int main(int argc, char** argv) {
     } else if (mode == "compare") {
         ret = RunCompareMode(engine.get(), model_dir, num_warmup, num_iter);
     } else {
-        LOG_ERROR("Unknown mode: %s (use text|mm|io|all|bench|compare|cold)", mode.c_str());
+        LOG_ERROR("Unknown mode: %s (use text|mm|io|all|bench|compare|cold|throughput)", mode.c_str());
         return 1;
     }
 

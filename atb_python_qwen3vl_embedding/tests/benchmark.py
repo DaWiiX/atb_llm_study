@@ -463,6 +463,74 @@ def _report_cold_start(results):
 
 
 # ═══════════════════════════════════════════════════════════════════
+# Throughput benchmark
+# ═══════════════════════════════════════════════════════════════════
+
+
+def _run_throughput_benchmark(engine, input_ids, pixel_values, image_grid_thw, duration_sec=20.0):
+    """Run continuous forward() for duration_sec seconds, return throughput stats.
+
+    Uses a hot engine (already warmup'd) and measures sustained throughput
+    by running forward() in a tight loop with NPU synchronize.
+
+    Args:
+        engine: Qwen3VLEngine instance (already warm).
+        input_ids: Long tensor [1, S] on CPU.
+        pixel_values: Float tensor from preprocess_image, or None for text-only.
+        image_grid_thw: Long tensor [1, 3], or None for text-only.
+        duration_sec: Measurement window in seconds (default 20.0).
+
+    Returns:
+        dict with keys: requests, total_tokens, tokens_per_sec, avg_latency_ms
+    """
+    tokens_per_request = input_ids.numel()
+    t0 = time.perf_counter()
+    requests = 0
+
+    while True:
+        engine.forward(input_ids, pixel_values, image_grid_thw)
+        sync()
+        requests += 1
+        elapsed = time.perf_counter() - t0
+        if elapsed >= duration_sec:
+            break
+
+    elapsed = time.perf_counter() - t0
+    total_tokens = requests * tokens_per_request
+
+    return {
+        'requests': requests,
+        'total_tokens': total_tokens,
+        'tokens_per_sec': total_tokens / elapsed if elapsed > 0 else 0,
+        'avg_latency_ms': (elapsed * 1000.0) / requests if requests > 0 else 0,
+    }
+
+
+def _report_throughput(results):
+    """Print throughput report in human-readable and machine-parseable formats.
+
+    Args:
+        results: List of dicts with keys:
+            mode, resolution, requests, total_tokens, tokens_per_sec, avg_latency_ms
+    """
+    # ── Human-readable table ─────────────────────────────────────
+    print(f"\n{'─' * 76}")
+    print("  === Throughput Benchmark (20s) ===")
+    print(f"{'─' * 76}")
+    print(f"  {'mode':<6} {'resolution':<14} {'requests':>8} {'total_tokens':>14} {'tokens/sec':>12} {'avg_lat_ms':>10}")
+    print(f"  {'─' * 6} {'─' * 14} {'─' * 8} {'─' * 14} {'─' * 12} {'─' * 10}")
+    for r in results:
+        print(f"  {r['mode']:<6} {r['resolution']:<14} {r['requests']:>8} {r['total_tokens']:>14,} {r['tokens_per_sec']:>12,.0f} {r['avg_latency_ms']:>10.1f}")
+    print(f"{'─' * 76}")
+
+    # ── Machine-parseable lines ──────────────────────────────────
+    for r in results:
+        print(f"BENCH_TPUT: mode={r['mode']} resolution={r['resolution']} "
+              f"requests={r['requests']} total_tokens={r['total_tokens']} "
+              f"tps={r['tokens_per_sec']:.0f} avg_ms={r['avg_latency_ms']:.1f}")
+
+
+# ═══════════════════════════════════════════════════════════════════
 # Transformers reference benchmark
 # ═══════════════════════════════════════════════════════════════════
 
@@ -654,7 +722,7 @@ def parse_args(argv: Optional[list] = None):
     p.add_argument('--seq', type=str, default='100,512,1024,2048,4096',
                    help='Comma-separated sequence lengths for TEXT_ONLY mode')
     p.add_argument('--mode', type=str, default='mm',
-                   choices=['text', 'io', 'mm', 'all', 'cold'],
+                   choices=['text', 'io', 'mm', 'all', 'cold', 'throughput'],
                    help='Benchmark mode: text (TEXT_ONLY), io (IMAGE_ONLY), '
                         'mm (IMAGE_AND_TEXT, default), all (run all three), '
                         'cold (cold-start measurement: text seq=2048, io/mm 1080x1920)')
@@ -680,9 +748,12 @@ def main(argv: Optional[list] = None) -> int:
         modes_to_run = ['cold']
     elif args.mode == 'all':
         modes_to_run = ['text', 'io', 'mm']
+    elif args.mode == 'throughput':
+        modes_to_run = ['throughput']
     else:
         modes_to_run = [args.mode]
     cold_results = []  # aggregated for --mode all and --mode cold
+    throughput_results = []  # aggregated for --mode all and --mode throughput
     resolutions = parse_resolutions(args.resolutions)
     seq_lengths = parse_seq_lengths(args.seq)
     print(f"Model dir : {args.model_dir}")
@@ -699,7 +770,7 @@ def main(argv: Optional[list] = None) -> int:
 
     # ── Load engine (shared for single-mode; per-mode for --mode all/cold) ──
     engine = None
-    if args.mode not in ('all', 'cold'):
+    if args.mode not in ('all', 'cold', 'throughput'):
         print("\n[ATB] Loading Qwen3VLEngine ...")
         engine = Qwen3VLEngine(args.model_dir)
         print(f"[ATB] {engine.n_layer} text layers, {engine.v_depth} vision blocks")
@@ -747,7 +818,7 @@ def main(argv: Optional[list] = None) -> int:
             else:
                 penalty = float('nan')
 
-            resolution_str = f"seq={seq}" if mode_name == 'text' else f"{w}x{h}"
+            resolution_str = f"seq_{seq}" if mode_name == 'text' else f"{w}x{h}"
             cold_results.append({
                 'mode': mode_name, 'resolution': resolution_str,
                 'cold_ms': cold_ms, 'warm_ms': warm_ms_val,
@@ -761,6 +832,77 @@ def main(argv: Optional[list] = None) -> int:
             torch.npu.empty_cache()
 
         _report_cold_start(cold_results)
+        return 0
+
+    # ═════════════════════════════════════════════════════════════════
+    # Mode: THROUGHPUT  (standalone — three modes, pre-warmed engines)
+    # ═════════════════════════════════════════════════════════════════
+    if 'throughput' in modes_to_run:
+        throughput_results = []
+
+        # ── Text mode (seq=2048) ──────────────────────────────────
+        print("\n[Throughput] Text mode (seq=2048) ...")
+        engine = Qwen3VLEngine(args.model_dir)
+        text = "Describe the image."
+        base_tokens = processor.tokenizer(text,
+                                          add_special_tokens=False)['input_ids']
+        seq = 2048
+        if len(base_tokens) >= seq:
+            ids = base_tokens[:seq]
+        else:
+            repeats = (seq + len(base_tokens) - 1) // len(base_tokens)
+            ids = (base_tokens * repeats)[:seq]
+        text_input_ids = torch.tensor([ids], dtype=torch.long)
+        engine._ensure_text_graph(seq)
+        for _ in range(args.warmup):
+            engine.forward(text_input_ids, None, None)
+        sync()
+        result = _run_throughput_benchmark(engine, text_input_ids, None, None)
+        result['mode'] = 'text'
+        result['resolution'] = 'seq_2048'
+        throughput_results.append(result)
+        torch.npu.synchronize()
+        del engine
+        torch.npu.synchronize()
+        torch.npu.empty_cache()
+
+        # ── IO mode (1080x1920) ───────────────────────────────────
+        print("[Throughput] IO mode (1080x1920) ...")
+        engine = Qwen3VLEngine(args.model_dir)
+        inputs = make_image_only_inputs(engine, processor, 1080, 1920,
+                                        load_pv=args.load_pixel_values)
+        for _ in range(args.warmup):
+            engine.forward(inputs['input_ids'], inputs['pv_raw'], inputs['grid_thw'])
+        sync()
+        result = _run_throughput_benchmark(engine, inputs['input_ids'],
+                                           inputs['pv_raw'], inputs['grid_thw'])
+        result['mode'] = 'io'
+        result['resolution'] = '1080x1920'
+        throughput_results.append(result)
+        torch.npu.synchronize()
+        del engine
+        torch.npu.synchronize()
+        torch.npu.empty_cache()
+
+        # ── MM mode (1080x1920) ───────────────────────────────────
+        print("[Throughput] MM mode (1080x1920) ...")
+        engine = Qwen3VLEngine(args.model_dir)
+        inputs = make_inputs(engine, processor, 1080, 1920,
+                             load_pv=args.load_pixel_values)
+        for _ in range(args.warmup):
+            engine.forward(inputs['input_ids'], inputs['pv_raw'], inputs['grid_thw'])
+        sync()
+        result = _run_throughput_benchmark(engine, inputs['input_ids'],
+                                           inputs['pv_raw'], inputs['grid_thw'])
+        result['mode'] = 'mm'
+        result['resolution'] = '1080x1920'
+        throughput_results.append(result)
+        torch.npu.synchronize()
+        del engine
+        torch.npu.synchronize()
+        torch.npu.empty_cache()
+
+        _report_throughput(throughput_results)
         return 0
 
     # ═════════════════════════════════════════════════════════════════
@@ -877,7 +1019,7 @@ def main(argv: Optional[list] = None) -> int:
                     else:
                         penalty = float('nan')
                     cold_results.append({
-                        'mode': 'text', 'resolution': f'seq={seq}',
+                        'mode': 'text', 'resolution': f'seq_{seq}',
                         'cold_ms': cold_e2e_ms,
                         'warm_ms': warm_mean,
                         'penalty_pct': penalty,
@@ -886,6 +1028,12 @@ def main(argv: Optional[list] = None) -> int:
 
         # Destroy per-mode engine for --mode all
         if args.mode == 'all':
+            # B4: Throughput benchmark (after all seq_lengths, engine is warm)
+            tput_result = _run_throughput_benchmark(engine, text_input_ids, None, None)
+            tput_result['mode'] = 'text'
+            tput_result['resolution'] = f'seq_{S}'
+            throughput_results.append(tput_result)
+
             torch.npu.synchronize()
             del engine
             engine = None
@@ -960,8 +1108,15 @@ def main(argv: Optional[list] = None) -> int:
             print_atb_report((w, h), S, n_vis, stages, atb_e2e,
                              staged_mem=staged_mem, e2e_mem=e2e_mem)
 
-        # Destroy per-mode engine for --mode all
+        # Destroy per-mode engine for --mode all (IO)
         if args.mode == 'all':
+            # B4: Throughput benchmark (after all resolutions, engine is warm)
+            tput_result = _run_throughput_benchmark(engine, inputs['input_ids'],
+                                                     inputs['pv_raw'], inputs['grid_thw'])
+            tput_result['mode'] = 'io'
+            tput_result['resolution'] = f'{w}x{h}'
+            throughput_results.append(tput_result)
+
             torch.npu.synchronize()
             del engine
             engine = None
@@ -1074,8 +1229,15 @@ def main(argv: Optional[list] = None) -> int:
                 'accuracy': None,
             }
 
-        # Destroy per-mode engine for --mode all
+        # Destroy per-mode engine for --mode all (MM)
         if args.mode == 'all':
+            # B4: Throughput benchmark (after all resolutions, engine is warm)
+            tput_result = _run_throughput_benchmark(engine, inputs['input_ids'],
+                                                     inputs['pv_raw'], inputs['grid_thw'])
+            tput_result['mode'] = 'mm'
+            tput_result['resolution'] = f'{w}x{h}'
+            throughput_results.append(tput_result)
+
             torch.npu.synchronize()
             del engine
             engine = None
@@ -1109,6 +1271,10 @@ def main(argv: Optional[list] = None) -> int:
     # ── Cold-start report for --mode all ────────────────────────────
     if args.mode == 'all' and cold_results:
         _report_cold_start(cold_results)
+
+    # ── Throughput report for --mode all ─────────────────────────────
+    if args.mode == 'all' and throughput_results:
+        _report_throughput(throughput_results)
 
     return 0
 
