@@ -39,8 +39,8 @@
 2. **310P mask 必须 NZ 格式 + FRACTAL_NZ format tag（二者缺一不可）**
    PA_ENCODER 下 910B 用 ND、310P 用 NZ。数据 layout 是 NZ 还不够，NPU tensor 的 format tag 也必须是 `ACL_FORMAT_FRACTAL_NZ`(29)，否则 ATB 内部 ND→NZ Transdata 失败："call operation setup fail"。— `310p` / `arch §9.6`
 
-3. **C++ 和 Python 平台逻辑必须同步**
-   C++ 改了 NZ mask 转换，Python `engine.py` 也必须改，不一致会一方通过一方失败。— `310p`
+3. **C++ 和 Python 平台逻辑必须同步（含 fallback 链）**
+   C++ 改了 NZ mask 转换，Python `engine.py` 也必须改，不一致会一方通过一方失败。**同理适用于容错机制**：C++ 参考生成器有 ATB→transformers-CPU fallback（`test_stage_reference.py`），但 Python 测试参考侧 `load_tf_ref` 长期没有——910B 上不暴露，到 310P transformers 参考撞 ArgMaxWithValue/Conv3d 就硬 FAIL。一侧加的容错/退化逻辑必须同步到对侧，否则跨平台测试必然暴露缺口。— `310p` / 2026-06-18 fallback 事件
 
 4. **`ASCEND_PLATFORM` 配错会静默 fallback**
    `is_310p()` 依赖 `.env` 的 `ASCEND_PLATFORM=310P`；配错则返回 False，静默用 910B 的 ND mask，310P 上图编译失败。正确行为隐式依赖人工配置——配错不报错最危险。— `arch §9.6`

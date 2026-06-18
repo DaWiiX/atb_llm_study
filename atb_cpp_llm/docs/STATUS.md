@@ -39,6 +39,7 @@
 | 测试基础设施 | R1 CTest 注册修复、R2 注释修正、Python 并行化(33m→19m)、910B 自动排除 310P 测试 | ✅ |
 | Benchmark 输出质量 | M1 compare human 表格、M2 bench 分辨率对齐、M3 io seq_len、M4 冒烟测试、M5 分辨率单一数据源、M6 统一输出策略 | ✅ |
 | 运行时验证 | 910B 全量测试 PASS | ✅ |
+| Python 测试参考 fallback | `load_tf_ref` 加 NPU→CPU eager probing + 薄代理（`_TFRef`），310P 上 transformers 参考撞不支持算子时自动退 CPU float32，对齐 C++ 参考生成器设计。910B 回归 7 文件全 PASS | ✅ (910B) / ⏳ 310P 待复验 |
 
 ### 2.5 平台适配
 910B + 310P 双平台。310P NZ mask 策略、GQA 原生支持（cos=1.0）、平台检测 API（`is_310p()`/`Is310P()`）均完成。详见 `evergreen/platform-310p.md`。
@@ -48,15 +49,17 @@
 ## 3. 待办（按优先级）
 
 ### 3.1 🔴 310P 硬件闭环验证（部署前必须）
-§9.6 事件中 310P benchmark "setup fail status 4" 在 F1–F3 修复后**未在真实 310P 上复验**。到 310P 机器按此顺序：
+310P 全量已跑：**C++ 50/50 全过**；Python 侧参考 fallback 已修（见 §2.4），**待在 310P 复验**原本 FAIL 的 `test_e2e`/`test_embedder_e2e`/`test_deepstack_integration`/`test_pipeline_trace` 转 PASS。到 310P 机器按此顺序：
 1. `git pull` → `grep ASCEND_PLATFORM .env` 必须为 `310P`（配错会静默 fallback，§9.6 根因）
 2. `bash atb_cpp_llm/build_and_test.sh`（全量，推理核心 + 平台算子可信）
-3. `python atb_python_qwen3vl_embedding/tests/run_all.py`（Python 全量）
+3. `python atb_python_qwen3vl_embedding/tests/run_all.py`（Python 全量，确认 fallback 生效、cosine ≥ 0.99）
 4. `ctest -R test_benchmark_modes`（benchmark 外壳在 310P 能跑）
 5. `python atb_cpp_llm/scripts/gen_compare_tokens.py` → `./benchmark --mode compare`
 6. `python atb_cpp_llm/tests/compare_py_cpp.py`（cosine ≥ 0.99）
 
 > 注：全量测试**不覆盖** benchmark 二进制（benchmark 不在 CTest，仅 `test_benchmark_modes` 冒烟），故 4–6 步是独立的必要验证。
+>
+> 310P 遗留（非 fallback 范围）：`test_310p_combinations` 5/18 `CreateOperation failed` 是 platform-310p.md 实验矩阵已标的 310P 不支持 attention 配置组合，属预期（13/18 正常），应改测试标 expected-skip；`test_text_diagnostics` 卡死是子进程僵尸，非算子。二者单独修。
 
 ### 3.2 🟡 Python 代码质量加固（43 项，非阻塞）
 - **P1 MEDIUM：23 项** — 硬编码值、`print`→`logging`、额外输入校验等健壮性改进
@@ -89,3 +92,4 @@ C++ ATB 全面最快：geomean 领先 Python ATB **1.39×**、领先 Transformer
 | 日期 | 内容 |
 |------|------|
 | 2026-06-18 | 建立本文件作为单一真相源，归并自 architect-assessment §11.1 + audit-fix-plan + test-fix-plan + refactoring-plan §1 |
+| 2026-06-18 | 310P 全量结果：C++ 50/50 全过；Python 参考侧撞 ArgMaxWithValue/Conv3d FAIL。根因：transformers 参考在 310P NPU 跑撞不支持算子，C++ 端有 fallback 而 Python `load_tf_ref` 无。修复：`load_tf_ref` 加 NPU→CPU eager probing + `_TFRef` 薄代理，910B 回归 7 文件全 PASS，310P 待复验 |

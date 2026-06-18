@@ -162,14 +162,14 @@ def run_tf_phase(model_dir: str, inputs_all):
     tf_ds_feats = {}  # name → list of CPU deepstack feature tensors
     for inputs in inputs_all:
         name = inputs['name']
-        input_ids = inputs['input_ids'].npu()
-        attn_mask = inputs['attention_mask'].npu()
+        input_ids = inputs['input_ids'].to(ref.device)
+        attn_mask = inputs['attention_mask'].to(ref.device)
         pv = inputs.get('tf_pixel_values')
         gth = inputs.get('tf_grid_thw')
         kwargs = {'input_ids': input_ids, 'attention_mask': attn_mask}
         if pv is not None and gth is not None:
-            kwargs['pixel_values'] = pv.half().npu()
-            kwargs['image_grid_thw'] = gth.npu()
+            kwargs['pixel_values'] = ref.place(pv)
+            kwargs['image_grid_thw'] = gth.to(ref.device)
 
         with torch.no_grad():
             out = ref(use_cache=False, **kwargs).last_hidden_state.cpu().float()
@@ -179,7 +179,7 @@ def run_tf_phase(model_dir: str, inputs_all):
         # Capture deepstack features for image cases
         if pv is not None:
             with torch.no_grad():
-                vis_out = ref.visual(pv.half().npu(), grid_thw=gth.npu())
+                vis_out = ref.visual(ref.place(pv), grid_thw=gth.to(ref.device))
                 if vis_out[1] and len(vis_out[1]) > 0:
                     tf_ds_feats[name] = [d.cpu().float() for d in vis_out[1]]
                     print(f"[TF]  {name:<12} captured {len(tf_ds_feats[name])} "

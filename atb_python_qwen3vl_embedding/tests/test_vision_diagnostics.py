@@ -133,7 +133,7 @@ def test_vision_only(proc, engine, model_dir):
         # ── TF vision forward ──
         # Qwen3VLVisionModel.forward(pixel_values, grid_thw=...)
         with torch.no_grad():
-            vis_tf_out = ref.visual(pv_tf.half().npu(), grid_thw=gth_tf.npu())
+            vis_tf_out = ref.visual(ref.place(pv_tf), grid_thw=gth_tf.to(ref.device))
             # vis_tf_out = (hidden_states, deepstack_feature_lists)
             vis_tf = vis_tf_out[0].cpu().float()  # merged vision embeds
             ds_tf = [d.cpu().float() for d in vis_tf_out[1]] if vis_tf_out[1] else []
@@ -184,7 +184,7 @@ def test_text_with_tf_vision(proc, engine, model_dir):
 
     # ── TF vision → image_embeds + deepstack (on NPU, fp16) ──
     with torch.no_grad():
-        vis_tf_out = ref.visual(pv_tf.half().npu(), grid_thw=gth_tf.npu())
+        vis_tf_out = ref.visual(ref.place(pv_tf), grid_thw=gth_tf.to(ref.device))
         # vis_tf_out[0] = merged hidden_states (N_vis, hidden_size)
         # vis_tf_out[1] = deepstack_feature_lists (list of tensors)
         vis_tf_npu = vis_tf_out[0].half().npu()   # image_embeds for injection
@@ -194,7 +194,7 @@ def test_text_with_tf_vision(proc, engine, model_dir):
 
     # ── Build TF inputs_embeds using TF embed weights (masked_scatter) ──
     with torch.no_grad():
-        ie_tf = ref.get_input_embeddings()(input_ids.npu()).half()
+        ie_tf = ref.get_input_embeddings()(input_ids.to(ref.device)).to(ref.dtype)
         image_embeds_cat = torch.cat([vis_tf_npu], dim=0).to(ie_tf.device, ie_tf.dtype)
         tok_emb = ref.get_input_embeddings()(
             torch.tensor(engine.img_tok, dtype=torch.long, device=ie_tf.device))
@@ -221,13 +221,13 @@ def test_text_with_tf_vision(proc, engine, model_dir):
         ds_tf_npu if ds_tf_npu else None).cpu().float()
 
     # TF language_model with same inputs (apples-to-apples comparison)
-    vis_pos_masks = vis_mask.unsqueeze(0).npu()  # (1, S) bool on NPU
+    vis_pos_masks = vis_mask.unsqueeze(0).to(ref.device)  # (1, S) bool
     with torch.no_grad():
         tf_out = ref.language_model(
             inputs_embeds=ie_tf,
-            position_ids=pid.npu(),
+            position_ids=pid.to(ref.device),
             visual_pos_masks=vis_pos_masks if ds_tf_npu else None,
-            deepstack_visual_embeds=ds_tf_npu if ds_tf_npu else None,
+            deepstack_visual_embeds=[d.to(ref.device, ref.dtype) for d in ds_tf_npu] if ds_tf_npu else None,
         ).last_hidden_state.cpu().float()
 
     cs = cosine(atb_out, tf_out)
@@ -268,13 +268,13 @@ def test_e2e_with_tf_preprocess(proc, engine, model_dir):
 
         # ── TF vision → image_embeds + deepstack ──
         with torch.no_grad():
-            vis_tf_out = ref.visual(pv_tf.half().npu(), grid_thw=gth_tf.npu())
+            vis_tf_out = ref.visual(ref.place(pv_tf), grid_thw=gth_tf.to(ref.device))
             vis_tf_npu = vis_tf_out[0].half().npu()
             ds_tf_npu = [d.half().npu() for d in vis_tf_out[1]] if vis_tf_out[1] else []
 
         # ── Build TF inputs_embeds with TF vision embeds injected ──
         with torch.no_grad():
-            ie_tf = ref.get_input_embeddings()(input_ids.npu()).half()
+            ie_tf = ref.get_input_embeddings()(input_ids.to(ref.device)).to(ref.dtype)
             image_embeds_cat = torch.cat([vis_tf_npu], dim=0).to(ie_tf.device, ie_tf.dtype)
             tok_emb = ref.get_input_embeddings()(
                 torch.tensor(engine.img_tok, dtype=torch.long, device=ie_tf.device))
@@ -301,13 +301,13 @@ def test_e2e_with_tf_preprocess(proc, engine, model_dir):
             ds_tf_npu if ds_tf_npu else None).cpu().float()
 
         # TF language_model with same inputs
-        vis_pos_masks = vis_mask.unsqueeze(0).npu()
+        vis_pos_masks = vis_mask.unsqueeze(0).to(ref.device)
         with torch.no_grad():
             tf_out = ref.language_model(
                 inputs_embeds=ie_tf,
-                position_ids=pid.npu(),
+                position_ids=pid.to(ref.device),
                 visual_pos_masks=vis_pos_masks if ds_tf_npu else None,
-                deepstack_visual_embeds=ds_tf_npu if ds_tf_npu else None,
+                deepstack_visual_embeds=[d.to(ref.device, ref.dtype) for d in ds_tf_npu] if ds_tf_npu else None,
             ).last_hidden_state.cpu().float()
 
         cs = cosine(atb_out, tf_out)
