@@ -672,22 +672,27 @@ PR 提交，用户实测才发现输出丑陋 + 分辨率漂移
 | **M1** | `--mode compare` 三处追加 `ReportStages()` human 表格（text/io/mm） | ✅ 已完成 |
 | **M2** | `--mode bench` 分辨率对齐到新 4 分辨率 + 更新注释 | ✅ 已完成 |
 | **M3** | io 路径 `ReportStagesCompact`/`ReportStages` 的 seq_len 改用 `io_seq_len` | ✅ 已完成 |
-| **M4** | benchmark 单元测试 / 冒烟测试（见下） | 📋 待实施 |
+| **M4** | benchmark 冒烟测试（见下） | ✅ 已完成 |
+| **M5** | 分辨率提取为单一数据源 `kBenchmarkResolutions`（根因修复，防漂移） | ✅ 已完成 |
+| **M6** | 统一 text/io/mm 独立 mode 输出（同时 human 表格 + 机器行，对齐 compare） | ✅ 已完成 |
 
-#### M4: benchmark 应增加单元测试
+#### M4: benchmark 冒烟测试（已实施）
 
-**结论：应该。** benchmark 作为对外工具（用户直接运行），不能只靠"编译通过"。至少需要：
+**结论：应该，已实施。** benchmark 作为对外工具（用户直接运行），不能只靠"编译通过"。
 
-1. **输出格式冒烟测试**：每个 mode（text/mm/io/all/compare/bench/cold/throughput）至少跑 1 次（最小 iter/warmup），验证：
-   - human-readable 表格存在（含表头）
-   - 机器行（`BENCH_RESULT`/`BENCH_COLD`/`BENCH_TPUT`/`BENCH_CHECK`）格式正确、字段无缺失
-   - 退出码正确
-2. **分辨率一致性断言**：解析 `--mode bench` 和 `--mode compare` 的输出，断言两者分辨率集合相同（防止配置漂移复发）
-3. **seq_len 语义校验**：解析 io 路径 `S=` 字段，断言 ≥ vis_tokens（chat-template 包裹后序列只会更长，不会更短）
+**实现**：新增 `atb_cpp_llm/tests/test_benchmark_modes.cpp`（doctest 风格，popen 调 `./benchmark --mode text --iter 1 --warmup 0 2>&1`，解析合并输出断言）：
+- 机器行 `BENCH_RESULT:` 存在 + 字段齐全（mode/resolution/S/vis/e2e_mean）
+- human-readable 表格存在（Stage/Preprocess/E2E 表头）
+- 注册到 CTest，LABELS `level4_e2e;needs_npu`，RESOURCE_LOCK `npu_e2e`，ENVIRONMENT 传 `LOG_LEVEL=1`（ReportStages 走 LOG_INFO 默认静音）+ `ASCEND_PLATFORM` + `QWEN3VL_EMB_MODEL_DIR`
+- 实测 PASS（42.66s，含模型加载）
 
-**实现位置建议**：新增 `atb_cpp_llm/tests/test_benchmark_modes.cpp`（doctest 风格，调用 benchmark 子进程解析输出），注册到 CTest。由于 benchmark 需要 NPU + 模型权重，应打 `needs_npu` + `needs_refdata` 标签，非 NPU 环境跳过。
+**配套根因修复（M5/M6）**：
+- **M5**：分辨率提取为文件级单一数据源 `kBenchmarkResolutions[]`，`--mode bench` 和 `RunCompareMode()` 共用，从根本上消除漂移（比测试断言更彻底）
+- **M6**：统一 text/io/mm 独立 mode 输出策略 —— 移除 `if(cmp_mode) {Compact} else {Stages}` 互斥，改为**总是同时输出** human 表格 + 机器行（对齐 RunCompareMode 的 §9.8 修复）。cmp_mode 现仅控制 .bin 保存和 verbose 标题，不再耦合输出格式。这使单次 `--mode text` 运行即可同时验证两种格式，冒烟测试无需跑两次子进程
 
-**与现有 build_and_test.sh 的关系**：`build_and_test.sh` 已能构建 benchmark；冒烟测试应作为独立 CTest 目标，在 `--mode all` 等全量测试之外可选运行（`benchmark --iter 1 --warmup 0` 快速冒烟）。
+**为何只测 text mode**：所有 mode 共享 `ReportStages`/`ReportStagesCompact` 函数，验证 text 的输出格式即间接守住所有 mode 的格式正确性。text mode 最快（无 vision preprocess），适合纳入全量 CTest（+42s，纳入 level4_e2e + npu_e2e 串行锁，不增 HBM 风险）。compare/bench/all/cold/throughput 因需完整 NPU 推理且耗时，不纳入常规冒烟，靠 M5（单一数据源）+ 代码审查守卫。
+
+**仍待加强（未来可选）**：分辨率一致性目前靠 M5 单一数据源根治，未做运行时断言；seq_len 语义（io `S=` ≥ vis_tokens）靠 M3 已修复，未加运行时断言。如需更强守卫，可扩展测试跑 io mode 验证，但会增耗时。
 
 #### 架构师教训（强化 §9.7）
 
@@ -986,4 +991,5 @@ BENCH_TPUT: mode=mm requests=143 total_tokens=407264 tps=20363 avg_ms=139.2
 | 2026-06-18 | **第 4 批启动 — B5**：实现 Python benchmark 性能回归检测（`save_baseline`/`check_regression` + `BENCH_CHECK` 机器行 + `--save-baseline`/`--check-regression`/`--regression-threshold` CLI），2 轮 Review（首轮 8 问题→全部修复，复审通过）|
 | 2026-06-18 | **第 4 批 — Python P1 HIGH**：12 项 HIGH 严重度 P1 修复（engine.py 6 项 + engine_utils.py 3 项 + utils.py 1 项 + preprocess.py 2 项），engine.py 1 轮 Review + 1 个修复，其余 1 轮通过。剩余 23 项 MEDIUM 待处理 |
 | 2026-06-18 | 🔴 **用户实测发现 benchmark 两问题（PR 提交后）**：① `--mode compare` 只输出 `BENCH_RESULT` 机器行无 human-readable 表格；② `--mode bench` 用老 4 分辨率（224/416/672/896）与文档/compare 模式不一致。修复：compare 三处追加 `ReportStages()` human 表格；bench 分辨率对齐到新 4 分辨率；附带修复 io 路径 `vis_tokens` 误作 seq_len 的预存 bug（改用 `io_seq_len`）。详见 §9.8 经验总结 |
+| 2026-06-18 | **M4/M5/M6 完成（benchmark 测试 + 根因修复）**：新增 `test_benchmark_modes.cpp` 冒烟测试（doctest，popen 调 `--mode text` 验证机器行+human表格，实测 PASS 42.66s）；分辨率提取为单一数据源 `kBenchmarkResolutions`（M5，根治漂移）；统一 text/io/mm 独立 mode 输出策略为同时 human+机器行（M6，对齐 compare，消除 cmp_mode 对输出格式的耦合）。注册 CTest，LABELS `level4_e2e;needs_npu`，RESOURCE_LOCK `npu_e2e`，ENVIRONMENT `LOG_LEVEL=1` |
 

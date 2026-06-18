@@ -42,6 +42,18 @@
 #include <tuple>
 #include <functional>
 
+// Shared resolution set — single source of truth used by both --mode bench
+// and RunCompareMode(). Modify here only; do NOT duplicate.
+// Matches Python benchmark.py default --resolutions.
+static const struct { int w; int h; } kBenchmarkResolutions[] = {
+    {416, 672},
+    {720, 1280},
+    {1080, 1920},
+    {1440, 2560},
+};
+static constexpr int kNumBenchmarkResolutions =
+    static_cast<int>(sizeof(kBenchmarkResolutions) / sizeof(kBenchmarkResolutions[0]));
+
 // ── Statistics helper ────────────────────────────────────────
 struct Stats {
     double mean = 0, median = 0, min_val = 0, max_val = 0, stddev = 0;
@@ -459,11 +471,11 @@ int RunTextBenchmark(atb_llm::LLMEngine* engine,
     for (auto& r : results) e2e_times.push_back(r.e2e_ms);
     Stats e2e_stats = ComputeStats(e2e_times);
 
-    if (cmp_mode) {
-        ReportStagesCompact(results, "text", "N/A", seq_len, 0, e2e_stats);
-    } else {
-        ReportStages(results, "text-only", seq_len, 0, e2e_stats);
-    }
+    // Always emit both formats (machine line + human table), matching
+    // RunCompareMode. cmp_mode no longer gates output format — it only
+    // controls .bin saving and the verbose LOG_INFO headers above.
+    ReportStagesCompact(results, "text", "N/A", seq_len, 0, e2e_stats);
+    ReportStages(results, "text-only", seq_len, 0, e2e_stats);
 
     // B4: Throughput benchmark (after warmup+hot iterations, engine is warm)
     if (throughput) {
@@ -581,17 +593,16 @@ int RunMultimodalBenchmark(atb_llm::LLMEngine* engine,
     for (auto& r : results) e2e_times.push_back(r.e2e_ms);
     Stats e2e_stats = ComputeStats(e2e_times);
 
-    if (cmp_mode) {
-        ReportStagesCompact(results, "mm", resolution,
-                            static_cast<int>(seq_len),
-                            static_cast<int>(vis_tokens), e2e_stats, pre_ms);
-    } else {
-        char label[64];
-        std::snprintf(label, sizeof(label), "%dx%d", img_w, img_h);
-        ReportStages(results, label,
-                     static_cast<int>(seq_len),
-                     static_cast<int>(vis_tokens), e2e_stats, pre_ms);
-    }
+    // Always emit both formats (machine line + human table), matching
+    // RunCompareMode. cmp_mode only gates .bin saving and verbose headers.
+    ReportStagesCompact(results, "mm", resolution,
+                        static_cast<int>(seq_len),
+                        static_cast<int>(vis_tokens), e2e_stats, pre_ms);
+    char label[64];
+    std::snprintf(label, sizeof(label), "%dx%d", img_w, img_h);
+    ReportStages(results, label,
+                 static_cast<int>(seq_len),
+                 static_cast<int>(vis_tokens), e2e_stats, pre_ms);
 
     // B4: Throughput benchmark (after warmup+hot iterations, engine is warm)
     if (throughput) {
@@ -714,17 +725,16 @@ int RunImageOnlyBenchmark(atb_llm::LLMEngine* engine,
     for (auto& r : results) e2e_times.push_back(r.e2e_ms);
     Stats e2e_stats = ComputeStats(e2e_times);
 
-    if (cmp_mode) {
-        ReportStagesCompact(results, "io", resolution,
-                            static_cast<int>(seq_len),
-                            static_cast<int>(vis_tokens), e2e_stats, pre_ms);
-    } else {
-        char label[64];
-        std::snprintf(label, sizeof(label), "image-only %dx%d", img_w, img_h);
-        ReportStages(results, label,
-                     static_cast<int>(seq_len),
-                     static_cast<int>(vis_tokens), e2e_stats, pre_ms);
-    }
+    // Always emit both formats (machine line + human table), matching
+    // RunCompareMode. cmp_mode only gates .bin saving and verbose headers.
+    ReportStagesCompact(results, "io", resolution,
+                        static_cast<int>(seq_len),
+                        static_cast<int>(vis_tokens), e2e_stats, pre_ms);
+    char label[64];
+    std::snprintf(label, sizeof(label), "image-only %dx%d", img_w, img_h);
+    ReportStages(results, label,
+                 static_cast<int>(seq_len),
+                 static_cast<int>(vis_tokens), e2e_stats, pre_ms);
 
     // B4: Throughput benchmark (after warmup+hot iterations, engine is warm)
     if (throughput) {
@@ -756,15 +766,6 @@ int RunCompareMode(atb_llm::LLMEngine* engine,
     static constexpr int64_t TOK_IMAGE    = 2168;
     static constexpr int64_t TOK_DOT      = 13;
     int64_t image_token_id = config.image_token_id;
-
-    // 4 resolutions (matching Python benchmark.py)
-    struct { int w; int h; } resolutions[] = {
-        {416, 672},
-        {720, 1280},
-        {1080, 1920},
-        {1440, 2560},
-    };
-    int num_res = static_cast<int>(sizeof(resolutions) / sizeof(resolutions[0]));
 
     LOG_INFO("============================================================");
     LOG_INFO("  Compare Mode — 13 combinations (5x TEXT + 4x IO + 4x MM)");
@@ -833,9 +834,9 @@ int RunCompareMode(atb_llm::LLMEngine* engine,
     }
 
     // ── 2. IMAGE_ONLY and IMAGE_AND_TEXT for each resolution ─────
-    for (int i = 0; i < num_res && ret == 0; i++) {
-        int img_w = resolutions[i].w;
-        int img_h = resolutions[i].h;
+    for (int i = 0; i < kNumBenchmarkResolutions && ret == 0; i++) {
+        int img_w = kBenchmarkResolutions[i].w;
+        int img_h = kBenchmarkResolutions[i].h;
 
         LOG_INFO("============================================================");
         LOG_INFO("  Resolution %dx%d", img_w, img_h);
@@ -1028,10 +1029,10 @@ int RunCompareMode(atb_llm::LLMEngine* engine,
         LOG_INFO("    /tmp/cpp_text_only_1024.bin");
         LOG_INFO("    /tmp/cpp_text_only_2048.bin");
         LOG_INFO("    /tmp/cpp_text_only_4096.bin");
-        for (int i = 0; i < num_res; i++) {
-            LOG_INFO("    /tmp/cpp_pv_%dx%d.bin", resolutions[i].w, resolutions[i].h);
-            LOG_INFO("    /tmp/cpp_io_%dx%d.bin", resolutions[i].w, resolutions[i].h);
-            LOG_INFO("    /tmp/cpp_mm_%dx%d.bin", resolutions[i].w, resolutions[i].h);
+        for (int i = 0; i < kNumBenchmarkResolutions; i++) {
+            LOG_INFO("    /tmp/cpp_pv_%dx%d.bin", kBenchmarkResolutions[i].w, kBenchmarkResolutions[i].h);
+            LOG_INFO("    /tmp/cpp_io_%dx%d.bin", kBenchmarkResolutions[i].w, kBenchmarkResolutions[i].h);
+            LOG_INFO("    /tmp/cpp_mm_%dx%d.bin", kBenchmarkResolutions[i].w, kBenchmarkResolutions[i].h);
         }
         LOG_INFO("============================================================");
     }
@@ -1256,19 +1257,12 @@ int main(int argc, char** argv) {
 
         ReportColdStart(cold_results);
     } else if (mode == "bench") {
-        struct { int w, h; } resolutions[] = {
-            {416, 672},
-            {720, 1280},
-            {1080, 1920},
-            {1440, 2560},
-        };
-        int num_res = static_cast<int>(sizeof(resolutions) / sizeof(resolutions[0]));
-        for (int i = 0; i < num_res; i++) {
+        for (int i = 0; i < kNumBenchmarkResolutions; i++) {
             if (!cmp_mode && i > 0) {
                 LOG_INFO("============================================================");
             }
             ret = RunImageOnlyBenchmark(engine.get(), model_dir,
-                                         resolutions[i].w, resolutions[i].h,
+                                         kBenchmarkResolutions[i].w, kBenchmarkResolutions[i].h,
                                          num_warmup, num_iter, cmp_mode);
             if (ret != 0) break;
         }

@@ -300,6 +300,45 @@ add_test(NAME test_io_adapters COMMAND test_io_adapters)
 # Match the label scheme used by add_atb_test() above.
 set_tests_properties(test_io_adapters PROPERTIES LABELS "level0_framework")
 
+# Benchmark mode smoke test (doctest, needs NPU + full model).
+# Spawns the benchmark binary, runs --mode text, parses output to verify
+# BENCH_RESULT machine lines + human-readable stage table both present.
+# Prevents regression of §9.8 (benchmark output quality never validated).
+add_executable(test_benchmark_modes tests/test_benchmark_modes.cpp)
+target_include_directories(test_benchmark_modes
+    PRIVATE
+        src
+        tests
+)
+target_compile_options(test_benchmark_modes PRIVATE
+    -Wno-unused-result
+    -Wno-unused-parameter
+    -Wno-sign-compare
+    -Wno-unused-function
+)
+target_link_directories(test_benchmark_modes
+    PRIVATE
+        ${ATB_DIR}/lib
+        ${ASCEND_TOOLKIT_DIR}/lib64
+)
+target_link_libraries(test_benchmark_modes PRIVATE atb_llm_engine atb ascendcl)
+add_test(NAME test_benchmark_modes COMMAND test_benchmark_modes)
+set_tests_properties(test_benchmark_modes PROPERTIES LABELS "level4_e2e;needs_npu")
+# Propagate env vars (ASCEND_PLATFORM, model dir) to the test subprocess
+# so the spawned benchmark can locate the model checkpoint — mirrors the
+# ENVIRONMENT logic inside add_atb_test() above.
+# LOG_LEVEL=1 forces INFO output so the human-readable ReportStages table
+# (emitted via LOG_INFO, otherwise muted at the default WARN level) is
+# captured and asserted by the test.
+set(_bm_env "LOG_LEVEL=1")
+if(DEFINED ENV{ASCEND_PLATFORM})
+    list(APPEND _bm_env "ASCEND_PLATFORM=$ENV{ASCEND_PLATFORM}")
+endif()
+if(DEFINED ENV{QWEN3VL_EMB_MODEL_DIR})
+    list(APPEND _bm_env "QWEN3VL_EMB_MODEL_DIR=$ENV{QWEN3VL_EMB_MODEL_DIR}")
+endif()
+set_tests_properties(test_benchmark_modes PROPERTIES ENVIRONMENT "${_bm_env}")
+
 # Benchmarks (not registered as CTest tests)
 add_atb_test(benchmark                 tests/benchmark.cpp)  # stays at tests/ root
 
@@ -319,6 +358,7 @@ set_tests_properties(
     test_forward_error_paths
     test_sync_safety
     test_vision_stages
+    test_benchmark_modes
     PROPERTIES RESOURCE_LOCK "npu_e2e"
 )
 
