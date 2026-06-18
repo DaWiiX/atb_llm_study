@@ -633,6 +633,68 @@ inline std::string GetModelDir() {
 5. **测试要求**：需要运行的具体测试命令
 6. **上报路径**：遇到不明确的情况 → 汇报给 architect，不要自己猜测
 
+### 9.8 ⚠️ Benchmark compare/bench 模式问题：未注册二进制缺少冒烟测试（2026-06-18）
+
+**事件描述**：PR 提交后，用户在 NPU 上实际运行 `./benchmark --mode compare` 和 `--mode bench` 发现两个问题：
+
+1. **`--mode compare` 输出非 human-readable**：只有 `BENCH_RESULT:` 机器行，无给人看的表格。`RunCompareMode()` 内部对 text/io/mm 全程调用 `ReportStagesCompact()`（机器行），从不调用 `ReportStages()`（human 表格）。
+2. **`--mode bench` 用老 4 分辨率**：硬编码 `{224,224},{416,672},{672,416},{896,896}`，与 `RunCompareMode` 的 `{416,672},{720,1280},{1080,1920},{1440,2560}` 不一致，也与文件顶部注释声明的"4 fixed resolutions"含义脱节。
+3. **附带发现 io 路径预存 bug**：`ReportStagesCompact` 的 seq_len 参数误用 `vis_tokens` 而非真实 `io_seq_len`，导致 `S=` 列低估序列长度。
+
+#### 为什么没有第一时间发现
+
+| 盲区 | 具体表现 | 严重度 |
+|------|----------|--------|
+| **benchmark 不在 CTest 中（§9.6 已知但未闭环）** | R1 修复仅让 benchmark 不被 CTest 误注册，但 benchmark 二进制仍**没有任何自动化测试**。所有 mode 的实际输出从未被验证过 | 🔴 严重 |
+| **静态审查无法发现"输出丑陋"** | 代码语法、参数传递都对，reviewer 不会主动运行 `--mode compare` 看输出长什么样。可读性是主观的、运行时才暴露 | 🔴 严重 |
+| **B6/B7 改动未触发回归验证** | B6 改了 `ReportStagesCompact`/`ReportStages` 签名，B7 改了 `compare_py_cpp.py`。两者都只做语法/编译验证，没在 NPU 上跑 `--mode compare` 确认输出符合预期 | 🟡 中等 |
+| **分辨率不一致是配置漂移** | `--mode bench` 和 `RunCompareMode` 各自硬编码 resolutions 数组，无单一数据源（single source of truth），时间久了必然漂移 | 🟡 中等 |
+| **编译通过 ≠ 功能正确** | developer 和 reviewer 都以"编译通过"为验收，但编译只验证语法，不验证输出语义 | 🔴 严重 |
+
+#### 根因总结
+
+```
+benchmark 二进制从未被任何自动化测试覆盖
+        ↓
+所有 mode 的输出从未被实际运行验证
+        ↓
+B6/B7 改动仅做编译验证就标记"完成"
+        ↓
+PR 提交，用户实测才发现输出丑陋 + 分辨率漂移
+```
+
+这是 §9.6 事件的**同型复发**：§9.6 是 benchmark 不在 CTest 导致静默崩溃未被发；本次是 benchmark 不在 CTest 导致输出质量问题未被发现。**核心教训未真正闭环 —— §9.6 加了 §9.7 工作流 v2，但 v2 的"复现优先"原则只用于修 bug，没有用于"提交前冒烟测试所有 mode"。**
+
+#### 修正措施
+
+| # | 措施 | 状态 |
+|---|------|------|
+| **M1** | `--mode compare` 三处追加 `ReportStages()` human 表格（text/io/mm） | ✅ 已完成 |
+| **M2** | `--mode bench` 分辨率对齐到新 4 分辨率 + 更新注释 | ✅ 已完成 |
+| **M3** | io 路径 `ReportStagesCompact`/`ReportStages` 的 seq_len 改用 `io_seq_len` | ✅ 已完成 |
+| **M4** | benchmark 单元测试 / 冒烟测试（见下） | 📋 待实施 |
+
+#### M4: benchmark 应增加单元测试
+
+**结论：应该。** benchmark 作为对外工具（用户直接运行），不能只靠"编译通过"。至少需要：
+
+1. **输出格式冒烟测试**：每个 mode（text/mm/io/all/compare/bench/cold/throughput）至少跑 1 次（最小 iter/warmup），验证：
+   - human-readable 表格存在（含表头）
+   - 机器行（`BENCH_RESULT`/`BENCH_COLD`/`BENCH_TPUT`/`BENCH_CHECK`）格式正确、字段无缺失
+   - 退出码正确
+2. **分辨率一致性断言**：解析 `--mode bench` 和 `--mode compare` 的输出，断言两者分辨率集合相同（防止配置漂移复发）
+3. **seq_len 语义校验**：解析 io 路径 `S=` 字段，断言 ≥ vis_tokens（chat-template 包裹后序列只会更长，不会更短）
+
+**实现位置建议**：新增 `atb_cpp_llm/tests/test_benchmark_modes.cpp`（doctest 风格，调用 benchmark 子进程解析输出），注册到 CTest。由于 benchmark 需要 NPU + 模型权重，应打 `needs_npu` + `needs_refdata` 标签，非 NPU 环境跳过。
+
+**与现有 build_and_test.sh 的关系**：`build_and_test.sh` 已能构建 benchmark；冒烟测试应作为独立 CTest 目标，在 `--mode all` 等全量测试之外可选运行（`benchmark --iter 1 --warmup 0` 快速冒烟）。
+
+#### 架构师教训（强化 §9.7）
+
+> **"编译通过"永远不是验收标准。** 对任何对外可执行的二进制/脚本，提交前必须在真实环境运行每个 mode/flag 组合至少一次，人工确认输出符合预期。静态审查 + 编译验证只覆盖语法层，输出质量（可读性、数值正确性、配置一致性）必须运行时验证。
+>
+> **同型 bug 复发说明教训未闭环。** §9.6 发现"benchmark 不在 CTest"，§9.7 加了工作流，但只用于"修 bug 时复现"，没扩展到"提交前冒烟所有 mode"。教训必须泛化为通用规则，而非针对单次事件。
+
 ---
 
 ## 10. 预防措施：如何避免类似问题
@@ -651,6 +713,9 @@ inline std::string GetModelDir() {
 | **🆕 环境配置隐式依赖** | `is_310p()` 正确性依赖 `.env`，错误配置导致静默 fallback 和运行时失败 | 高 |
 | **🆕 知识孤岛** | `refactoring-plan.md` 记录的已知问题未纳入 `test-fix-plan.md` 可操作项 | 高 |
 | **🆕 多模式测试覆盖不完整** | benchmark 4 种 mode × 多种选项，仅默认路径被测试覆盖 | 中 |
+| **🆕 编译通过=完成谬误** | B6/B7 仅编译验证就标记完成，未运行 benchmark 验证输出质量 | 高 |
+| **🆕 配置漂移（无单一数据源）** | `--mode bench` 与 `RunCompareMode` 各自硬编码 resolutions，时间久了漂移 | 中 |
+| **🆕 同型 bug 复发** | §9.6（benchmark 不在 CTest）教训未闭环，§9.8 同型问题再现 | 高 |
 
 ### 10.2 预防机制
 
@@ -737,6 +802,14 @@ inline std::string GetModelDir() {
 - [ ] 是否已检查相关二进制是否被自动化测试覆盖
 - **教训来源**: 本次事件 — 架构师直接分析代码而跳过复现，导致第三个根因（`std::abort()`）完全遗漏，需用户提供额外信息才发现
 
+**13. 🆕 提交前冒烟测试所有 mode（§9.8 新增）**：
+- [ ] 对外可执行的二进制/脚本，提交前是否在真实环境运行了**每个 mode/flag 组合至少一次**？
+- [ ] 是否**人工确认输出符合预期**（不只看退出码，还要看输出可读性、数值合理性、配置一致性）？
+- [ ] 是否有**单一数据源**防止配置漂移（如 resolutions 不在多处硬编码）？
+- [ ] "编译通过"**不是**验收标准 —— 它只验证语法，不验证输出质量
+- **教训来源**: §9.8 — B6/B7 改了 `ReportStages*` 签名和 compare_py_cpp，仅编译验证就标记完成；用户实测发现 compare 输出无 human 表格、bench 用老分辨率。与 §9.6 同型（benchmark 不在 CTest），教训未闭环
+
+
 ### 10.3 与现有 CLUADE.md 测试精度原则的关系
 
 本项目 CLAUDE.md 已规定：
@@ -753,11 +826,12 @@ inline std::string GetModelDir() {
 | 维度 | 已完成 | 进行中 | 待开始 |
 |------|--------|--------|--------|
 | C++ 端鲁棒性 | G1, G2, G3 ✅ | — | — |
-| Benchmark 增强 | B1, B2, B3, B4 ✅ | — | B5-B7 |
+| Benchmark 增强 | B1, B2, B3, B4, B5, B6, B7 ✅ | — | — |
 | Python 端 P0 | P0-1, P0-2, P0-3, P0-4 ✅ | — | — |
 | Benchmark 紧急修复 | F1, F2, F3 ✅ | — | — |
-| 🧪 测试基础设施优化 | R1, R2, P0-1(并行化), P0-2(自动排除) ✅ | — | — |
-| Python 端 P1/P2 | — | — | 48 项 |
+| 🧪 测试基础设施优化 | R1, R2, 并行化, 自动排除 ✅ | — | — |
+| Python 端 P1 | 12 项 HIGH ✅ | — | 23 项 MEDIUM |
+| Python 端 P2 | — | — | 20 项 |
 | ⚠️ 运行时验证 | ✅ 已完成（全量 PASS） | — | — |
 
 ### 11.2 第 2 批完成清单
@@ -893,8 +967,6 @@ BENCH_TPUT: mode=mm requests=143 total_tokens=407264 tps=20363 avg_ms=139.2
 
 每完成 4 项目标后进行状态汇报和 plan 更新。
 
-每完成 4 项目标后进行状态汇报和 plan 更新。
-
 ---
 
 ## 12. 修订记录
@@ -913,3 +985,5 @@ BENCH_TPUT: mode=mm requests=143 total_tokens=407264 tps=20363 avg_ms=139.2
 | 2026-06-18 | **B7 完成**：`compare_py_cpp.py` 删除 3 个硬编码 timing dict，简化为纯 cosine 对比表，2 轮 Review（首轮 2 问题→修复，复审通过）|
 | 2026-06-18 | **第 4 批启动 — B5**：实现 Python benchmark 性能回归检测（`save_baseline`/`check_regression` + `BENCH_CHECK` 机器行 + `--save-baseline`/`--check-regression`/`--regression-threshold` CLI），2 轮 Review（首轮 8 问题→全部修复，复审通过）|
 | 2026-06-18 | **第 4 批 — Python P1 HIGH**：12 项 HIGH 严重度 P1 修复（engine.py 6 项 + engine_utils.py 3 项 + utils.py 1 项 + preprocess.py 2 项），engine.py 1 轮 Review + 1 个修复，其余 1 轮通过。剩余 23 项 MEDIUM 待处理 |
+| 2026-06-18 | 🔴 **用户实测发现 benchmark 两问题（PR 提交后）**：① `--mode compare` 只输出 `BENCH_RESULT` 机器行无 human-readable 表格；② `--mode bench` 用老 4 分辨率（224/416/672/896）与文档/compare 模式不一致。修复：compare 三处追加 `ReportStages()` human 表格；bench 分辨率对齐到新 4 分辨率；附带修复 io 路径 `vis_tokens` 误作 seq_len 的预存 bug（改用 `io_seq_len`）。详见 §9.8 经验总结 |
+

@@ -10,7 +10,7 @@
  *   --mode mm      : multimodal benchmark (image + text)
  *   --mode io      : image-only benchmark (no text tokens)
  *   --mode all     : run all three modes (default)
- *   --mode bench   : run image-only at 4 fixed resolutions (224x224, 416x672, 672x416, 896x896)
+ *   --mode bench   : run image-only at 4 fixed resolutions (416x672, 720x1280, 1080x1920, 1440x2560)
  *   --mode compare : run full test matrix: TEXT_ONLY + IMAGE_ONLY x4 + IMAGE_AND_TEXT x4
  *                    saves pooler output .bin for each combination
  *   --iter N      : benchmark iterations (default: 5)
@@ -824,6 +824,11 @@ int RunCompareMode(atb_llm::LLMEngine* engine,
             Stats e2e_stats = ComputeStats(e2e_times);
             ReportStagesCompact(results, "text", "N/A",
                                 static_cast<int>(actual_seq), 0, e2e_stats);
+            char label[64];
+            std::snprintf(label, sizeof(label),
+                          "TEXT_ONLY S=%ld", static_cast<long>(actual_seq));
+            ReportStages(results, label,
+                         static_cast<int>(actual_seq), 0, e2e_stats);
         }
     }
 
@@ -932,8 +937,14 @@ int RunCompareMode(atb_llm::LLMEngine* engine,
             for (auto& r : results) e2e_times.push_back(r.e2e_ms);
             Stats e2e_stats = ComputeStats(e2e_times);
             ReportStagesCompact(results, "io", resolution_str,
-                                static_cast<int>(vis_tokens),
+                                static_cast<int>(io_seq_len),
                                 static_cast<int>(vis_tokens), e2e_stats, pre_ms);
+            char label[64];
+            std::snprintf(label, sizeof(label),
+                          "IMAGE_ONLY %s", resolution_str);
+            ReportStages(results, label,
+                         static_cast<int>(io_seq_len),
+                         static_cast<int>(vis_tokens), e2e_stats, pre_ms);
         }
 
         // ── IMAGE_AND_TEXT ────────────────────────────────────────
@@ -1000,6 +1011,12 @@ int RunCompareMode(atb_llm::LLMEngine* engine,
             ReportStagesCompact(results, "mm", resolution_str,
                                 static_cast<int>(seq_len),
                                 static_cast<int>(vis_tokens), e2e_stats, pre_ms);
+            char label[64];
+            std::snprintf(label, sizeof(label),
+                          "MM %s", resolution_str);
+            ReportStages(results, label,
+                         static_cast<int>(seq_len),
+                         static_cast<int>(vis_tokens), e2e_stats, pre_ms);
         }
     }
 
@@ -1240,10 +1257,10 @@ int main(int argc, char** argv) {
         ReportColdStart(cold_results);
     } else if (mode == "bench") {
         struct { int w, h; } resolutions[] = {
-            {224, 224},
             {416, 672},
-            {672, 416},
-            {896, 896},
+            {720, 1280},
+            {1080, 1920},
+            {1440, 2560},
         };
         int num_res = static_cast<int>(sizeof(resolutions) / sizeof(resolutions[0]));
         for (int i = 0; i < num_res; i++) {
