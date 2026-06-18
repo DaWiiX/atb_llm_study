@@ -90,7 +90,7 @@ def main():
 
     with torch.no_grad():
         # NOTE: grid_thw must stay as long (TF uses it as int for torch.linspace)
-        vis_tf_out = ref.visual(to_npu_half(pv_tf), grid_thw=gth_tf.npu())
+        vis_tf_out = ref.visual(ref.place(pv_tf), grid_thw=gth_tf.to(ref.device))
         vis_tf = to_cpu_float(vis_tf_out[0])           # TF output (CPU float)
         ds_tf = [to_cpu_float(d) for d in vis_tf_out[1]] if vis_tf_out[1] else []
 
@@ -107,8 +107,8 @@ def main():
     ie_atb = F.embedding(input_ids, engine.embed_w).half().npu()          # (1,S,hd) NPU
     ie_atb[0, vis_mask_1d.npu(), :] = to_npu_half(vis_atb)               # inject
 
-    # TF: all on NPU — replicate transformers Qwen3VLModel image-injection exactly
-    ie_tf = ref.get_input_embeddings()(input_ids.npu()).half()           # (1,S,hd) NPU
+    # TF: replicate transformers Qwen3VLModel image-injection exactly
+    ie_tf = ref.get_input_embeddings()(input_ids.to(ref.device)).to(ref.dtype)           # (1,S,hd)
     image_embeds_cat = torch.cat([vis_tf], dim=0).to(ie_tf.device, ie_tf.dtype)
     tok_emb = ref.get_input_embeddings()(
         torch.tensor(cfg.image_token_id, dtype=torch.long, device=ie_tf.device))
@@ -120,7 +120,7 @@ def main():
 
     # Compare injected vision tokens only
     atb_injected = ie_atb[0, vis_mask_1d.npu(), :].cpu()
-    tf_injected = ie_tf[0, vis_mask_1d.npu(), :].cpu()
+    tf_injected = ie_tf[0, vis_mask_1d.to(ref.device), :].cpu()
     trace("injected vision tokens only", atb_injected, tf_injected)
 
     # ── Step 4: Position IDs ──────────────────────────────────────
@@ -140,9 +140,9 @@ def main():
     sin_atb = atb_sin.reshape(-1, engine.hd_t)
 
     with torch.no_grad():
-        dummy = torch.zeros(1, S, engine.hidden_t, device='npu')
-        # tf_pid is on CPU → move to NPU for rotary_emb
-        tf_cos, tf_sin = ref.language_model.rotary_emb(dummy, tf_pid.float().npu())
+        dummy = torch.zeros(1, S, engine.hidden_t, device=ref.device, dtype=ref.dtype)
+        # tf_pid is on CPU → move to ref device for rotary_emb
+        tf_cos, tf_sin = ref.language_model.rotary_emb(dummy, tf_pid.float().to(ref.device))
     cos_tf = tf_cos.reshape(-1, engine.hd_t)
     sin_tf = tf_sin.reshape(-1, engine.hd_t)
 
@@ -158,15 +158,17 @@ def main():
         causal_mask_atb = make_causal_mask_nz_npu(S)
     else:
         causal_mask_atb = causal_mask
+    # TF attention mask follows ref's device/dtype (causal_mask itself is ATB-only, NPU).
+    causal_mask_tf = make_causal_mask(S).to(ref.device, ref.dtype).unsqueeze(0).unsqueeze(0)
 
     # Move everything to NPU for the loop
     hidden_atb = ie_atb                                                # already NPU
-    hidden_tf = ie_tf                                                  # already NPU
+    hidden_tf = ie_tf                                                  # on ref device
     cos_npu = to_npu_half(cos_atb)
     sin_npu = to_npu_half(sin_atb)
-    tf_cos_npu = tf_cos.half().npu()
-    tf_sin_npu = tf_sin.half().npu()
-    vis_mask_2d = vis_mask_1d.unsqueeze(0).npu()                     # (1,S) bool NPU
+    tf_cos_npu = tf_cos.to(ref.device, ref.dtype)
+    tf_sin_npu = tf_sin.to(ref.device, ref.dtype)
+    vis_mask_2d = vis_mask_1d.unsqueeze(0).to(ref.device)             # (1,S) bool
 
     ds_indexes = engine.ds_indexes
     print(f"  deepstack at layers: {ds_indexes}")
@@ -185,7 +187,7 @@ def main():
             hidden_tf = ref.language_model.layers[li](
                 hidden_tf,
                 position_embeddings=(tf_cos_npu, tf_sin_npu),
-                attention_mask=causal_mask.unsqueeze(0).unsqueeze(0).float())
+                attention_mask=causal_mask_tf)
 
         torch.npu.synchronize()
 
@@ -197,7 +199,7 @@ def main():
             hidden_atb[0, vis_mask_1d.npu(), :] = local_atb
 
             # TF: _deepstack_process
-            ds_npu_tf = to_npu_half(ds_tf[li])  # ds_tf[li] is CPU → NPU
+            ds_npu_tf = ds_tf[li].to(ref.device, ref.dtype)
             local_tf = hidden_tf[vis_mask_2d, :].clone() + ds_npu_tf
             hidden_tf[vis_mask_2d, :] = local_tf
 
@@ -225,9 +227,9 @@ def main():
     print("\n── Step 8: Sanity check — manual TF vs ref(...) full ──")
     with torch.no_grad():
         ref_full = ref(
-            input_ids=input_ids.npu(),
-            pixel_values=pv_tf.half().npu(),
-            image_grid_thw=gth_tf.npu(),
+            input_ids=input_ids.to(ref.device),
+            pixel_values=ref.place(pv_tf),
+            image_grid_thw=gth_tf.to(ref.device),
         ).last_hidden_state.cpu().float()
     trace("manual_TF vs ref_full", out_tf, ref_full)
     trace("ATB     vs ref_full",   out_atb, ref_full)
@@ -239,11 +241,11 @@ def main():
     print("\n── Step 9: Sub-bisect with ref.language_model(...) ──")
     with torch.no_grad():
         # Use TF-built ie_tf + manually computed tf_pid + deepstack list
-        ds_for_lm = [d.half().npu() for d in ds_tf] if ds_tf else None
+        ds_for_lm = [d.to(ref.device, ref.dtype) for d in ds_tf] if ds_tf else None
         vis_pos_masks_lm = vis_mask_2d if ds_for_lm else None
         sub_out = ref.language_model(
             inputs_embeds=ie_tf,
-            position_ids=tf_pid.npu(),
+            position_ids=tf_pid.to(ref.device),
             visual_pos_masks=vis_pos_masks_lm,
             deepstack_visual_embeds=ds_for_lm,
         ).last_hidden_state.cpu().float()
@@ -277,9 +279,9 @@ def main():
     ref.language_model.forward = spy_forward
     with torch.no_grad():
         spy_ref_full = ref(
-            input_ids=input_ids.npu(),
-            pixel_values=pv_tf.half().npu(),
-            image_grid_thw=gth_tf.npu(),
+            input_ids=input_ids.to(ref.device),
+            pixel_values=ref.place(pv_tf),
+            image_grid_thw=gth_tf.to(ref.device),
         ).last_hidden_state.cpu().float()
     ref.language_model.forward = real_lm_forward  # restore
 

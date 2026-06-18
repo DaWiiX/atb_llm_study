@@ -195,7 +195,7 @@ def test_deepstack_extraction(model_dir=None):
     # ── TF: run vision pipeline ──────────────────────────────────
     print("\n[TF] Running vision pipeline ...")
     with torch.no_grad():
-        vis_tf_out = ref.visual(pv_tf.half().npu(), grid_thw=gth_tf.npu())
+        vis_tf_out = ref.visual(ref.place(pv_tf), grid_thw=gth_tf.to(ref.device))
         ds_tf = [to_cpu_float(d) for d in vis_tf_out[1]] if vis_tf_out[1] else []
         for i, d in enumerate(ds_tf):
             print(f"  Deepstack[{ds_indexes[i]}] TF  shape: {tuple(d.shape)}")
@@ -284,7 +284,7 @@ def test_deepstack_injection(model_dir=None):
 
     # Get deepstack features from TF vision
     with torch.no_grad():
-        vis_tf_out = ref.visual(pv_tf.half().npu(), grid_thw=gth_tf.npu())
+        vis_tf_out = ref.visual(ref.place(pv_tf), grid_thw=gth_tf.to(ref.device))
         ds_tf = vis_tf_out[1] if vis_tf_out[1] else []
     print(f"  TF deepstack features: {len(ds_tf)}")
 
@@ -293,9 +293,9 @@ def test_deepstack_injection(model_dir=None):
 
     # Get TF vision merged output
     with torch.no_grad():
-        vis_tf_merged = vis_tf_out[0]  # NPU
+        vis_tf_merged = vis_tf_out[0]
         # Use TF's own image injection (same as pipeline_trace)
-        ie_tf = ref.get_input_embeddings()(input_ids.npu()).half()
+        ie_tf = ref.get_input_embeddings()(input_ids.to(ref.device)).to(ref.dtype)
         tok_emb = ref.get_input_embeddings()(
             torch.tensor(img_tok, dtype=torch.long, device=ie_tf.device))
         special_image_mask = (ie_tf == tok_emb)
@@ -323,11 +323,11 @@ def test_deepstack_injection(model_dir=None):
     sin_npu = to_npu_half(atb_sin.reshape(-1, hd_t))
 
     with torch.no_grad():
-        dummy = torch.zeros(1, S, hidden_t, device='npu')
+        dummy = torch.zeros(1, S, hidden_t, device=ref.device, dtype=ref.dtype)
         tf_pid, _ = ref.get_rope_index(input_ids, gth_tf, None, None)
-        tf_cos, tf_sin = ref.language_model.rotary_emb(dummy, tf_pid.float().npu())
-    tf_cos_npu = tf_cos.half().npu()
-    tf_sin_npu = tf_sin.half().npu()
+        tf_cos, tf_sin = ref.language_model.rotary_emb(dummy, tf_pid.float().to(ref.device))
+    tf_cos_npu = tf_cos.to(ref.device, ref.dtype)
+    tf_sin_npu = tf_sin.to(ref.device, ref.dtype)
 
     # ── Build ATB text graphs ────────────────────────────────────
     g_t_layer = build_text_layer_graph(
@@ -339,7 +339,8 @@ def test_deepstack_injection(model_dir=None):
         causal_mask_atb = make_causal_mask_nz_npu(S)
     else:
         causal_mask_atb = causal_mask
-    causal_mask_tf = causal_mask.unsqueeze(0).unsqueeze(0).float()
+    # TF attention mask follows ref's device/dtype (causal_mask itself is ATB-only, NPU).
+    causal_mask_tf = make_causal_mask(S).to(ref.device, ref.dtype).unsqueeze(0).unsqueeze(0)
 
     # ── Run text layers with deepstack injection ─────────────────
     print(f"\n{'─'*70}")
@@ -348,7 +349,7 @@ def test_deepstack_injection(model_dir=None):
 
     hidden_atb = ie_atb
     hidden_tf = ie_tf
-    vis_mask_2d = vis_mask_1d.unsqueeze(0).npu()
+    vis_mask_2d = vis_mask_1d.unsqueeze(0).to(ref.device)
     seqlen_t = make_seqlen_tensor(S)
 
     all_ok = True
@@ -375,7 +376,7 @@ def test_deepstack_injection(model_dir=None):
             hidden_atb[0, vis_mask_1d.npu(), :] = local_atb
 
             # TF injection (replicate _deepstack_process)
-            ds_npu_tf = to_npu_half(ds_tf[ds_idx])
+            ds_npu_tf = ds_tf[ds_idx].to(ref.device, ref.dtype)
             local_tf = hidden_tf[vis_mask_2d, :].clone() + ds_npu_tf
             hidden_tf[vis_mask_2d, :] = local_tf
 
@@ -385,7 +386,7 @@ def test_deepstack_injection(model_dir=None):
 
         # Log periodically and at deepstack injection points
         if li == 0 or li == n_layer - 1 or li % 8 == 0 or (li < len(ds_tf)):
-            cs = cosine(hidden_atb, hidden_tf)
+            cs = cosine(hidden_atb.cpu().float(), hidden_tf.cpu().float())
             is_ds = " [+ds]" if li < len(ds_tf) else ""
             ok = cs >= 0.99  # 0.99: moderate fp16 accumulation (multi-layer injection) — see THRESHOLDS.md
             all_ok &= ok

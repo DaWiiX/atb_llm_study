@@ -248,8 +248,8 @@ def make_inputs(engine, processor, w: int, h: int, load_pv: bool = False):
         'input_ids': tf_in['input_ids'],
         'attention_mask': tf_in.get('attention_mask',
                                     torch.ones_like(tf_in['input_ids'])).npu(),
-        'tf_pixel_values': tf_in.get('pixel_values').npu(),
-        'tf_grid_thw': tf_in.get('image_grid_thw').npu(),
+        'tf_pixel_values': tf_in.get('pixel_values'),
+        'tf_grid_thw': tf_in.get('image_grid_thw'),
     }
 
 
@@ -687,10 +687,10 @@ def check_regression(results, baseline_path, threshold=1.2):
 # ═══════════════════════════════════════════════════════════════════
 
 def benchmark_tf_e2e(ref, inputs, n_warmup, n_iter):
-    input_ids = inputs['input_ids'].npu()
-    attn_mask = inputs['attention_mask'].npu()
-    pv = inputs['tf_pixel_values'].half().npu()
-    gth = inputs['tf_grid_thw'].npu()
+    input_ids = inputs['input_ids'].to(ref.device)
+    attn_mask = inputs['attention_mask'].to(ref.device)
+    pv = ref.place(inputs['tf_pixel_values'])
+    gth = inputs['tf_grid_thw'].to(ref.device)
 
     def _call():
         with torch.no_grad():
@@ -717,12 +717,12 @@ def benchmark_tf_e2e(ref, inputs, n_warmup, n_iter):
     accuracy = None
     if inputs.get('atb_text_tf_vision') is not None:
         # Reload ATB vision embeddings (saved as CPU float32 in Phase 1)
-        vis_atb = inputs['vis_atb_tf'].half().npu()
-        ds_atb = [d.half().npu() for d in inputs['ds_atb_tf']]
+        vis_atb = ref.place(inputs['vis_atb_tf'])
+        ds_atb = [ref.place(d) for d in inputs['ds_atb_tf']]
 
         # Build TF inputs_embeds with ATB vision injection
         with torch.no_grad():
-            ie_tf = ref.get_input_embeddings()(input_ids).half()
+            ie_tf = ref.get_input_embeddings()(input_ids).to(ref.dtype)
             tok_emb = ref.get_input_embeddings()(
                 torch.tensor(inputs['img_tok'], dtype=torch.long, device=ie_tf.device))
             image_mask = (ie_tf == tok_emb).all(-1, keepdim=True).expand_as(ie_tf)
@@ -731,11 +731,11 @@ def benchmark_tf_e2e(ref, inputs, n_warmup, n_iter):
 
         # TF language_model with ATB vision features
         vis_mask = inputs['vis_mask_tf']
-        vis_pos_masks = vis_mask.unsqueeze(0).npu()
+        vis_pos_masks = vis_mask.unsqueeze(0).to(ref.device)
         with torch.no_grad():
             tf_out = ref.language_model(
                 inputs_embeds=ie_tf,
-                position_ids=inputs['pid_tf'].npu(),
+                position_ids=inputs['pid_tf'].to(ref.device),
                 visual_pos_masks=vis_pos_masks if ds_atb else None,
                 deepstack_visual_embeds=ds_atb if ds_atb else None,
             ).last_hidden_state.cpu().float()

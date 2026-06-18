@@ -120,13 +120,13 @@ def run_tf_embed(model_dir: str, processor, cases) -> dict:
         tf_in = processor.apply_chat_template(
             msgs, tokenize=True, return_dict=True, return_tensors='pt',
             add_generation_prompt=True)
-        ids_t = tf_in['input_ids'].npu()
-        mask_t = tf_in.get('attention_mask', torch.ones_like(ids_t)).npu()
+        ids_t = tf_in['input_ids'].to(model.device)
+        mask_t = tf_in.get('attention_mask', torch.ones_like(ids_t)).to(model.device)
 
         kwargs = dict(use_cache=False, input_ids=ids_t, attention_mask=mask_t)
         if img is not None:
-            kwargs["pixel_values"] = tf_in.get('pixel_values').half().npu()
-            kwargs["image_grid_thw"] = tf_in.get('image_grid_thw').npu()
+            kwargs["pixel_values"] = model.place(tf_in.get('pixel_values'))
+            kwargs["image_grid_thw"] = tf_in.get('image_grid_thw').to(model.device)
 
         with torch.no_grad():
             out = model(**kwargs)

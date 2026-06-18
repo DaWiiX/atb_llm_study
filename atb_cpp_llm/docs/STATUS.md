@@ -41,6 +41,7 @@
 | 运行时验证 | 910B 全量测试 PASS | ✅ |
 | 平台检测根治 | `Is310P()`/`Is910B()` 改读 `.env`（抽 `src/utils/dotenv.h` 共享头，消除生产代码依赖 test 头）+ benchmark 启动期 `aclrtGetSocName()` 硬件探针自检（不匹配 `LOG_ERROR` 提醒，不 abort）。修裸启动 `./benchmark` 读不到 `ASCEND_PLATFORM` 静默走 910B ND mask 致 310P Transdata 崩溃 | ✅ |
 | Benchmark 输出修复 | `ReportStages`/`ReportColdStart`/`ReportThroughput` 的 `LOG_INFO`→`printf`(stdout)，修复默认 WARN log level 吞掉 human-readable 报告（只剩 `BENCH_RESULT` machine 行） | ✅ |
+| Python 测试参考 fallback | `load_tf_ref` 加 NPU→CPU eager probing + 薄代理（`_TFRef`），310P 上 transformers 参考撞不支持算子时自动退 CPU float32，对齐 C++ 参考生成器设计。910B 回归 7 文件全 PASS | ✅ (910B) / ⏳ 310P 待复验 |
 
 ### 2.5 平台适配
 910B + 310P 双平台。310P NZ mask 策略、GQA 原生支持（cos=1.0）、平台检测 API（`is_310p()`/`Is310P()`）均完成。详见 `evergreen/platform-310p.md`。
@@ -71,11 +72,11 @@
 
 ## 3. 待办（按优先级）
 
-### 3.1 ✅ 310P 硬件闭环验证（已通过）
-310P 全量 + benchmark compare 已在真实 310P 复验通过（2026-06-20）：C++ 全量过、裸启动 `./benchmark --mode compare` 不再崩 Transdata（平台检测根治后读 `.env` 的 `ASCEND_PLATFORM=310P`）、human 表正常输出。310P 机器的回归复验步骤：
+### 3.1 🟡 310P 硬件闭环验证（C++ 已通过 / Python fallback 待复验）
+310P C++ 全量 + benchmark compare 已在真实 310P 复验通过（2026-06-20）：C++ 全量过、裸启动 `./benchmark --mode compare` 不再崩 Transdata（平台检测根治后读 `.env` 的 `ASCEND_PLATFORM=310P`）、human 表正常输出。**Python 参考侧 fallback（§2.4 末行）910B 回归通过,但原本在 310P FAIL 的 `test_e2e`/`test_embedder_e2e`/`test_deepstack_integration`/`test_pipeline_trace` 待在 310P 上复验转 PASS**。310P 机器的回归复验步骤：
 1. `git pull` → `grep ASCEND_PLATFORM .env` 为 `310P`
 2. `bash atb_cpp_llm/build_and_test.sh`（全量）
-3. `python atb_python_qwen3vl_embedding/tests/run_all.py`（Python 全量，fallback 生效）
+3. `python atb_python_qwen3vl_embedding/tests/run_all.py`（Python 全量，确认 fallback 生效、cosine ≥ 0.99）
 4. `./atb_cpp_llm/build/benchmark --mode compare`（裸启动即可，自动读 `.env`）
 5. `python atb_cpp_llm/tests/compare_py_cpp.py`（cosine ≥ 0.99）
 
@@ -114,6 +115,7 @@ C++ ATB 全面最快：geomean 领先 Python ATB **1.39×**、领先 Transformer
 | 日期 | 内容 |
 |------|------|
 | 2026-06-18 | 建立本文件作为单一真相源，归并自 architect-assessment §11.1 + audit-fix-plan + test-fix-plan + refactoring-plan §1 |
+| 2026-06-18 | 310P 全量结果：C++ 50/50 全过；Python 参考侧撞 ArgMaxWithValue/Conv3d FAIL。根因：transformers 参考在 310P NPU 跑撞不支持算子，C++ 端有 fallback 而 Python `load_tf_ref` 无。修复：`load_tf_ref` 加 NPU→CPU eager probing + `_TFRef` 薄代理，910B 回归 7 文件全 PASS，310P 待复验 |
 | 2026-06-20 | 平台检测根治 + benchmark human 表修复 + 310P 真机复验通过 |
 | 2026-06-21 | 性能优化 Batch 1：异步流水恢复（H1 per-op sync 默认 OFF + H4 deepstack sync 移除 + idx/alpha 缓存 + async D2H sync 补齐）。12–13% e2e 收益，精度无损，Dev→Reviewer→Re-review 闭环 |
 | 2026-06-22 | 性能优化 Batch 2-A：CPU 预处理 PIL 式重写（可分离两阶段卷积 + 系数预算表 + normalize 融合 + patch f 帧去重）。preprocess 4.3–5.0× 加速（657→141ms@1080×1920），cos=1.0 精度无损，Dev→Reviewer→Re-review 闭环 |
@@ -123,3 +125,4 @@ C++ ATB 全面最快：geomean 领先 Python ATB **1.39×**、领先 Transformer
 | 2026-06-23 | 路径C：NPU preprocess接入引擎dispatch。PreprocessImageNpu加device tensor重载(跳过D2H)+Internal重构DRY；NpuTensor::Adopt+TensorAllocator::Detach所有权转移原语；ForwardWithTiming激活raw_image分支(device tensor直喂pixels_npu,无H2D)；PREPROCESSED旁路不动(公共契约不变)；StageTimings.preprocess_ms引擎内回填。e2e测试raw_image vs PREPROCESSED embedding cos=0.999956。零BLOCKER/零MAJOR,4 MINOR修复 |
 | 2026-06-23 | 流程纪律：Reviewer探查的BLOCKER/MAJOR必须归档lessons-learned(用户要求)。WORKFLOW §3.3加「审查发现归档纪律」+ lessons主题7第12条元规则 + 路径C Reviewer两条泛化发现归主题8第7/8条(调用方sync空操作/Detach静默no-op) |
 | 2026-06-23 | benchmark 接入路径C:bench模式改 raw_image(引擎内NPU preprocess),compare保留CPU。staged_sum 公平对比 4 分辨率路径C全更优(416 38→54/720 104→161/1080 181→235/1440 247→256ms),preprocess_ms CPU→NPU 降 3.7-59%。e2e 口径迁移(路径C含preprocess、PREPROCESSED不含)经 Reviewer 确认公平。MAJOR(pre_ms cold口径)修+warmup,1440翻转证cold假象。grid_t隐式领域事实归 lessons 主题1第6条 |
+| 2026-06-24 | Python 测试参考 NPU→CPU fallback 合入(cherry-pick fix/python-ref-fallback): `load_tf_ref` 加 eager probing + `_TFRef` 薄代理 + 7 个测试文件 device 透传改写 + bf16 权重 CPU float32 dtype 修复。910B 回归全 PASS,310P 待复验 |
