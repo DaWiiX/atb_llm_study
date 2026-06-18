@@ -11,6 +11,7 @@ Usage:
     engine = Qwen3VLEngine("/path/to/Qwen3-VL-Embedding-2B")
     output = engine.forward(input_ids, pixel_values, image_grid_thw)
 """
+import threading
 import time
 from pathlib import Path
 
@@ -52,7 +53,15 @@ class Qwen3VLEngine:
     """
 
     def __init__(self, model_dir: str):
-        import torch_npu  # noqa: F401 — required for ATB NPU ops
+        self._closed = False
+        self._lock = threading.Lock()
+        try:
+            import torch_npu  # noqa: F401 — required for ATB NPU ops
+        except ImportError as e:
+            raise ImportError(
+                "torch_npu is required but not installed. "
+                "Install with: pip install torch_npu"
+            ) from e
 
         self.model_dir = Path(model_dir)
 
@@ -97,40 +106,212 @@ class Qwen3VLEngine:
         self.pp_max_px = pp["max_pixels"]
 
         # ── Cached weights (NPU-resident float16) ────────────────────
-        self.embed_w = get_embed_weight(self.weights)
-        self.norm_w = get_text_norm_weight(self.weights).half().npu()
-        self.t_layer_weights = [
-            [to_npu_half(w) for w in get_text_layer_weights(self.weights, i)]
-            for i in range(self.n_layer)
-        ]
+        try:
+            self.embed_w = get_embed_weight(self.weights)
+        except KeyError as e:
+            raise KeyError(f"Failed to load embedding weight: missing key {e}") from e
+        try:
+            self.norm_w = get_text_norm_weight(self.weights).half().npu()
+        except KeyError as e:
+            raise KeyError(f"Failed to load text norm weight: missing key {e}") from e
+        self.t_layer_weights = []
+        for i in range(self.n_layer):
+            try:
+                self.t_layer_weights.append(
+                    [to_npu_half(w) for w in get_text_layer_weights(self.weights, i)])
+            except KeyError as e:
+                raise KeyError(
+                    f"Failed to load text layer {i} weights: missing key {e}") from e
 
         # Vision: block weights by layer (NPU-resident)
-        self.v_block_weights = [
-            [to_npu_half(w) for w in get_vision_block_weights(self.weights, i)]
-            for i in range(self.v_depth)
-        ]
-        self.v_pe_w, self.v_pe_b = get_patch_embed_weights(
-            self.weights, self.v_cfg["hidden_size"])
+        self.v_block_weights = []
+        for i in range(self.v_depth):
+            try:
+                self.v_block_weights.append(
+                    [to_npu_half(w) for w in get_vision_block_weights(self.weights, i)])
+            except KeyError as e:
+                raise KeyError(
+                    f"Failed to load vision block {i} weights: missing key {e}") from e
+        try:
+            self.v_pe_w, self.v_pe_b = get_patch_embed_weights(
+                self.weights, self.v_cfg["hidden_size"])
+        except KeyError as e:
+            raise KeyError(
+                f"Failed to load patch embed weights: missing key {e}") from e
         self.v_pe_w = to_npu_half(self.v_pe_w)
         self.v_pe_b = to_npu_half(self.v_pe_b)
-        self.v_pos_embed = get_vision_pos_embed(self.weights)
+        try:
+            self.v_pos_embed = get_vision_pos_embed(self.weights)
+        except KeyError as e:
+            raise KeyError(
+                f"Failed to load vision position embedding: missing key {e}") from e
         self.v_pe_w_table = to_npu_half(self.v_pos_embed)  # NPU fp16 for ATB Gather
         self.num_grid = int(self.v_cfg["num_position_embeddings"] ** 0.5)
 
         # Vision: merger weights (NPU-resident)
-        self.v_merger_w = [to_npu_half(w) for w in
-                           get_merger_weights(self.weights, is_deepstack=False)]
-        self.v_ds_w = [
-            [to_npu_half(w) for w in
-             get_merger_weights(self.weights, is_deepstack=True, ds_idx=i)]
-            for i in range(len(self.ds_indexes))
-        ]
+        try:
+            self.v_merger_w = [to_npu_half(w) for w in
+                               get_merger_weights(self.weights, is_deepstack=False)]
+        except KeyError as e:
+            raise KeyError(
+                f"Failed to load merger weights: missing key {e}") from e
+        self.v_ds_w = []
+        for i in range(len(self.ds_indexes)):
+            try:
+                self.v_ds_w.append(
+                    [to_npu_half(w) for w in
+                     get_merger_weights(self.weights, is_deepstack=True, ds_idx=i)])
+            except KeyError as e:
+                raise KeyError(
+                    f"Failed to load deepstack merger {i} weights: missing key {e}") from e
 
         # ── Build ATB graphs ────────────────────────────────────────
         self._build_graphs()
 
         # ── Debug / test access ────────────────────────────────────
         self._last_ds_feats = None  # populated by _run_vision
+
+    # ── Resource cleanup ─────────────────────────────────────────────
+
+    def close(self):
+        """Release all NPU resources (tensors, ATB graphs, cached buffers).
+
+        Idempotent — safe to call multiple times.  Individual resource
+        release failures are logged but do not prevent releasing the
+        remaining resources.
+
+        Thread-safe: the _closed flag is protected by _lock so that
+        concurrent calls to close() / forward() / encode() cannot race
+        and cause double-free.
+        """
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+
+        resource_errors = []
+
+        # ── Release ATB graphs ──────────────────────────────────────
+        for attr in (
+            "g_v_first", "g_v_block", "g_v_merger", "g_v_ds",
+            "g_v_posemb", "g_t_norm", "g_t_layer",
+        ):
+            try:
+                obj = getattr(self, attr, None)
+                if obj is not None:
+                    setattr(self, attr, None)
+                    del obj
+            except Exception as e:
+                resource_errors.append(f"{attr}: {e}")
+
+        # ── Release NPU weight tensors ──────────────────────────────
+        # Large nested structures — use pop/clear where possible.
+        weight_attrs = [
+            "embed_w", "norm_w", "v_pe_w", "v_pe_b",
+            "v_pe_w_table", "v_pos_embed",
+        ]
+        for attr in weight_attrs:
+            try:
+                obj = getattr(self, attr, None)
+                if obj is not None:
+                    setattr(self, attr, None)
+                    del obj
+            except Exception as e:
+                resource_errors.append(f"{attr}: {e}")
+
+        # Nested weight lists / dicts
+        for top_attr in (
+            "t_layer_weights", "v_block_weights",
+            "v_merger_w", "v_ds_w",
+        ):
+            try:
+                container = getattr(self, top_attr, None)
+                if container is None:
+                    continue
+                # Clear each sub-list/item
+                if isinstance(container, (list, tuple)):
+                    for item in container:
+                        if isinstance(item, (list, tuple)):
+                            item.clear()
+                    container.clear()
+                setattr(self, top_attr, None)
+                del container
+            except Exception as e:
+                resource_errors.append(f"{top_attr}: {e}")
+
+        # ── Release cached mask ─────────────────────────────────────
+        try:
+            mask = getattr(self, '_cached_mask', None)
+            if mask is not None:
+                self._cached_mask = None
+                del mask
+        except Exception as e:
+            resource_errors.append(f"_cached_mask: {e}")
+
+        # ── Release CPU weight dict ─────────────────────────────────
+        try:
+            weights = getattr(self, 'weights', None)
+            if weights is not None:
+                weights.clear()
+                self.weights = None
+                del weights
+        except Exception as e:
+            resource_errors.append(f"weights: {e}")
+
+        # ── Release RoPE objects (CPU side) ─────────────────────────
+        for attr in ("text_rope", "vis_rotary"):
+            try:
+                obj = getattr(self, attr, None)
+                if obj is not None:
+                    setattr(self, attr, None)
+                    del obj
+            except Exception as e:
+                resource_errors.append(f"{attr}: {e}")
+
+        # ── Reclaim NPU memory ──────────────────────────────────────
+        try:
+            torch.npu.empty_cache()
+        except Exception as e:
+            resource_errors.append(f"empty_cache: {e}")
+
+        # Log any errors that occurred during cleanup.
+        if resource_errors:
+            try:
+                import sys
+                print(
+                    f"[Qwen3VLEngine.close] {len(resource_errors)} resource "
+                    f"release error(s): {resource_errors}", file=sys.stderr)
+            except Exception:
+                print(
+                    f"[ERROR] Qwen3VLEngine.close(): failed to log resource errors",
+                    file=sys.stderr)
+
+    def __del__(self):
+        """Destructor — release NPU resources on garbage collection."""
+        try:
+            self.close()
+        except Exception:
+            # Must not raise from __del__, and we cannot assume that
+            # torch / torch_npu / ATB are still importable at this point.
+            try:
+                import sys
+                print(
+                    f"[ERROR] Qwen3VLEngine.__del__: cleanup failed",
+                    file=sys.stderr)
+            except Exception:
+                pass  # Nothing we can do
+
+    def __enter__(self):
+        """Enter context manager — returns self for use in `with` block."""
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Exit context manager — always closes resources.
+
+        Does not suppress exceptions; the caller must handle them.
+        """
+        self.close()
+        return False  # do not suppress any exception
 
     def _make_vision_config(self):
         """Create a config-like object for ATB vision graph builders."""
@@ -173,6 +354,18 @@ class Qwen3VLEngine:
 
     def preprocess_image(self, image: torch.Tensor):
         """Preprocess raw image (C,H,W uint8) → ATB-compatible format."""
+        if not isinstance(image, torch.Tensor):
+            raise TypeError(
+                f"preprocess_image: expected torch.Tensor, "
+                f"got {type(image).__name__}")
+        if image.dtype != torch.uint8:
+            raise TypeError(
+                f"preprocess_image: expected uint8 image, "
+                f"got {image.dtype}")
+        if image.dim() != 3:
+            raise ValueError(
+                f"preprocess_image: expected 3D tensor (C,H,W), "
+                f"got {image.dim()}D")
         return preprocess_image(
             image, patch_size=self.patch_size,
             temporal_patch_size=self.tp, merge_size=self.merge_size,
@@ -245,9 +438,19 @@ class Qwen3VLEngine:
                               cos_npu, sin_npu, seqlen_v)
             if li in self.ds_indexes:
                 ds_idx = self.ds_indexes.index(li)
+                # Sync: the deepstack merger graph may run on a different
+                # internal NPU stream than the VisionBlock graph above.
+                # Without this barrier it can read h before the block
+                # output is fully written.
+                torch.npu.synchronize()
                 ds_feats.append(run_merger_npu(self.g_v_ds, h, self.v_ds_w[ds_idx]))
 
-        # torch.npu.synchronize()
+        # Sync: the last VisionBlock in the loop above is async (ATB
+        # graph.Run() returns immediately).  Without this barrier the
+        # subsequent merger graph may read h before the block output is
+        # fully computed — silent data corruption when graphs execute on
+        # different internal NPU streams.
+        torch.npu.synchronize()
         vis = run_merger_npu(self.g_v_merger, h, self.v_merger_w)
 
         if return_intermediates:
@@ -294,13 +497,174 @@ class Qwen3VLEngine:
                                         cos_npu, sin_npu, seqlen_t,
                                         causal_mask=self._cached_mask)
             if deepstack_features and li < len(deepstack_features):
-                # clone + add + writeback (matches TF _deepstack_process)
+                # Sync: run_text_layer_npu returns immediately (ATB graph
+                # executes on a separate NPU stream).  Without this barrier
+                # the PyTorch clone/read below may see stale hidden data.
+                torch.npu.synchronize()
                 local = hidden[0, visual_mask, :].clone() + deepstack_features[li]
                 hidden[0, visual_mask, :] = local
 
+        # Sync: the last DecoderLayer execution in the loop above is async
+        # (ATB graph.Run() returns immediately).  Without this barrier,
+        # FinalNorm may read hidden states before the last layer's output
+        # is fully available on the NPU.
+        torch.npu.synchronize()
         return run_text_norm_npu(self.g_t_norm, hidden, self.norm_w).cpu().float()
 
     # ── Full pipeline ───────────────────────────────────────────────
+
+    def _validate_inputs(self, input_ids, pixel_values, image_grid_thw):
+        """Validate forward() inputs — raises TypeError / ValueError with
+        clear diagnostic messages for each violation.
+
+        Checks (in order):
+          1. input_ids device → cpu
+          2. input_ids dtype  → int64
+          3. input_ids shape  → 2D (B, S)
+          4. batch_size       → B == 1
+          5. pixel_values / image_grid_thw consistency → both None or both set
+          6. pixel_values / image_grid_thw Tensor type guard
+          7. pixel_values dtype   → float32 (when set)
+          8. pixel_values shape   → 1D or 2D (when set)
+          9. image_grid_thw dtype → int64 (when set)
+         10. image_grid_thw shape → 2D (*, 3) (when set)
+         11. image_grid_thw empty → shape[0] > 0
+         12. image_grid_thw grid values → T, H, W all >= 1
+         13. pixel_values length ↔ grid_thw consistency
+         14. token_id non-empty → numel > 0
+         15. token_id range  → [0, vocab_size)
+        """
+        # 1 ─ input_ids device ──────────────────────────────────────────
+        if input_ids.device.type != 'cpu':
+            raise ValueError(
+                f"forward(): input_ids must be on CPU, "
+                f"got device={input_ids.device}")
+
+        # 2 ─ input_ids dtype ───────────────────────────────────────────
+        if input_ids.dtype != torch.int64:
+            raise TypeError(
+                f"forward(): input_ids must be int64 (LongTensor), "
+                f"got {input_ids.dtype}")
+
+        # 3 ─ input_ids shape ───────────────────────────────────────────
+        if input_ids.ndim != 2:
+            raise ValueError(
+                f"forward(): input_ids must be 2D (B, S), "
+                f"got shape {tuple(input_ids.shape)}")
+
+        # 4 ─ batch_size ────────────────────────────────────────────────
+        B = input_ids.shape[0]
+        if B != 1:
+            raise ValueError(
+                f"forward(): batch_size must be 1, got {B}")
+
+        # 5 ─ pixel_values / image_grid_thw consistency ─────────────────
+        pv_set = pixel_values is not None
+        thw_set = image_grid_thw is not None
+        if pv_set != thw_set:
+            raise ValueError(
+                f"forward(): pixel_values and image_grid_thw must both "
+                f"be None or both be provided, "
+                f"got pixel_values={'provided' if pv_set else 'None'}, "
+                f"image_grid_thw={'provided' if thw_set else 'None'}")
+
+        if pixel_values is not None:
+            # 6 ─ Tensor type guards ────────────────────────────────────
+            if not isinstance(pixel_values, torch.Tensor):
+                raise TypeError(
+                    f"forward(): pixel_values must be a torch.Tensor, "
+                    f"got {type(pixel_values).__name__}")
+            if not isinstance(image_grid_thw, torch.Tensor):
+                raise TypeError(
+                    f"forward(): image_grid_thw must be a torch.Tensor, "
+                    f"got {type(image_grid_thw).__name__}")
+
+            # 7 ─ pixel_values dtype (must be float32) ──────────────────
+            if pixel_values.dtype != torch.float32:
+                raise TypeError(
+                    f"forward(): pixel_values must be float32, "
+                    f"got {pixel_values.dtype}")
+
+            # 8 ─ pixel_values shape (1D or 2D) ─────────────────────────
+            if pixel_values.ndim not in (1, 2):
+                raise ValueError(
+                    f"forward(): pixel_values must be 1D (N,) or 2D, "
+                    f"got shape {tuple(pixel_values.shape)}")
+
+            # 9 ─ image_grid_thw dtype (must be int64) ──────────────────
+            if image_grid_thw.dtype != torch.int64:
+                raise TypeError(
+                    f"forward(): image_grid_thw must be int64 "
+                    f"(LongTensor), got {image_grid_thw.dtype}")
+
+            # 10 ─ image_grid_thw shape (2D, last dim == 3) ─────────────
+            if image_grid_thw.ndim != 2 or image_grid_thw.shape[-1] != 3:
+                raise ValueError(
+                    f"forward(): image_grid_thw must be 2D (*, 3), "
+                    f"got shape {tuple(image_grid_thw.shape)}")
+
+            # 11 ─ image_grid_thw non-empty ─────────────────────────────
+            if image_grid_thw.shape[0] == 0:
+                raise ValueError(
+                    f"forward(): image_grid_thw has 0 rows — "
+                    f"use None for no images")
+
+            # 12 ─ grid value range (T, H, W all >= 1) ──────────────────
+            for i in range(image_grid_thw.shape[0]):
+                t = image_grid_thw[i, 0].item()
+                h = image_grid_thw[i, 1].item()
+                w = image_grid_thw[i, 2].item()
+                if t < 1:
+                    raise ValueError(
+                        f"forward(): image_grid_thw[{i}, 0] (T) must be >= 1, "
+                        f"got {t}")
+                if h < 1:
+                    raise ValueError(
+                        f"forward(): image_grid_thw[{i}, 1] (H) must be >= 1, "
+                        f"got {h}")
+                if w < 1:
+                    raise ValueError(
+                        f"forward(): image_grid_thw[{i}, 2] (W) must be >= 1, "
+                        f"got {w}")
+
+            # 13 ─ pixel_values length ↔ grid_thw consistency ───────────
+            expected_patches = 0
+            for i in range(image_grid_thw.shape[0]):
+                expected_patches += int(image_grid_thw[i, 0].item() *
+                                        image_grid_thw[i, 1].item() *
+                                        image_grid_thw[i, 2].item())
+            if pixel_values.ndim == 2:
+                if pixel_values.shape[0] != expected_patches:
+                    raise ValueError(
+                        f"forward(): pixel_values.shape[0] "
+                        f"({pixel_values.shape[0]}) does not match "
+                        f"expected patches ({expected_patches}) "
+                        f"from image_grid_thw")
+            else:  # 1D
+                expected_len = (expected_patches * self.patch_size *
+                                self.patch_size * self.v_cfg["in_channels"] *
+                                self.tp)
+                if pixel_values.shape[0] != expected_len:
+                    raise ValueError(
+                        f"forward(): pixel_values length "
+                        f"({pixel_values.shape[0]}) does not match "
+                        f"expected length ({expected_len}) "
+                        f"from image_grid_thw")
+
+        # 14 ─ token_id non-empty ───────────────────────────────────────
+        if input_ids.numel() == 0:
+            raise ValueError(
+                f"forward(): input_ids cannot be empty "
+                f"(got shape {tuple(input_ids.shape)})")
+
+        # 15 ─ token_id range ───────────────────────────────────────────
+        vocab_size = self.embed_w.shape[0]
+        min_id = input_ids.min().item()
+        max_id = input_ids.max().item()
+        if min_id < 0 or max_id >= vocab_size:
+            raise ValueError(
+                f"forward(): all token_ids must be in range [0, {vocab_size}), "
+                f"got min={min_id}, max={max_id}")
 
     def forward(self, input_ids: torch.LongTensor,
                 pixel_values: torch.Tensor | None = None,
@@ -314,8 +678,23 @@ class Qwen3VLEngine:
             image_grid_thw: (N, 3) LongTensor or None.
 
         Returns (B, S, hidden_size) float32 on CPU.
+
+        Raises:
+            RuntimeError: if the engine has been closed.
+            TypeError:    if any tensor has the wrong dtype.
+            ValueError:   if any tensor has the wrong shape or values.
         """
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("Engine is closed and cannot be used.")
+
+        self._validate_inputs(input_ids, pixel_values, image_grid_thw)
+
         # 1. Text embeddings → NPU
+        if self.embed_w is None:
+            raise RuntimeError(
+                "Embedding weight not loaded — "
+                "engine initialization may have failed silently")
         inputs_embeds = F.embedding(input_ids, self.embed_w).half().npu()
 
         # 2. Vision features — all NPU-resident
@@ -323,9 +702,11 @@ class Qwen3VLEngine:
         vis_mask = None
         if pixel_values is not None and image_grid_thw is not None:
             vis_embeds, ds_feats = self._run_vision(pixel_values, image_grid_thw)
-            # CPU: compute mask; async H2D: vis_mask.npu(); async NPU: scatter.
-            # Sync so the scatter sees a fully-transferred mask AND valid
-            # vis_embeds from the (async) ATB vision graph.
+            # Sync: vis_embeds was produced by async ATB vision graphs
+            # (run_merger_npu returns immediately).  Without this barrier,
+            # the scatter below may read stale/partial vis_embeds data.
+            # The mask H2D (vis_mask.npu()) is on the same PyTorch NPU
+            # stream as the scatter — stream ordering handles the mask.
             torch.npu.synchronize()
             vis_mask = input_ids.squeeze(0) == self.img_tok
             inputs_embeds[0, vis_mask.npu(), :] = vis_embeds
@@ -368,7 +749,13 @@ class Qwen3VLEngine:
         """Full encode → pool → (optionally normalize).
 
         Returns (B, hidden_size) embedding vector.
+
+        Raises:
+            RuntimeError: if the engine has been closed.
         """
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("Engine is closed and cannot be used.")
         output = self.forward(input_ids, pixel_values, image_grid_thw)
         if attention_mask is None:
             attention_mask = torch.ones_like(input_ids)

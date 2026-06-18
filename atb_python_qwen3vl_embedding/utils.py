@@ -14,6 +14,7 @@ Also provides:
 import torch
 import torch_atb
 import torch.nn.functional as F
+import warnings
 
 from .env import ASCEND_PLATFORM
 
@@ -43,8 +44,8 @@ def set_atb_buffer_size(size_bytes: int):
     """
     global _buffer_size_set
     if _buffer_size_set:
-        print(f"[WARN] set_atb_buffer_size({size_bytes}) ignored: buffer size "
-              f"already set. Only the first call takes effect.")
+        warnings.warn(f"set_atb_buffer_size({size_bytes}) ignored: buffer size "
+                      f"already set. Only the first call takes effect.")
         return
     _buffer_size_set = True
     torch_atb.set_buffer_size(size_bytes)

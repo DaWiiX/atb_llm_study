@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from __future__ import annotations
 """Test runner: discover and run all Python test scripts in this directory.
 
 Each test script is a standalone program (``if __name__ == "__main__"``)
@@ -21,11 +22,15 @@ Exit code: 0 if all tests pass, non‑zero otherwise.
 """
 
 import argparse
+import concurrent.futures
 import fnmatch
 import os
+import signal
 import subprocess
 import sys
+import threading
 import time
+from functools import partial
 from pathlib import Path
 
 
@@ -88,7 +93,37 @@ def apply_filters(
 STATUS_PASS = "PASS"
 STATUS_FAIL = "FAIL"
 
+# ── resource groups for parallel execution ───────────────────────────
+# Same-group tests run serially; different-group tests can run in parallel.
+# "exclusive" — full model (10+ GB HBM), must be completely serial
+# "text_model" — only Text DecoderLayer graph, ≈5 GB
+# "vision_model" — only VisionBlock graph, ≈5 GB
+# "light" (default) — small buffers (≤1 GB), N-way parallel
+TEST_RESOURCE_GROUPS = {
+    "test_e2e": "exclusive",
+    "test_embedder_e2e": "exclusive",
+    "test_deepstack_integration": "exclusive",
+    "test_pipeline_trace": "exclusive",
+    "test_text_model": "exclusive",
+    "test_vision_pos_embed": "exclusive",
+    "test_text_diagnostics": "text_model",
+    "test_vision_diagnostics": "vision_model",
+}
+# Unlisted tests default to "light"
+
 TEST_TIMEOUT = 600  # 10 minutes per test
+
+
+def get_current_platform() -> str | None:
+    """Read ASCEND_PLATFORM from the package env module.
+
+    Returns '910B', '310P', or None if the import fails.
+    """
+    try:
+        from atb_python_qwen3vl_embedding.env import ASCEND_PLATFORM
+        return ASCEND_PLATFORM
+    except Exception:
+        return None
 
 
 def run_one_test(
@@ -96,10 +131,12 @@ def run_one_test(
     script_path: Path,
     repo_root: Path,
     verbose: bool,
+    running_pids: dict | None = None,
+    pids_lock: threading.Lock | None = None,
 ) -> dict:
     """Run a single test script as a subprocess.
 
-    Returns a dict with keys: name, status, exit_code, elapsed_s, output.
+    Returns a dict with keys: name, status, exit_code, elapsed_s, output, pid.
     """
     env = os.environ.copy()
     # Ensure the package is importable from the repo root
@@ -107,37 +144,60 @@ def run_one_test(
     env["PYTHONPATH"] = str(repo_root) + (":" + existing if existing else "")
 
     start = time.monotonic()
+    proc = None
+
     try:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             [sys.executable, str(script_path)],
             cwd=str(repo_root),
             env=env,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=TEST_TIMEOUT,
         )
-    except subprocess.TimeoutExpired as e:
+        if running_pids is not None and pids_lock is not None:
+            with pids_lock:
+                running_pids[name] = proc.pid
+
+        try:
+            stdout, stderr = proc.communicate(timeout=TEST_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            stdout, stderr = proc.communicate()
+            elapsed = time.monotonic() - start
+            output = f"[TIMEOUT after {TEST_TIMEOUT}s]"
+            if stdout:
+                output += "\n[STDOUT]\n" + stdout
+            if stderr:
+                output += "\n[STDERR]\n" + stderr
+            return {
+                "name": name,
+                "status": STATUS_FAIL,
+                "exit_code": -1,
+                "elapsed_s": elapsed,
+                "output": output,
+                "pid": proc.pid,
+            }
+    except Exception as e:
         elapsed = time.monotonic() - start
-        output = f"[TIMEOUT after {TEST_TIMEOUT}s]"
-        if e.stdout:
-            stdout_text = e.stdout.decode() if isinstance(e.stdout, bytes) else e.stdout
-            output += "\n[STDOUT]\n" + stdout_text
-        if e.stderr:
-            stderr_text = e.stderr.decode() if isinstance(e.stderr, bytes) else e.stderr
-            output += "\n[STDERR]\n" + stderr_text
         return {
             "name": name,
             "status": STATUS_FAIL,
             "exit_code": -1,
             "elapsed_s": elapsed,
-            "output": output,
+            "output": f"[EXCEPTION] {type(e).__name__}: {e}",
+            "pid": proc.pid if proc is not None else None,
         }
+    finally:
+        if proc is not None and running_pids is not None and pids_lock is not None:
+            with pids_lock:
+                running_pids.pop(name, None)
 
     elapsed = time.monotonic() - start
     status = STATUS_PASS if proc.returncode == 0 else STATUS_FAIL
-    output = proc.stdout
-    if proc.stderr:
-        output += "\n[STDERR]\n" + proc.stderr
+    output = stdout
+    if stderr:
+        output += "\n[STDERR]\n" + stderr
 
     return {
         "name": name,
@@ -145,7 +205,113 @@ def run_one_test(
         "exit_code": proc.returncode,
         "elapsed_s": elapsed,
         "output": output,
+        "pid": proc.pid,
     }
+
+
+# ── parallel execution ──────────────────────────────────────────────────
+
+def run_tests_parallel(
+    tests: list[tuple[str, Path]],
+    args: argparse.Namespace,
+    repo_root: Path,
+) -> tuple[list[dict], bool]:
+    """Run tests with resource-group-aware parallelism.
+
+    Tests in the same resource group run serially; tests in different groups
+    may run concurrently.  ``light`` group concurrency is capped at
+    ``args.parallel``.
+
+    Returns ``(results_in_original_order, any_failed)``.
+    """
+    max_per_group = {
+        "exclusive": 1,
+        "text_model": 1,
+        "vision_model": 1,
+        "light": args.parallel,
+    }
+    running_per_group = {"exclusive": 0, "text_model": 0, "vision_model": 0, "light": 0}
+
+    pending = list(tests)          # (name, path) — submission order
+    running: dict[concurrent.futures.Future, tuple[int, str, str]] = {}
+    results_by_name: dict[str, dict] = {}
+    original_order = [name for name, _ in tests]
+    total = len(tests)
+    any_failed = False
+
+    # Track subprocess pids for fail-fast SIGTERM delivery
+    running_pids: dict[str, int] = {}
+    pids_lock = threading.Lock()
+
+    # Total thread pool size = sum of per-group concurrency caps:
+    #   exclusive(1) + text_model(1) + vision_model(1) + light(N)
+    max_workers = sum(max_per_group.values())
+
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
+    try:
+        print_header()
+        while pending or running:
+            # Submit tests whose resource group still has capacity
+            while pending:
+                name, path = pending[0]
+                group = TEST_RESOURCE_GROUPS.get(name, "light")
+                if running_per_group[group] < max_per_group[group]:
+                    pending.pop(0)
+                    running_per_group[group] += 1
+                    idx = original_order.index(name)
+                    fut = executor.submit(
+                        partial(run_one_test, name, path, repo_root,
+                                args.verbose, running_pids, pids_lock)
+                    )
+                    running[fut] = (idx, name, group)
+                else:
+                    break
+
+            if not running:
+                break
+
+            # Wait for at least one running test to finish
+            done, _ = concurrent.futures.wait(
+                running, return_when=concurrent.futures.FIRST_COMPLETED
+            )
+
+            for fut in done:
+                idx, name, group = running.pop(fut)
+                running_per_group[group] -= 1
+                result = fut.result()
+                results_by_name[name] = result
+
+                # Progress display with [idx/total] prefix + aligned columns
+                print(f"[{idx + 1}/{total}] ", end="")
+                print_summary_row(result)
+
+                if args.verbose:
+                    print_verbose_output(result)
+
+                if result["status"] == STATUS_FAIL:
+                    any_failed = True
+                    if args.fail_fast:
+                        pending.clear()
+
+            if args.fail_fast and any_failed:
+                # Send SIGTERM to all still-running subprocesses
+                with pids_lock:
+                    for pid in list(running_pids.values()):
+                        try:
+                            os.kill(pid, signal.SIGTERM)
+                        except OSError:
+                            pass
+                for f in running:
+                    f.cancel()
+                break
+    finally:
+        executor.shutdown(wait=not (args.fail_fast and any_failed))
+
+    # Return results in original test-list order
+    ordered_results = [
+        results_by_name[name] for name in original_order if name in results_by_name
+    ]
+    return ordered_results, any_failed
 
 
 # ── reporting ──────────────────────────────────────────────────────────
@@ -249,11 +415,31 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Include benchmark.py in the run.",
     )
+    p.add_argument(
+        "--parallel",
+        type=int,
+        default=1,
+        metavar="N",
+        help="Maximum concurrent light-group tests (1-8, default 1 = serial).",
+    )
+    p.add_argument(
+        "--no-auto-exclude",
+        action="store_true",
+        help="Disable automatic platform-based test exclusion.",
+    )
     return p.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+
+    # Clamp --parallel to [1, 8]
+    if args.parallel < 1:
+        print(f"Warning: --parallel {args.parallel} clamped to 1", file=sys.stderr)
+        args.parallel = 1
+    elif args.parallel > 8:
+        print(f"Warning: --parallel {args.parallel} clamped to 8", file=sys.stderr)
+        args.parallel = 8
 
     # Paths
     repo_root = Path(__file__).resolve().parent.parent.parent
@@ -261,6 +447,17 @@ def main(argv: list[str] | None = None) -> int:
 
     # Discover
     all_tests = discover_tests(tests_dir, include_benchmarks=args.benchmarks)
+
+    # Auto-exclude tests that don't match the current platform
+    if not args.no_auto_exclude:
+        platform = get_current_platform()
+        if platform == "910B":
+            auto_exclude = ["*310p*", "*310P*"]
+            if args.exclude:
+                args.exclude = list(args.exclude) + auto_exclude
+            else:
+                args.exclude = auto_exclude
+
     tests = apply_filters(all_tests, args.include, args.exclude)
 
     if not tests:
@@ -283,24 +480,34 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Repo root: {repo_root}")
     print(f"Python:   {sys.executable}")
 
-    print_header()
-    results: list[dict] = []
     start_all = time.monotonic()
-    any_failed = False
 
-    for name, path in tests:
-        result = run_one_test(name, path, repo_root, args.verbose)
-        results.append(result)
-        print_summary_row(result)
+    if args.parallel == 1:
+        # ── serial mode (original behaviour, backward compatible) ──────
+        print_header()
+        results: list[dict] = []
+        any_failed = False
 
-        if args.verbose:
-            print_verbose_output(result)
+        for name, path in tests:
+            result = run_one_test(name, path, repo_root, args.verbose)
+            results.append(result)
+            print_summary_row(result)
 
-        if result["status"] == STATUS_FAIL:
-            any_failed = True
-            if args.fail_fast:
-                print(f"\n{YELLOW}Stopping after first failure (--fail-fast).{RESET}")
-                break
+            if args.verbose:
+                print_verbose_output(result)
+
+            if result["status"] == STATUS_FAIL:
+                any_failed = True
+                if args.fail_fast:
+                    print(
+                        f"\n{YELLOW}Stopping after first failure"
+                        f" (--fail-fast).{RESET}"
+                    )
+                    break
+    else:
+        # ── parallel mode (resource-group-aware) ───────────────────────
+        print(f"Parallelism: light={args.parallel}, exclusive/text/vision=1")
+        results, any_failed = run_tests_parallel(tests, args, repo_root)
 
     total_elapsed = time.monotonic() - start_all
     print_final_summary(results, total_elapsed)

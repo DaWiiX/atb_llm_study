@@ -17,14 +17,95 @@ import safetensors.torch
 
 def load_config(model_dir: str) -> dict:
     """Load model config from config.json."""
-    with open(f"{model_dir}/config.json") as f:
-        return json.load(f)
+    if model_dir is None:
+        raise RuntimeError(
+            "加载模型配置失败: model_dir 为 None. "
+            "请确认 QWEN3VL_EMB_MODEL_DIR 环境变量已设置."
+        )
+    config_path = f"{model_dir}/config.json"
+    try:
+        with open(config_path) as f:
+            cfg = json.load(f)
+    except FileNotFoundError as e:
+        raise RuntimeError(
+            f"加载模型配置失败: config.json 不存在. "
+            f"路径: {config_path}. "
+            f"请确认 QWEN3VL_EMB_MODEL_DIR 环境变量指向正确的模型目录."
+        ) from e
+    except PermissionError as e:
+        raise RuntimeError(
+            f"加载模型配置失败: config.json 权限不足. "
+            f"路径: {config_path}. 请检查文件权限 (chmod)."
+        ) from e
+    except json.JSONDecodeError as e:
+        raise RuntimeError(
+            f"加载模型配置失败: config.json JSON 解析错误. "
+            f"路径: {config_path}. 请检查文件完整性."
+        ) from e
+    except Exception as e:
+        raise RuntimeError(
+            f"加载模型配置失败: 未知错误 ({type(e).__name__}). "
+            f"路径: {config_path}. 详情: {e}"
+        ) from e
+
+    # Validate required keys
+    required_keys = ["text_config", "vision_config", "image_token_id"]
+    missing = [k for k in required_keys if k not in cfg]
+    if missing:
+        raise RuntimeError(
+            f"加载模型配置失败: config.json 缺少必需键 {missing}. "
+            f"路径: {config_path}. 请确认模型文件完整."
+        )
+    if "spatial_merge_size" not in cfg.get("vision_config", {}):
+        raise RuntimeError(
+            f"加载模型配置失败: vision_config 缺少必需键 'spatial_merge_size'. "
+            f"路径: {config_path}. 请确认模型文件完整."
+        )
+    return cfg
 
 
 def load_preprocessor_config(model_dir: str) -> dict:
     """Load preprocessor config from preprocessor_config.json."""
-    with open(f"{model_dir}/preprocessor_config.json") as f:
-        return json.load(f)
+    if model_dir is None:
+        raise RuntimeError(
+            "加载预处理器配置失败: model_dir 为 None. "
+            "请确认 QWEN3VL_EMB_MODEL_DIR 环境变量已设置."
+        )
+    pp_config_path = f"{model_dir}/preprocessor_config.json"
+    try:
+        with open(pp_config_path) as f:
+            pp = json.load(f)
+    except FileNotFoundError as e:
+        raise RuntimeError(
+            f"加载预处理器配置失败: preprocessor_config.json 不存在. "
+            f"路径: {pp_config_path}. "
+            f"请确认 QWEN3VL_EMB_MODEL_DIR 环境变量指向正确的模型目录."
+        ) from e
+    except PermissionError as e:
+        raise RuntimeError(
+            f"加载预处理器配置失败: preprocessor_config.json 权限不足. "
+            f"路径: {pp_config_path}. 请检查文件权限 (chmod)."
+        ) from e
+    except json.JSONDecodeError as e:
+        raise RuntimeError(
+            f"加载预处理器配置失败: preprocessor_config.json JSON 解析错误. "
+            f"路径: {pp_config_path}. 请检查文件完整性."
+        ) from e
+    except Exception as e:
+        raise RuntimeError(
+            f"加载预处理器配置失败: 未知错误 ({type(e).__name__}). "
+            f"路径: {pp_config_path}. 详情: {e}"
+        ) from e
+
+    # Validate required keys
+    required_keys = ["patch_size", "temporal_patch_size", "min_pixels", "max_pixels"]
+    missing = [k for k in required_keys if k not in pp]
+    if missing:
+        raise RuntimeError(
+            f"加载预处理器配置失败: preprocessor_config.json 缺少必需键 {missing}. "
+            f"路径: {pp_config_path}. 请确认模型文件完整."
+        )
+    return pp
 
 
 # ═════════════════════════════════════════════════════════════════════
@@ -37,9 +118,36 @@ def load_weights(model_dir: str) -> dict[str, torch.Tensor]:
     Keys follow the HuggingFace format: model.language_model.*, model.visual.*
     All tensors are stored as float32 (converted from bf16 if needed).
     """
-    weights = safetensors.torch.load_file(
-        f"{model_dir}/model.safetensors", device="cpu")
-    return {k: v.float() for k, v in weights.items()}
+    if model_dir is None:
+        raise RuntimeError(
+            "加载模型权重失败: model_dir 为 None. "
+            "请确认 QWEN3VL_EMB_MODEL_DIR 环境变量已设置."
+        )
+    weights_path = f"{model_dir}/model.safetensors"
+    try:
+        weights = safetensors.torch.load_file(weights_path, device="cpu")
+        return {k: v.float() for k, v in weights.items()}
+    except FileNotFoundError as e:
+        raise RuntimeError(
+            f"加载模型权重失败: model.safetensors 不存在. "
+            f"路径: {weights_path}. "
+            f"请确认 QWEN3VL_EMB_MODEL_DIR 环境变量指向正确的模型目录."
+        ) from e
+    except PermissionError as e:
+        raise RuntimeError(
+            f"加载模型权重失败: model.safetensors 权限不足. "
+            f"路径: {weights_path}. 请检查文件权限 (chmod)."
+        ) from e
+    except safetensors.SafetensorError as e:
+        raise RuntimeError(
+            f"加载模型权重失败: model.safetensors 文件损坏或格式异常. "
+            f"路径: {weights_path}. 请重新下载模型文件. 详情: {e}"
+        ) from e
+    except Exception as e:
+        raise RuntimeError(
+            f"加载模型权重失败: 未知错误 ({type(e).__name__}). "
+            f"路径: {weights_path}. 详情: {e}"
+        ) from e
 
 
 def get_text_layer_weights(weights: dict, layer_idx: int) -> list[torch.Tensor]:
@@ -52,10 +160,13 @@ def get_text_layer_weights(weights: dict, layer_idx: int) -> list[torch.Tensor]:
     a = lambda name: weights[f"{pfx}self_attn.{name}.weight"]
     m = lambda name: weights[f"{pfx}mlp.{name}.weight"]
     n = lambda name: weights[f"{pfx}{name}.weight"]
-    return [a("q_proj"), a("k_proj"), a("v_proj"), a("o_proj"),
-            a("q_norm"), a("k_norm"),
-            m("gate_proj"), m("up_proj"), m("down_proj"),
-            n("input_layernorm"), n("post_attention_layernorm")]
+    try:
+        return [a("q_proj"), a("k_proj"), a("v_proj"), a("o_proj"),
+                a("q_norm"), a("k_norm"),
+                m("gate_proj"), m("up_proj"), m("down_proj"),
+                n("input_layernorm"), n("post_attention_layernorm")]
+    except KeyError as e:
+        raise KeyError(f"get_text_layer_weights(layer={layer_idx}): missing weight key {e}") from e
 
 
 def get_text_norm_weight(weights: dict) -> torch.Tensor:
@@ -76,12 +187,15 @@ def get_vision_block_weights(weights: dict, block_idx: int) -> list[torch.Tensor
     """
     pfx = f"model.visual.blocks.{block_idx}."
     b = lambda name: weights[f"{pfx}{name}"]
-    return [b("attn.qkv.weight"), b("attn.qkv.bias"),
-            b("attn.proj.weight"), b("attn.proj.bias"),
-            b("mlp.linear_fc1.weight"), b("mlp.linear_fc1.bias"),
-            b("mlp.linear_fc2.weight"), b("mlp.linear_fc2.bias"),
-            b("norm1.weight"), b("norm1.bias"),
-            b("norm2.weight"), b("norm2.bias")]
+    try:
+        return [b("attn.qkv.weight"), b("attn.qkv.bias"),
+                b("attn.proj.weight"), b("attn.proj.bias"),
+                b("mlp.linear_fc1.weight"), b("mlp.linear_fc1.bias"),
+                b("mlp.linear_fc2.weight"), b("mlp.linear_fc2.bias"),
+                b("norm1.weight"), b("norm1.bias"),
+                b("norm2.weight"), b("norm2.bias")]
+    except KeyError as e:
+        raise KeyError(f"get_vision_block_weights(block={block_idx}): missing weight key {e}") from e
 
 
 def get_patch_embed_weights(weights: dict, hidden_size: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -89,8 +203,13 @@ def get_patch_embed_weights(weights: dict, hidden_size: int) -> tuple[torch.Tens
 
     Returns (weight, bias) where weight is (hidden_size, C*tp*p*p).
     """
-    w = weights["model.visual.patch_embed.proj.weight"]  # (hs, C, tp, p, p)
-    b = weights["model.visual.patch_embed.proj.bias"]    # (hs,)
+    try:
+        w = weights["model.visual.patch_embed.proj.weight"]  # (hs, C, tp, p, p)
+        b = weights["model.visual.patch_embed.proj.bias"]    # (hs,)
+    except KeyError as e:
+        raise KeyError(f"get_patch_embed_weights: missing weight key {e}") from e
+    if w.dim() != 5:
+        raise ValueError(f"patch_embed weight expected 5D (hs,C,tp,p,p), got {w.shape}")
     ksize = w.shape[1] * w.shape[2] * w.shape[3] * w.shape[4]  # C*tp*p*p
     w = w.reshape(hidden_size, ksize).contiguous()
     return w, b

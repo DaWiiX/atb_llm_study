@@ -703,6 +703,13 @@ static bool TestL3_VisionRoPE(int& passed, int& failed) {
 // Main
 // ═══════════════════════════════════════════════════════════════════════
 int main() {
+    if (MODEL_DIR.empty()) {
+        std::fprintf(stderr,
+            "QWEN3VL_EMB_MODEL_DIR is not set. "
+            "Source .env via build_and_test.sh or export the variable.\n");
+        return 1;
+    }
+
     LOG_INFO("=== Vision Pipeline Stage Precision Test ===");
     LOG_INFO("Image: %dx%d, Model: %s", IMG_H, IMG_W, MODEL_DIR.c_str());
 

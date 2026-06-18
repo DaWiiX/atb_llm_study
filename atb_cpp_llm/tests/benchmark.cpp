@@ -10,7 +10,7 @@
  *   --mode mm      : multimodal benchmark (image + text)
  *   --mode io      : image-only benchmark (no text tokens)
  *   --mode all     : run all three modes (default)
- *   --mode bench   : run image-only at 4 fixed resolutions (224x224, 416x672, 672x416, 896x896)
+ *   --mode bench   : run image-only at 4 fixed resolutions (416x672, 720x1280, 1080x1920, 1440x2560)
  *   --mode compare : run full test matrix: TEXT_ONLY + IMAGE_ONLY x4 + IMAGE_AND_TEXT x4
  *                    saves pooler output .bin for each combination
  *   --iter N      : benchmark iterations (default: 5)
@@ -39,13 +39,40 @@
 #include <numeric>
 #include <cmath>
 #include <string>
+#include <tuple>
 #include <functional>
 
-static const std::string MODEL_DIR = GetModelDir();
+// Shared resolution set — single source of truth used by both --mode bench
+// and RunCompareMode(). Modify here only; do NOT duplicate.
+// Matches Python benchmark.py default --resolutions.
+static const struct { int w; int h; } kBenchmarkResolutions[] = {
+    {416, 672},
+    {720, 1280},
+    {1080, 1920},
+    {1440, 2560},
+};
+static constexpr int kNumBenchmarkResolutions =
+    static_cast<int>(sizeof(kBenchmarkResolutions) / sizeof(kBenchmarkResolutions[0]));
 
 // ── Statistics helper ────────────────────────────────────────
 struct Stats {
     double mean = 0, median = 0, min_val = 0, max_val = 0, stddev = 0;
+};
+
+// ── Cold-start metrics ──────────────────────────────────────
+struct ColdMetrics {
+    double cold_e2e_ms = 0;
+    double warm_e2e_ms = 0;
+    double penalty_pct = 0;
+    bool valid = false;
+};
+
+// ── Throughput metrics ──────────────────────────────────────
+struct ThroughputMetrics {
+    int requests = 0;
+    int64_t total_tokens = 0;
+    double tokens_per_sec = 0.0;
+    double avg_latency_ms = 0.0;
 };
 
 Stats ComputeStats(std::vector<double>& times) {
@@ -168,8 +195,13 @@ std::vector<TimedResult> RunBenchmark(
         atb_llm::LLMEngine* engine,
         const atb_llm::InferRequest& request,
         int num_warmup, int num_iter, bool verbose,
-        const char* save_bin_path = nullptr) {
+        const char* save_bin_path = nullptr,
+        ColdMetrics* cold = nullptr) {
     atb_llm::Status s;
+
+    if (cold && num_warmup < 1) {
+        cold->valid = false;
+    }
 
     // Warmup
     for (int i = 0; i < num_warmup; i++) {
@@ -179,6 +211,11 @@ std::vector<TimedResult> RunBenchmark(
         if (s != atb_llm::STATUS_OK) {
             LOG_ERROR("Warmup iteration %d failed: %d", i, static_cast<int>(s));
             return {};
+        }
+        // All ATB graphs were compiled during LLMEngine::Create(); no lazy graph init in cold path
+        // Capture cold start from the very first forward
+        if (cold && i == 0) {
+            cold->cold_e2e_ms = timings.e2e_ms;
         }
         if (verbose) {
             LOG_INFO("  Warmup %d: %.2f ms", i, timings.e2e_ms);
@@ -205,6 +242,19 @@ std::vector<TimedResult> RunBenchmark(
             LOG_INFO("  Iter %d: %.2f ms", i, timings.e2e_ms);
         }
     }
+
+    // Compute cold-start penalty
+    if (cold && cold->cold_e2e_ms > 0 && results.size() > 0) {
+        double sum = 0;
+        for (auto& r : results) sum += r.e2e_ms;
+        cold->warm_e2e_ms = sum / results.size();
+        if (cold->warm_e2e_ms > 0) {
+            cold->penalty_pct = (cold->cold_e2e_ms - cold->warm_e2e_ms)
+                                / cold->warm_e2e_ms * 100.0;
+            cold->valid = true;
+        }
+    }
+
     if (save_bin_path) {
         if (!SavePoolerOutput(save_bin_path, last_result)) {
             LOG_ERROR("Failed to save pooler output to %s", save_bin_path);
@@ -224,8 +274,8 @@ double MeanStage(const std::vector<TimedResult>& results,
 // ── Report stage timings (human-readable) ────────────────────
 void ReportStages(const std::vector<TimedResult>& results,
                   const char* label, int seq_len, int vis_tokens,
-                  const Stats& e2e_stats) {
-    double preprocess = MeanStage(results, [](const atb_llm::StageTimings& t) { return t.preprocess_ms; });
+                  const Stats& e2e_stats, double preprocess_ms = 0.0) {
+    double preprocess = preprocess_ms;
     double vision_pos = MeanStage(results, [](const atb_llm::StageTimings& t) { return t.vision_pos_ms; });
     double vision_model = MeanStage(results, [](const atb_llm::StageTimings& t) { return t.vision_model_ms; });
     double text_embed = MeanStage(results, [](const atb_llm::StageTimings& t) { return t.text_embed_ms; });
@@ -259,8 +309,8 @@ void ReportStages(const std::vector<TimedResult>& results,
 void ReportStagesCompact(const std::vector<TimedResult>& results,
                          const char* mode, const char* resolution,
                          int seq_len, int vis_tokens,
-                         const Stats& e2e_stats) {
-    double preprocess = MeanStage(results, [](const atb_llm::StageTimings& t) { return t.preprocess_ms; });
+                         const Stats& e2e_stats, double preprocess_ms = 0.0) {
+    double preprocess = preprocess_ms;
     double vision_pos = MeanStage(results, [](const atb_llm::StageTimings& t) { return t.vision_pos_ms; });
     double vision_model = MeanStage(results, [](const atb_llm::StageTimings& t) { return t.vision_model_ms; });
     double text_embed = MeanStage(results, [](const atb_llm::StageTimings& t) { return t.text_embed_ms; });
@@ -280,13 +330,119 @@ void ReportStagesCompact(const std::vector<TimedResult>& results,
            pooling, staged_sum, e2e_stats.mean, e2e_stats.stddev);
 }
 
+// ── Report cold-start results (dual-format) ────────────────────
+void ReportColdStart(const std::vector<std::tuple<std::string, std::string, ColdMetrics>>& cold_results) {
+    if (cold_results.empty()) return;
+
+    // Human-readable table
+    LOG_INFO("============================================================");
+    LOG_INFO("  === Cold-Start Benchmark ===");
+    LOG_INFO("============================================================");
+    LOG_INFO("  mode   resolution     cold_e2e_ms  warm_e2e_ms  penalty_pct");
+    LOG_INFO("  ------ -------------- ------------ ------------ -----------");
+    for (const auto& entry : cold_results) {
+        const std::string& mode = std::get<0>(entry);
+        const std::string& resolution = std::get<1>(entry);
+        const ColdMetrics& cm = std::get<2>(entry);
+        char buf[128];
+        std::snprintf(buf, sizeof(buf), "%+.1f%%", cm.penalty_pct);
+        LOG_INFO("  %-6s %-14s %12.2f %12.2f %11s",
+                 mode.c_str(), resolution.c_str(),
+                 cm.cold_e2e_ms, cm.warm_e2e_ms, buf);
+    }
+    LOG_INFO("============================================================");
+
+    // Machine-parseable lines
+    for (const auto& entry : cold_results) {
+        const std::string& mode = std::get<0>(entry);
+        const std::string& resolution = std::get<1>(entry);
+        const ColdMetrics& cm = std::get<2>(entry);
+        printf("BENCH_COLD: mode=%s resolution=%s cold_ms=%.2f warm_ms=%.2f penalty_pct=%.1f\n",
+               mode.c_str(), resolution.c_str(), cm.cold_e2e_ms, cm.warm_e2e_ms, cm.penalty_pct);
+    }
+}
+
+// ── Throughput benchmark (continuous forward loop) ──────────────
+ThroughputMetrics RunThroughputBenchmark(
+        atb_llm::LLMEngine* engine,
+        const atb_llm::InferRequest& request,
+        double duration_sec,
+        int64_t tokens_per_request) {
+    ThroughputMetrics metrics;
+
+    auto start = std::chrono::steady_clock::now();
+    int requests = 0;
+
+    while (true) {
+        atb_llm::InferResult result;
+        atb_llm::StageTimings timings;
+        atb_llm::Status s = engine->EncodeWithTiming(request, result, timings);
+        if (s != atb_llm::STATUS_OK) {
+            LOG_ERROR("Throughput iteration %d failed: %d", requests, static_cast<int>(s));
+            return metrics;
+        }
+        requests++;
+
+        auto now = std::chrono::steady_clock::now();
+        double elapsed = std::chrono::duration<double>(now - start).count();
+        if (elapsed >= duration_sec) break;
+    }
+
+    auto end = std::chrono::steady_clock::now();
+    double elapsed = std::chrono::duration<double>(end - start).count();
+
+    if (requests > 0 && elapsed > 0) {
+        metrics.requests = requests;
+        metrics.total_tokens = requests * tokens_per_request;
+        metrics.tokens_per_sec = static_cast<double>(metrics.total_tokens) / elapsed;
+        metrics.avg_latency_ms = (elapsed * 1000.0) / static_cast<double>(requests);
+    }
+
+    return metrics;
+}
+
+// ── Report throughput results (dual-format) ──────────────────────
+void ReportThroughput(const std::vector<std::tuple<std::string, std::string, ThroughputMetrics>>& results) {
+    if (results.empty()) return;
+
+    // Human-readable table
+    LOG_INFO("============================================================");
+    LOG_INFO("  === Throughput Benchmark (20s) ===");
+    LOG_INFO("============================================================");
+    LOG_INFO("  mode   resolution     requests  total_tokens  tokens/sec  avg_lat_ms");
+    LOG_INFO("  ------ -------------- --------  ------------  ----------  ----------");
+    for (const auto& entry : results) {
+        const std::string& mode = std::get<0>(entry);
+        const std::string& resolution = std::get<1>(entry);
+        const ThroughputMetrics& m = std::get<2>(entry);
+        LOG_INFO("  %-6s %-14s %8d  %12ld  %10.0f  %10.1f",
+                 mode.c_str(), resolution.c_str(),
+                 m.requests, static_cast<long>(m.total_tokens),
+                 m.tokens_per_sec, m.avg_latency_ms);
+    }
+    LOG_INFO("============================================================");
+
+    // Machine-parseable lines
+    for (const auto& entry : results) {
+        const std::string& mode = std::get<0>(entry);
+        const std::string& resolution = std::get<1>(entry);
+        const ThroughputMetrics& m = std::get<2>(entry);
+        printf("BENCH_TPUT: mode=%s resolution=%s requests=%d total_tokens=%ld tps=%.0f avg_ms=%.1f\n",
+               mode.c_str(), resolution.c_str(),
+               m.requests, static_cast<long>(m.total_tokens),
+               m.tokens_per_sec, m.avg_latency_ms);
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════
 // Text-only benchmark
 // ═══════════════════════════════════════════════════════════════
 
 int RunTextBenchmark(atb_llm::LLMEngine* engine,
                      int seq_len, int num_warmup, int num_iter,
-                     bool cmp_mode) {
+                     bool cmp_mode,
+                     ColdMetrics* cold = nullptr,
+                     ThroughputMetrics* throughput = nullptr) {
     // Input: [151643, 15339, ..., 15339, 151645]
     std::vector<int64_t> input_ids(seq_len);
     input_ids[0] = 151643;
@@ -307,17 +463,24 @@ int RunTextBenchmark(atb_llm::LLMEngine* engine,
         LOG_INFO("Iterations: %d (warmup: %d)", num_iter, num_warmup);
     }
 
-    auto results = RunBenchmark(engine, request, num_warmup, num_iter, !cmp_mode);
+    auto results = RunBenchmark(engine, request, num_warmup, num_iter, !cmp_mode,
+                                nullptr, cold);
     if (results.empty()) return 1;
 
     std::vector<double> e2e_times;
     for (auto& r : results) e2e_times.push_back(r.e2e_ms);
     Stats e2e_stats = ComputeStats(e2e_times);
 
-    if (cmp_mode) {
-        ReportStagesCompact(results, "text", "N/A", seq_len, 0, e2e_stats);
-    } else {
-        ReportStages(results, "text-only", seq_len, 0, e2e_stats);
+    // Always emit both formats (machine line + human table), matching
+    // RunCompareMode. cmp_mode no longer gates output format — it only
+    // controls .bin saving and the verbose LOG_INFO headers above.
+    ReportStagesCompact(results, "text", "N/A", seq_len, 0, e2e_stats);
+    ReportStages(results, "text-only", seq_len, 0, e2e_stats);
+
+    // B4: Throughput benchmark (after warmup+hot iterations, engine is warm)
+    if (throughput) {
+        *throughput = RunThroughputBenchmark(engine, request, 20.0,
+                                             static_cast<int64_t>(seq_len));
     }
 
     return 0;
@@ -328,14 +491,17 @@ int RunTextBenchmark(atb_llm::LLMEngine* engine,
 // ═══════════════════════════════════════════════════════════════
 
 int RunMultimodalBenchmark(atb_llm::LLMEngine* engine,
+                           const std::string& model_dir,
                            int img_w, int img_h,
                            int num_warmup, int num_iter,
-                           bool cmp_mode) {
+                           bool cmp_mode,
+                           ColdMetrics* cold = nullptr,
+                           ThroughputMetrics* throughput = nullptr) {
     // Load Qwen3VL config for preprocessing
     atb_llm::adapters::Qwen3VLConfig config;
-    atb_llm::Status s = atb_llm::adapters::LoadQwen3VLConfig(MODEL_DIR, config);
+    atb_llm::Status s = atb_llm::adapters::LoadQwen3VLConfig(model_dir, config);
     if (s != atb_llm::STATUS_OK) {
-        LOG_ERROR("Failed to load Qwen3VL config from %s", MODEL_DIR.c_str());
+        LOG_ERROR("Failed to load Qwen3VL config from %s", model_dir.c_str());
         return 1;
     }
 
@@ -418,27 +584,30 @@ int RunMultimodalBenchmark(atb_llm::LLMEngine* engine,
         LOG_INFO("Iterations: %d (warmup: %d)", num_iter, num_warmup);
     }
 
-    auto results = RunBenchmark(engine, request, num_warmup, num_iter, !cmp_mode);
+    auto results = RunBenchmark(engine, request, num_warmup, num_iter, !cmp_mode,
+                                nullptr, cold);
     if (results.empty()) return 1;
     double pre_ms = std::chrono::duration<double, std::milli>(pre_end - pre_start).count();
-    for (auto& r : results) {
-        r.timings.preprocess_ms = pre_ms;
-    }
 
     std::vector<double> e2e_times;
     for (auto& r : results) e2e_times.push_back(r.e2e_ms);
     Stats e2e_stats = ComputeStats(e2e_times);
 
-    if (cmp_mode) {
-        ReportStagesCompact(results, "mm", resolution,
-                            static_cast<int>(seq_len),
-                            static_cast<int>(vis_tokens), e2e_stats);
-    } else {
-        char label[64];
-        std::snprintf(label, sizeof(label), "%dx%d", img_w, img_h);
-        ReportStages(results, label,
-                     static_cast<int>(seq_len),
-                     static_cast<int>(vis_tokens), e2e_stats);
+    // Always emit both formats (machine line + human table), matching
+    // RunCompareMode. cmp_mode only gates .bin saving and verbose headers.
+    ReportStagesCompact(results, "mm", resolution,
+                        static_cast<int>(seq_len),
+                        static_cast<int>(vis_tokens), e2e_stats, pre_ms);
+    char label[64];
+    std::snprintf(label, sizeof(label), "%dx%d", img_w, img_h);
+    ReportStages(results, label,
+                 static_cast<int>(seq_len),
+                 static_cast<int>(vis_tokens), e2e_stats, pre_ms);
+
+    // B4: Throughput benchmark (after warmup+hot iterations, engine is warm)
+    if (throughput) {
+        *throughput = RunThroughputBenchmark(engine, request, 20.0,
+                                             static_cast<int64_t>(seq_len));
     }
 
     return 0;
@@ -449,14 +618,17 @@ int RunMultimodalBenchmark(atb_llm::LLMEngine* engine,
 // ═══════════════════════════════════════════════════════════════
 
 int RunImageOnlyBenchmark(atb_llm::LLMEngine* engine,
+                          const std::string& model_dir,
                           int img_w, int img_h,
                           int num_warmup, int num_iter,
-                          bool cmp_mode) {
+                          bool cmp_mode,
+                          ColdMetrics* cold = nullptr,
+                          ThroughputMetrics* throughput = nullptr) {
     // Load Qwen3VL config for preprocessing
     atb_llm::adapters::Qwen3VLConfig config;
-    atb_llm::Status s = atb_llm::adapters::LoadQwen3VLConfig(MODEL_DIR, config);
+    atb_llm::Status s = atb_llm::adapters::LoadQwen3VLConfig(model_dir, config);
     if (s != atb_llm::STATUS_OK) {
-        LOG_ERROR("Failed to load Qwen3VL config from %s", MODEL_DIR.c_str());
+        LOG_ERROR("Failed to load Qwen3VL config from %s", model_dir.c_str());
         return 1;
     }
 
@@ -507,6 +679,10 @@ int RunImageOnlyBenchmark(atb_llm::LLMEngine* engine,
                   "/tmp/tokens_chat_io_%dx%d.bin", img_w, img_h);
     std::vector<int64_t> input_ids = LoadTokenIds(io_tok_path);
     if (input_ids.empty()) {
+        LOG_WARN("Chat-templated token file not found: %s — "
+                 "using bare image tokens. Run 'python atb_cpp_llm/scripts/gen_compare_tokens.py' "
+                 "to generate accurate token files.",
+                 io_tok_path);
         // Fallback to bare image tokens
         input_ids.resize(vis_tokens);
         for (int64_t i = 0; i < vis_tokens; i++)
@@ -540,27 +716,30 @@ int RunImageOnlyBenchmark(atb_llm::LLMEngine* engine,
         LOG_INFO("Iterations: %d (warmup: %d)", num_iter, num_warmup);
     }
 
-    auto results = RunBenchmark(engine, request, num_warmup, num_iter, !cmp_mode);
+    auto results = RunBenchmark(engine, request, num_warmup, num_iter, !cmp_mode,
+                                nullptr, cold);
     if (results.empty()) return 1;
     double pre_ms = std::chrono::duration<double, std::milli>(pre_end - pre_start).count();
-    for (auto& r : results) {
-        r.timings.preprocess_ms = pre_ms;
-    }
 
     std::vector<double> e2e_times;
     for (auto& r : results) e2e_times.push_back(r.e2e_ms);
     Stats e2e_stats = ComputeStats(e2e_times);
 
-    if (cmp_mode) {
-        ReportStagesCompact(results, "io", resolution,
-                            static_cast<int>(seq_len),
-                            static_cast<int>(vis_tokens), e2e_stats);
-    } else {
-        char label[64];
-        std::snprintf(label, sizeof(label), "image-only %dx%d", img_w, img_h);
-        ReportStages(results, label,
-                     static_cast<int>(seq_len),
-                     static_cast<int>(vis_tokens), e2e_stats);
+    // Always emit both formats (machine line + human table), matching
+    // RunCompareMode. cmp_mode only gates .bin saving and verbose headers.
+    ReportStagesCompact(results, "io", resolution,
+                        static_cast<int>(seq_len),
+                        static_cast<int>(vis_tokens), e2e_stats, pre_ms);
+    char label[64];
+    std::snprintf(label, sizeof(label), "image-only %dx%d", img_w, img_h);
+    ReportStages(results, label,
+                 static_cast<int>(seq_len),
+                 static_cast<int>(vis_tokens), e2e_stats, pre_ms);
+
+    // B4: Throughput benchmark (after warmup+hot iterations, engine is warm)
+    if (throughput) {
+        *throughput = RunThroughputBenchmark(engine, request, 20.0,
+                                             static_cast<int64_t>(seq_len));
     }
 
     return 0;
@@ -571,12 +750,13 @@ int RunImageOnlyBenchmark(atb_llm::LLMEngine* engine,
 // ═══════════════════════════════════════════════════════════════
 
 int RunCompareMode(atb_llm::LLMEngine* engine,
+                   const std::string& model_dir,
                    int num_warmup, int num_iter) {
     // Load Qwen3VL config for preprocessing
     atb_llm::adapters::Qwen3VLConfig config;
-    atb_llm::Status s = atb_llm::adapters::LoadQwen3VLConfig(MODEL_DIR, config);
+    atb_llm::Status s = atb_llm::adapters::LoadQwen3VLConfig(model_dir, config);
     if (s != atb_llm::STATUS_OK) {
-        LOG_ERROR("Failed to load Qwen3VL config from %s", MODEL_DIR.c_str());
+        LOG_ERROR("Failed to load Qwen3VL config from %s", model_dir.c_str());
         return 1;
     }
 
@@ -586,15 +766,6 @@ int RunCompareMode(atb_llm::LLMEngine* engine,
     static constexpr int64_t TOK_IMAGE    = 2168;
     static constexpr int64_t TOK_DOT      = 13;
     int64_t image_token_id = config.image_token_id;
-
-    // 4 resolutions (matching Python benchmark.py)
-    struct { int w; int h; } resolutions[] = {
-        {416, 672},
-        {720, 1280},
-        {1080, 1920},
-        {1440, 2560},
-    };
-    int num_res = static_cast<int>(sizeof(resolutions) / sizeof(resolutions[0]));
 
     LOG_INFO("============================================================");
     LOG_INFO("  Compare Mode — 13 combinations (5x TEXT + 4x IO + 4x MM)");
@@ -617,8 +788,16 @@ int RunCompareMode(atb_llm::LLMEngine* engine,
                           "/tmp/tokens_chat_text_only_%ld.bin", static_cast<long>(seq));
             std::vector<int64_t> input_ids = LoadTokenIds(tok_path);
             if (input_ids.empty()) {
-                LOG_ERROR("Chat-templated token file not found: %s", tok_path);
-                return 1;
+                LOG_WARN("Chat-templated token file not found: %s — "
+                         "using fallback tokens. Run 'python atb_cpp_llm/scripts/gen_compare_tokens.py' "
+                         "to generate accurate token files.",
+                         tok_path);
+                // Fallback: construct simple token sequence of nominal seq_len
+                input_ids.resize(static_cast<size_t>(seq));
+                input_ids[0] = 151643;
+                for (int64_t j = 1; j < seq - 1; j++)
+                    input_ids[j] = 15339;
+                input_ids[static_cast<size_t>(seq) - 1] = 151645;
             }
             int64_t actual_seq = static_cast<int64_t>(input_ids.size());
 
@@ -646,13 +825,18 @@ int RunCompareMode(atb_llm::LLMEngine* engine,
             Stats e2e_stats = ComputeStats(e2e_times);
             ReportStagesCompact(results, "text", "N/A",
                                 static_cast<int>(actual_seq), 0, e2e_stats);
+            char label[64];
+            std::snprintf(label, sizeof(label),
+                          "TEXT_ONLY S=%ld", static_cast<long>(actual_seq));
+            ReportStages(results, label,
+                         static_cast<int>(actual_seq), 0, e2e_stats);
         }
     }
 
     // ── 2. IMAGE_ONLY and IMAGE_AND_TEXT for each resolution ─────
-    for (int i = 0; i < num_res && ret == 0; i++) {
-        int img_w = resolutions[i].w;
-        int img_h = resolutions[i].h;
+    for (int i = 0; i < kNumBenchmarkResolutions && ret == 0; i++) {
+        int img_w = kBenchmarkResolutions[i].w;
+        int img_h = kBenchmarkResolutions[i].h;
 
         LOG_INFO("============================================================");
         LOG_INFO("  Resolution %dx%d", img_w, img_h);
@@ -722,6 +906,10 @@ int RunCompareMode(atb_llm::LLMEngine* engine,
                           "/tmp/tokens_chat_io_%dx%d.bin", img_w, img_h);
             std::vector<int64_t> input_ids = LoadTokenIds(io_tok_path);
             if (input_ids.empty()) {
+                LOG_WARN("Chat-templated token file not found: %s — "
+                         "using bare image tokens. Run 'python atb_cpp_llm/scripts/gen_compare_tokens.py' "
+                         "to generate accurate token files.",
+                         io_tok_path);
                 // Fallback to bare image tokens
                 input_ids.resize(vis_tokens, image_token_id);
             }
@@ -745,16 +933,19 @@ int RunCompareMode(atb_llm::LLMEngine* engine,
             auto results = RunBenchmark(engine, request, num_warmup, num_iter, true,
                                          save_path);
             if (results.empty()) { ret = 1; break; }
-            for (auto& r : results) {
-                r.timings.preprocess_ms = pre_ms;
-            }
 
             std::vector<double> e2e_times;
             for (auto& r : results) e2e_times.push_back(r.e2e_ms);
             Stats e2e_stats = ComputeStats(e2e_times);
             ReportStagesCompact(results, "io", resolution_str,
-                                static_cast<int>(vis_tokens),
-                                static_cast<int>(vis_tokens), e2e_stats);
+                                static_cast<int>(io_seq_len),
+                                static_cast<int>(vis_tokens), e2e_stats, pre_ms);
+            char label[64];
+            std::snprintf(label, sizeof(label),
+                          "IMAGE_ONLY %s", resolution_str);
+            ReportStages(results, label,
+                         static_cast<int>(io_seq_len),
+                         static_cast<int>(vis_tokens), e2e_stats, pre_ms);
         }
 
         // ── IMAGE_AND_TEXT ────────────────────────────────────────
@@ -770,9 +961,9 @@ int RunCompareMode(atb_llm::LLMEngine* engine,
 
             if (input_ids.empty()) {
                 // Fallback: hardcoded construction
-                LOG_WARN("Token file %s not found — using hardcoded tokens. "
-                            "Run 'python benchmark.py --save-tokens --mode mm' "
-                            "for accurate tokenization.", token_path);
+                LOG_WARN("Chat-templated token file not found: %s — "
+                         "using hardcoded tokens. Run 'python atb_cpp_llm/scripts/gen_compare_tokens.py' "
+                         "to generate accurate token files.", token_path);
                 input_ids.push_back(TOK_DESCRIBE);
                 for (int64_t j = 0; j < vis_tokens; j++) {
                     input_ids.push_back(image_token_id);
@@ -814,16 +1005,19 @@ int RunCompareMode(atb_llm::LLMEngine* engine,
             auto results = RunBenchmark(engine, request, num_warmup, num_iter, true,
                                          save_path);
             if (results.empty()) { ret = 1; break; }
-            for (auto& r : results) {
-                r.timings.preprocess_ms = pre_ms;
-            }
 
             std::vector<double> e2e_times;
             for (auto& r : results) e2e_times.push_back(r.e2e_ms);
             Stats e2e_stats = ComputeStats(e2e_times);
             ReportStagesCompact(results, "mm", resolution_str,
                                 static_cast<int>(seq_len),
-                                static_cast<int>(vis_tokens), e2e_stats);
+                                static_cast<int>(vis_tokens), e2e_stats, pre_ms);
+            char label[64];
+            std::snprintf(label, sizeof(label),
+                          "MM %s", resolution_str);
+            ReportStages(results, label,
+                         static_cast<int>(seq_len),
+                         static_cast<int>(vis_tokens), e2e_stats, pre_ms);
         }
     }
 
@@ -835,10 +1029,10 @@ int RunCompareMode(atb_llm::LLMEngine* engine,
         LOG_INFO("    /tmp/cpp_text_only_1024.bin");
         LOG_INFO("    /tmp/cpp_text_only_2048.bin");
         LOG_INFO("    /tmp/cpp_text_only_4096.bin");
-        for (int i = 0; i < num_res; i++) {
-            LOG_INFO("    /tmp/cpp_pv_%dx%d.bin", resolutions[i].w, resolutions[i].h);
-            LOG_INFO("    /tmp/cpp_io_%dx%d.bin", resolutions[i].w, resolutions[i].h);
-            LOG_INFO("    /tmp/cpp_mm_%dx%d.bin", resolutions[i].w, resolutions[i].h);
+        for (int i = 0; i < kNumBenchmarkResolutions; i++) {
+            LOG_INFO("    /tmp/cpp_pv_%dx%d.bin", kBenchmarkResolutions[i].w, kBenchmarkResolutions[i].h);
+            LOG_INFO("    /tmp/cpp_io_%dx%d.bin", kBenchmarkResolutions[i].w, kBenchmarkResolutions[i].h);
+            LOG_INFO("    /tmp/cpp_mm_%dx%d.bin", kBenchmarkResolutions[i].w, kBenchmarkResolutions[i].h);
         }
         LOG_INFO("============================================================");
     }
@@ -877,66 +1071,205 @@ int main(int argc, char** argv) {
         }
     }
 
+    // Validate model directory (was static global — now checked after LOG init)
+    std::string model_dir = GetModelDir();
+    if (model_dir.empty()) {
+        LOG_ERROR("QWEN3VL_EMB_MODEL_DIR is not set (see stderr for details).");
+        return 1;
+    }
+
     if (!cmp_mode) {
         LOG_INFO("=== Qwen3VL Embedding Benchmark ===");
-        LOG_INFO("Model: %s", MODEL_DIR.c_str());
+        LOG_INFO("Model: %s", model_dir.c_str());
         LOG_INFO("Mode: %s", mode.c_str());
     }
 
-    // Create engine
+    // Engine config (shared by all factory calls)
     atb_llm::EngineConfig config;
-    config.model_dir = MODEL_DIR;
+    config.model_dir = model_dir;
     config.buffer_size = 10LL * 1024 * 1024 * 1024;
     config.device_id = 0;
 
-    std::unique_ptr<atb_llm::LLMEngine> engine;
-    auto t0 = std::chrono::high_resolution_clock::now();
-    atb_llm::Status s = atb_llm::LLMEngine::Create(config, engine);
-    auto t1 = std::chrono::high_resolution_clock::now();
-    auto load_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+    // Helper: create engine and return via unique_ptr
+    auto CreateEngine = [&]() -> std::unique_ptr<atb_llm::LLMEngine> {
+        std::unique_ptr<atb_llm::LLMEngine> eng;
+        auto t0 = std::chrono::high_resolution_clock::now();
+        atb_llm::Status st = atb_llm::LLMEngine::Create(config, eng);
+        auto t1 = std::chrono::high_resolution_clock::now();
+        auto load_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+        if (st != atb_llm::STATUS_OK || !eng) {
+            LOG_ERROR("Failed to create engine: %d", static_cast<int>(st));
+            return nullptr;
+        }
+        if (!cmp_mode) LOG_INFO("Engine load time: %ld ms", static_cast<long>(load_ms));
+        return eng;
+    };
 
-    if (s != atb_llm::STATUS_OK || !engine) {
-        LOG_ERROR("Failed to create engine: %d", static_cast<int>(s));
-        return 1;
+    // Create engine for single modes; all/cold/throughput create engines per mode below
+    std::unique_ptr<atb_llm::LLMEngine> engine;
+    if (mode != "all" && mode != "cold" && mode != "throughput") {
+        engine = CreateEngine();
+        if (!engine) return 1;
     }
-    if (!cmp_mode) LOG_INFO("Engine load time: %ld ms", static_cast<long>(load_ms));
 
     int ret = 0;
     if (mode == "text") {
         ret = RunTextBenchmark(engine.get(), seq_len, num_warmup, num_iter, cmp_mode);
     } else if (mode == "mm") {
-        ret = RunMultimodalBenchmark(engine.get(), img_w, img_h, num_warmup, num_iter, cmp_mode);
+        ret = RunMultimodalBenchmark(engine.get(), model_dir, img_w, img_h, num_warmup, num_iter, cmp_mode);
     } else if (mode == "io") {
-        ret = RunImageOnlyBenchmark(engine.get(), img_w, img_h, num_warmup, num_iter, cmp_mode);
+        ret = RunImageOnlyBenchmark(engine.get(), model_dir, img_w, img_h, num_warmup, num_iter, cmp_mode);
     } else if (mode == "all") {
-        ret = RunTextBenchmark(engine.get(), seq_len, num_warmup, num_iter, cmp_mode);
-        if (ret == 0) {
-            ret = RunImageOnlyBenchmark(engine.get(), img_w, img_h, num_warmup, num_iter, cmp_mode);
+        std::vector<std::tuple<std::string, std::string, ColdMetrics>> cold_results;
+        std::vector<std::tuple<std::string, std::string, ThroughputMetrics>> tput_results;
+
+        // ── Text mode (per-mode engine) ─────────────────────────
+        {
+            auto eng = CreateEngine();
+            if (!eng) return 1;
+            ColdMetrics cold;
+            ThroughputMetrics tput;
+            ret = RunTextBenchmark(eng.get(), seq_len, num_warmup, num_iter, cmp_mode, &cold, &tput);
+            if (ret == 0) {
+                if (cold.valid) {
+                    cold_results.push_back({"text", "seq_" + std::to_string(seq_len), cold});
+                }
+                tput_results.push_back({"text", "seq_" + std::to_string(seq_len), tput});
+            }
         }
+
+        // ── Image-only mode (per-mode engine) ───────────────────
         if (ret == 0) {
-            ret = RunMultimodalBenchmark(engine.get(), img_w, img_h, num_warmup, num_iter, cmp_mode);
+            auto eng = CreateEngine();
+            if (!eng) return 1;
+            ColdMetrics cold;
+            ThroughputMetrics tput;
+            char res[32];
+            std::snprintf(res, sizeof(res), "%dx%d", img_w, img_h);
+            ret = RunImageOnlyBenchmark(eng.get(), model_dir, img_w, img_h,
+                                        num_warmup, num_iter, cmp_mode, &cold, &tput);
+            if (ret == 0) {
+                if (cold.valid) {
+                    cold_results.push_back({"io", res, cold});
+                }
+                tput_results.push_back({"io", res, tput});
+            }
         }
+
+        // ── Multimodal mode (per-mode engine) ───────────────────
+        if (ret == 0) {
+            auto eng = CreateEngine();
+            if (!eng) return 1;
+            ColdMetrics cold;
+            ThroughputMetrics tput;
+            char res[32];
+            std::snprintf(res, sizeof(res), "%dx%d", img_w, img_h);
+            ret = RunMultimodalBenchmark(eng.get(), model_dir, img_w, img_h,
+                                         num_warmup, num_iter, cmp_mode, &cold, &tput);
+            if (ret == 0) {
+                if (cold.valid) {
+                    cold_results.push_back({"mm", res, cold});
+                }
+                tput_results.push_back({"mm", res, tput});
+            }
+        }
+
+        ReportColdStart(cold_results);
+        ReportThroughput(tput_results);
+    } else if (mode == "throughput") {
+        // Three modes sequentially, each with a pre-warmed per-mode engine
+        std::vector<std::tuple<std::string, std::string, ThroughputMetrics>> tput_results;
+
+        // ── Text mode (seq=2048) ─────────────────────────────────
+        {
+            auto eng = CreateEngine();
+            if (!eng) return 1;
+            ThroughputMetrics tput;
+            ret = RunTextBenchmark(eng.get(), 2048, num_warmup, num_iter,
+                                   cmp_mode, nullptr, &tput);
+            if (ret == 0) {
+                tput_results.push_back({"text", "seq_2048", tput});
+            }
+        }
+
+        // ── IO mode (1080x1920) ───────────────────────────────────
+        if (ret == 0) {
+            auto eng = CreateEngine();
+            if (!eng) return 1;
+            ThroughputMetrics tput;
+            ret = RunImageOnlyBenchmark(eng.get(), model_dir, 1080, 1920,
+                                        num_warmup, num_iter, cmp_mode, nullptr, &tput);
+            if (ret == 0) {
+                tput_results.push_back({"io", "1080x1920", tput});
+            }
+        }
+
+        // ── MM mode (1080x1920) ───────────────────────────────────
+        if (ret == 0) {
+            auto eng = CreateEngine();
+            if (!eng) return 1;
+            ThroughputMetrics tput;
+            ret = RunMultimodalBenchmark(eng.get(), model_dir, 1080, 1920,
+                                         num_warmup, num_iter, cmp_mode, nullptr, &tput);
+            if (ret == 0) {
+                tput_results.push_back({"mm", "1080x1920", tput});
+            }
+        }
+
+        ReportThroughput(tput_results);
+    } else if (mode == "cold") {
+        std::vector<std::tuple<std::string, std::string, ColdMetrics>> cold_results;
+
+        // ── Text cold: seq=2048 ─────────────────────────────────
+        {
+            auto eng = CreateEngine();
+            if (!eng) return 1;
+            ColdMetrics cold;
+            ret = RunTextBenchmark(eng.get(), 2048, num_warmup, num_iter, cmp_mode, &cold);
+            if (ret == 0 && cold.valid) {
+                cold_results.push_back({"text", "seq_2048", cold});
+            }
+        }
+
+        // ── IO cold: 1080x1920 ──────────────────────────────────
+        if (ret == 0) {
+            auto eng = CreateEngine();
+            if (!eng) return 1;
+            ColdMetrics cold;
+            ret = RunImageOnlyBenchmark(eng.get(), model_dir, 1080, 1920,
+                                        num_warmup, num_iter, cmp_mode, &cold);
+            if (ret == 0 && cold.valid) {
+                cold_results.push_back({"io", "1080x1920", cold});
+            }
+        }
+
+        // ── MM cold: 1080x1920 ──────────────────────────────────
+        if (ret == 0) {
+            auto eng = CreateEngine();
+            if (!eng) return 1;
+            ColdMetrics cold;
+            ret = RunMultimodalBenchmark(eng.get(), model_dir, 1080, 1920,
+                                         num_warmup, num_iter, cmp_mode, &cold);
+            if (ret == 0 && cold.valid) {
+                cold_results.push_back({"mm", "1080x1920", cold});
+            }
+        }
+
+        ReportColdStart(cold_results);
     } else if (mode == "bench") {
-        struct { int w, h; } resolutions[] = {
-            {224, 224},
-            {416, 672},
-            {672, 416},
-            {896, 896},
-        };
-        int num_res = static_cast<int>(sizeof(resolutions) / sizeof(resolutions[0]));
-        for (int i = 0; i < num_res; i++) {
+        for (int i = 0; i < kNumBenchmarkResolutions; i++) {
             if (!cmp_mode && i > 0) {
                 LOG_INFO("============================================================");
             }
-            ret = RunImageOnlyBenchmark(engine.get(),
-                                         resolutions[i].w, resolutions[i].h,
+            ret = RunImageOnlyBenchmark(engine.get(), model_dir,
+                                         kBenchmarkResolutions[i].w, kBenchmarkResolutions[i].h,
                                          num_warmup, num_iter, cmp_mode);
             if (ret != 0) break;
         }
     } else if (mode == "compare") {
-        ret = RunCompareMode(engine.get(), num_warmup, num_iter);
+        ret = RunCompareMode(engine.get(), model_dir, num_warmup, num_iter);
     } else {
-        LOG_ERROR("Unknown mode: %s (use text|mm|io|all|bench|compare)", mode.c_str());
+        LOG_ERROR("Unknown mode: %s (use text|mm|io|all|bench|compare|cold|throughput)", mode.c_str());
         return 1;
     }
 

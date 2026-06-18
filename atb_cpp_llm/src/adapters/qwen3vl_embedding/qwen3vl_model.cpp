@@ -303,6 +303,10 @@ Status Qwen3VLModel::ForwardWithTiming(const InferRequest& request,
         if (!gthw && request.preprocessed.metadata) {
             gthw = static_cast<const int64_t*>(request.preprocessed.metadata);
         }
+        if (!gthw) {
+            LOG_ERROR("ForwardWithTiming: grid_thw and metadata are both null");
+            return ERROR_INVALID_PARAM;
+        }
         grid_thw_host.assign(gthw, gthw + 3);
         num_images = 1;
 
@@ -369,7 +373,11 @@ Status Qwen3VLModel::ForwardWithTiming(const InferRequest& request,
             LOG_ERROR("ForwardWithTiming: alloc vision pixels NPU tensor failed");
             return ERROR_NPU_MEMORY;
         }
-        alloc->CopyToDevice(*pixels_npu.Get(), pv, pixel_bytes);
+        Status s = alloc->CopyToDevice(*pixels_npu.Get(), pv, pixel_bytes);
+        if (s != STATUS_OK) {
+            LOG_ERROR("ForwardWithTiming: copy vision pixels to device failed");
+            return s;
+        }
 
         atb::Tensor vis_seqlen;
         int32_t vis_seqlen_val = static_cast<int32_t>(total_tokens);
@@ -471,7 +479,11 @@ Status Qwen3VLModel::ForwardWithTiming(const InferRequest& request,
 
             size_t merged_bytes = static_cast<size_t>(merged_tokens) *
                                   vis_embed_dim * sizeof(uint16_t);
-            alloc->CopyToHost(vis_embeds_host.data(), *merged_out.Get(), merged_bytes);
+            s = alloc->CopyToHost(vis_embeds_host.data(), *merged_out.Get(), merged_bytes);
+            if (s != STATUS_OK) {
+                LOG_ERROR("ForwardWithTiming: copy vision merger to host failed");
+                return s;
+            }
         }
 
         runtime_->Synchronize();
@@ -532,15 +544,23 @@ Status Qwen3VLModel::ForwardWithTiming(const InferRequest& request,
             LOG_ERROR("ForwardWithTiming: alloc cached cos NPU tensor failed");
             return ERROR_NPU_MEMORY;
         }
-        alloc->CopyToDevice(*cached_cos_npu_.Get(), cos16.data(),
-                            static_cast<size_t>(seq_len) * hd * sizeof(uint16_t));
+        Status s = alloc->CopyToDevice(*cached_cos_npu_.Get(), cos16.data(),
+                                       static_cast<size_t>(seq_len) * hd * sizeof(uint16_t));
+        if (s != STATUS_OK) {
+            LOG_ERROR("ForwardWithTiming: copy cached cos to device failed");
+            return s;
+        }
         cached_sin_npu_ = AllocNpuFloat16({seq_len, hd});
         if (!cached_sin_npu_) {
             LOG_ERROR("ForwardWithTiming: alloc cached sin NPU tensor failed");
             return ERROR_NPU_MEMORY;
         }
-        alloc->CopyToDevice(*cached_sin_npu_.Get(), sin16.data(),
-                            static_cast<size_t>(seq_len) * hd * sizeof(uint16_t));
+        s = alloc->CopyToDevice(*cached_sin_npu_.Get(), sin16.data(),
+                                static_cast<size_t>(seq_len) * hd * sizeof(uint16_t));
+        if (s != STATUS_OK) {
+            LOG_ERROR("ForwardWithTiming: copy cached sin to device failed");
+            return s;
+        }
         // Generate causal mask in platform-correct format
         if (Is310P()) {
             // 310P PA_ENCODER requires NZ (FRACTAL_NZ) format mask.
@@ -556,8 +576,12 @@ Status Qwen3VLModel::ForwardWithTiming(const InferRequest& request,
                 return ERROR_NPU_MEMORY;
             }
             cached_mask_npu_.Get()->desc.format = ACL_FORMAT_FRACTAL_NZ;
-            alloc->CopyToDevice(*cached_mask_npu_.Get(), m16_nz.data(),
-                                static_cast<size_t>(nz_elems) * sizeof(uint16_t));
+            s = alloc->CopyToDevice(*cached_mask_npu_.Get(), m16_nz.data(),
+                                    static_cast<size_t>(nz_elems) * sizeof(uint16_t));
+            if (s != STATUS_OK) {
+                LOG_ERROR("ForwardWithTiming: copy cached mask (NZ) to device failed");
+                return s;
+            }
         } else {
             // 910B: standard ND causal mask
             std::vector<uint16_t> m16(static_cast<size_t>(seq_len) * seq_len);
@@ -567,8 +591,12 @@ Status Qwen3VLModel::ForwardWithTiming(const InferRequest& request,
                 LOG_ERROR("ForwardWithTiming: alloc cached mask NPU tensor (ND) failed");
                 return ERROR_NPU_MEMORY;
             }
-            alloc->CopyToDevice(*cached_mask_npu_.Get(), m16.data(),
-                                static_cast<size_t>(seq_len) * seq_len * sizeof(uint16_t));
+            s = alloc->CopyToDevice(*cached_mask_npu_.Get(), m16.data(),
+                                    static_cast<size_t>(seq_len) * seq_len * sizeof(uint16_t));
+            if (s != STATUS_OK) {
+                LOG_ERROR("ForwardWithTiming: copy cached mask (ND) to device failed");
+                return s;
+            }
         }
         cached_text_seq_len_ = seq_len;
     }
@@ -588,8 +616,12 @@ Status Qwen3VLModel::ForwardWithTiming(const InferRequest& request,
             LOG_ERROR("ForwardWithTiming: alloc text hidden NPU tensor failed");
             return ERROR_NPU_MEMORY;
         }
-        alloc->CopyToDevice(*h_npu.Get(), inputs_embeds.data(),
-                            static_cast<size_t>(n) * hidden_size * sizeof(uint16_t));
+        Status s = alloc->CopyToDevice(*h_npu.Get(), inputs_embeds.data(),
+                                       static_cast<size_t>(n) * hidden_size * sizeof(uint16_t));
+        if (s != STATUS_OK) {
+            LOG_ERROR("ForwardWithTiming: copy text embeddings to device failed");
+            return s;
+        }
         atb::Tensor seqlen;
         int32_t sl = seq_len;
         seqlen.desc.dtype = ACL_INT32;
@@ -598,7 +630,7 @@ Status Qwen3VLModel::ForwardWithTiming(const InferRequest& request,
         seqlen.desc.shape.dims[0] = 1;
         seqlen.dataSize = sizeof(int32_t);
         seqlen.hostData = &sl;
-        Status s = text_runner_->EnsureBuilt(seq_len);
+        s = text_runner_->EnsureBuilt(seq_len);
         if (s != STATUS_OK) return s;
 
         // ── Text sub-stage: 28 Decoder Layers ──
@@ -651,8 +683,12 @@ Status Qwen3VLModel::ForwardWithTiming(const InferRequest& request,
         s = ExecuteGraph(text_runner_->GetNormGraph(), nvp);
         if (s != STATUS_OK) return s;
         runtime_->Synchronize();
-        alloc->CopyToHost(inputs_embeds.data(), *norm_out.Get(),
-                          static_cast<size_t>(n) * hidden_size * sizeof(uint16_t));
+        s = alloc->CopyToHost(inputs_embeds.data(), *norm_out.Get(),
+                              static_cast<size_t>(n) * hidden_size * sizeof(uint16_t));
+        if (s != STATUS_OK) {
+            LOG_ERROR("ForwardWithTiming: copy text norm to host failed");
+            return s;
+        }
     }
 
     auto t_text_model = std::chrono::high_resolution_clock::now();
@@ -753,7 +789,11 @@ Status Qwen3VLModel::RunVision(const uint16_t* pixel_values, int64_t num_patches
         LOG_ERROR("RunVision: alloc vision pixels NPU tensor failed");
         return ERROR_NPU_MEMORY;
     }
-    alloc->CopyToDevice(*pixels_npu.Get(), pixel_values, pixel_bytes);
+    Status s = alloc->CopyToDevice(*pixels_npu.Get(), pixel_values, pixel_bytes);
+    if (s != STATUS_OK) {
+        LOG_ERROR("RunVision: copy vision pixels to device failed");
+        return s;
+    }
 
     // Seqlen for vision (host-side int32, not NPU-allocated)
     atb::Tensor vis_seqlen;
@@ -879,7 +919,11 @@ Status Qwen3VLModel::RunVision(const uint16_t* pixel_values, int64_t num_patches
         // Copy merged vision embeddings to host
         size_t merged_bytes = static_cast<size_t>(merged_tokens) *
                               config_.vis_out_hidden_size * sizeof(uint16_t);
-        alloc->CopyToHost(vis_embeds_out, *merged_out.Get(), merged_bytes);
+        s = alloc->CopyToHost(vis_embeds_out, *merged_out.Get(), merged_bytes);
+        if (s != STATUS_OK) {
+            LOG_ERROR("RunVision: copy vision merger to host failed");
+            return s;
+        }
 
         // DEBUG: Save merged vision output for comparison with Python
         DebugDumpMerged(vis_embeds_out,
@@ -950,10 +994,18 @@ Status Qwen3VLModel::ComputePosEmbedNpu(const int64_t* grid_thw, int64_t num_ima
             return ERROR_NPU_MEMORY;
         }
 
-        alloc->CopyToDevice(*idx_npu[k].Get(), idx_host[k].data(),
-                            n * sizeof(int32_t));
-        alloc->CopyToDevice(*wt_npu[k].Get(), wt_host[k].data(),
-                            n * sizeof(uint16_t));
+        Status s = alloc->CopyToDevice(*idx_npu[k].Get(), idx_host[k].data(),
+                                       n * sizeof(int32_t));
+        if (s != STATUS_OK) {
+            LOG_ERROR("ComputePosEmbedNpu: copy idx%d to device failed", k);
+            return s;
+        }
+        s = alloc->CopyToDevice(*wt_npu[k].Get(), wt_host[k].data(),
+                                n * sizeof(uint16_t));
+        if (s != STATUS_OK) {
+            LOG_ERROR("ComputePosEmbedNpu: copy wt%d to device failed", k);
+            return s;
+        }
     }
 
     atb::VariantPack vp;
@@ -1020,18 +1072,30 @@ int64_t Qwen3VLModel::ComputeVisionRopeNpu(const int64_t* grid_thw,
         LOG_ERROR("ComputeVisionRopeNpu: tensor alloc failed");
         return -1;
     }
-    alloc->CopyToDevice(*ft_npu.Get(), freq_table_fp16.data(),
-                        freq_table_fp16.size() * sizeof(uint16_t));
-    alloc->CopyToDevice(*row_npu.Get(), row_idx_host.data(),
-                        n * sizeof(int32_t));
-    alloc->CopyToDevice(*col_npu.Get(), col_idx_host.data(),
-                        n * sizeof(int32_t));
+    Status s = alloc->CopyToDevice(*ft_npu.Get(), freq_table_fp16.data(),
+                                   freq_table_fp16.size() * sizeof(uint16_t));
+    if (s != STATUS_OK) {
+        LOG_ERROR("ComputeVisionRopeNpu: copy freq table to device failed");
+        return -1;
+    }
+    s = alloc->CopyToDevice(*row_npu.Get(), row_idx_host.data(),
+                            n * sizeof(int32_t));
+    if (s != STATUS_OK) {
+        LOG_ERROR("ComputeVisionRopeNpu: copy row indices to device failed");
+        return -1;
+    }
+    s = alloc->CopyToDevice(*col_npu.Get(), col_idx_host.data(),
+                            n * sizeof(int32_t));
+    if (s != STATUS_OK) {
+        LOG_ERROR("ComputeVisionRopeNpu: copy col indices to device failed");
+        return -1;
+    }
 
     atb::VariantPack vp;
     vp.inTensors  = {*ft_npu.Get(), *row_npu.Get(), *col_npu.Get()};
     vp.outTensors = {cos_npu, sin_npu};
 
-    Status s = ExecuteGraph(vis_rope_graph_, vp);
+    s = ExecuteGraph(vis_rope_graph_, vp);
     if (s != STATUS_OK) {
         LOG_ERROR("ComputeVisionRopeNpu: graph execute failed");
         return -1;

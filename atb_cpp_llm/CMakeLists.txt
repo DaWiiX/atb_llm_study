@@ -180,8 +180,8 @@ function(add_atb_test name source)
             ${ASCEND_TOOLKIT_DIR}/lib64
     )
     target_link_libraries(${name} PRIVATE atb_llm_engine atb ascendcl)
-    # Register as CTest target unless it's a benchmark
-    if(NOT name MATCHES "^bench_")
+    # Register as CTest target unless it's a benchmark (names starting with "bench")
+    if(NOT name MATCHES "^bench")
         add_test(NAME ${name} COMMAND ${name})
         # Auto-derive a CTest label from the source path:
         #   tests/level1_cpu_pure/foo.cpp  →  label "level1_cpu_pure"
@@ -300,6 +300,45 @@ add_test(NAME test_io_adapters COMMAND test_io_adapters)
 # Match the label scheme used by add_atb_test() above.
 set_tests_properties(test_io_adapters PROPERTIES LABELS "level0_framework")
 
+# Benchmark mode smoke test (doctest, needs NPU + full model).
+# Spawns the benchmark binary, runs --mode text, parses output to verify
+# BENCH_RESULT machine lines + human-readable stage table both present.
+# Prevents regression of §9.8 (benchmark output quality never validated).
+add_executable(test_benchmark_modes tests/test_benchmark_modes.cpp)
+target_include_directories(test_benchmark_modes
+    PRIVATE
+        src
+        tests
+)
+target_compile_options(test_benchmark_modes PRIVATE
+    -Wno-unused-result
+    -Wno-unused-parameter
+    -Wno-sign-compare
+    -Wno-unused-function
+)
+target_link_directories(test_benchmark_modes
+    PRIVATE
+        ${ATB_DIR}/lib
+        ${ASCEND_TOOLKIT_DIR}/lib64
+)
+target_link_libraries(test_benchmark_modes PRIVATE atb_llm_engine atb ascendcl)
+add_test(NAME test_benchmark_modes COMMAND test_benchmark_modes)
+set_tests_properties(test_benchmark_modes PROPERTIES LABELS "level4_e2e;needs_npu")
+# Propagate env vars (ASCEND_PLATFORM, model dir) to the test subprocess
+# so the spawned benchmark can locate the model checkpoint — mirrors the
+# ENVIRONMENT logic inside add_atb_test() above.
+# LOG_LEVEL=1 forces INFO output so the human-readable ReportStages table
+# (emitted via LOG_INFO, otherwise muted at the default WARN level) is
+# captured and asserted by the test.
+set(_bm_env "LOG_LEVEL=1")
+if(DEFINED ENV{ASCEND_PLATFORM})
+    list(APPEND _bm_env "ASCEND_PLATFORM=$ENV{ASCEND_PLATFORM}")
+endif()
+if(DEFINED ENV{QWEN3VL_EMB_MODEL_DIR})
+    list(APPEND _bm_env "QWEN3VL_EMB_MODEL_DIR=$ENV{QWEN3VL_EMB_MODEL_DIR}")
+endif()
+set_tests_properties(test_benchmark_modes PROPERTIES ENVIRONMENT "${_bm_env}")
+
 # Benchmarks (not registered as CTest tests)
 add_atb_test(benchmark                 tests/benchmark.cpp)  # stays at tests/ root
 
@@ -319,23 +358,26 @@ set_tests_properties(
     test_forward_error_paths
     test_sync_safety
     test_vision_stages
+    test_benchmark_modes
     PROPERTIES RESOURCE_LOCK "npu_e2e"
 )
 
 # ── Reference-data dependency labels ──────────────────────
 # Tests that fopen() /tmp/{cpu_,preprocess_,stage_,posembed_npu_,visrope_npu_}*.bin
 # files produced by tests/python_reference/gen_all.py. When those .bin
-# files are absent the tests silently skip (LOG_ERROR + return), which
-# looks like PASS from ctest's perspective — a real footgun.
+# files are absent, every test listed below correctly returns a non-zero exit code
+# (true failure), so ctest will report them as FAIL — not PASS.
 #
-# build_and_test.sh's --no-refdata mode passes `ctest -LE "needs_refdata"`
-# to actively exclude these tests when reference data is unavailable
+# The "needs_refdata" label is defense-in-depth: build_and_test.sh's
+# --no-refdata mode passes `ctest -LE "^needs_refdata$"` to proactively
+# exclude these tests when reference data is known to be unavailable
 # (either explicitly via the flag, or via auto-fallback from
-# --no-refresh-refdata when sentinel files are missing).
+# --no-refresh-refdata when sentinel files are missing). This avoids
+# noisy, expected failures that would distract from real regressions.
 #
 # Maintenance contract: when a new test reads a /tmp/*.bin file, list it
 # here. Discovered via: grep -lE '/tmp/(cpu_|preprocess_|stage_|posembed_npu_|visrope_npu_)' \
-#                          tests/level*/*.cpp
+#                          tests/level*/*.cpp | grep -v test_config_wiring
 set(REFDATA_DEPENDENT_TESTS
     # Level 0 framework tests
     test_io_adapters
