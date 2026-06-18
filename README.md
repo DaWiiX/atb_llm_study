@@ -147,7 +147,7 @@ bash build_and_test.sh --list                                                 # 
 - **位置参数自动识别**：命中 `level0_framework` / `level1_cpu_pure` / `level2_op_precision` / `level3_integration` / `level4_e2e` 当作 level 过滤，否则当作测试名过滤。
 - **参考数据三态**：默认每次刷新（~90s），`--no-refresh-refdata` 复用已有（缺失自动 fallback 到 `--no-refdata`），`--no-refdata` 主动排除 27 个依赖参考数据的测试并打印清单。
 
-详细规则、维护契约、边界用例见 [`atb_cpp_llm/docs/testing-guide.md` § 一·五](atb_cpp_llm/docs/testing-guide.md)。
+详细规则、维护契约、边界用例见 [`atb_cpp_llm/docs/archive/testing-guide.md` § 一·五](atb_cpp_llm/docs/archive/testing-guide.md)。
 
 脚本会：
 
@@ -166,7 +166,7 @@ bash build_and_test.sh --list                                                 # 
 python atb_cpp_llm/tests/python_reference/gen_all.py
 
 # gen_all.py 自身的 --skip-fresh: 跳过哨兵文件已存在的生成器（脚本默认 mode 不传这个 flag，
-# 用户在脚本层用 --no-refresh-refdata 控制，详见 atb_cpp_llm/docs/testing-guide.md § 一·五 #8）
+# 用户在脚本层用 --no-refresh-refdata 控制，详见 atb_cpp_llm/docs/archive/testing-guide.md § 一·五 #8）
 python atb_cpp_llm/tests/python_reference/gen_all.py --skip-fresh
 ```
 

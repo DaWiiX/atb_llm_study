@@ -241,7 +241,7 @@
 - **结论**: 
   - deepstack_fusion.cpp 中的 per-op sync 必须保留（P5 性能收益依赖正确调度）
   - 其他位置**不加**额外 sync，除非有明确的同步需求且经过 13/13 精度验证
-- **经验教训**: 见 [refactoring-plan.md §4.10](./refactoring-plan.md#410-npu-sync-语义不是加了更安全)
+- **经验教训**: 见 [lessons-learned.md 主题1第3条](../lessons-learned.md#主题-1精度调试)（NPU sync 不是"加了更安全"）
 - **相关测试**: ✅ G5 `test_sync_safety.{cpp,py}`（2026-06-09）— per-op sync 和 timing sync 均可安全移除（cosine=1.000 bit-exact），deepstack 和 D2H sync 必须保留
 
 ---
@@ -316,7 +316,7 @@
 
 **生产性能**（2026-06-09，chat-templated inputs，C++ ATB vs Python ATB）:
 - C++ ATB geomean 领先 Python ATB **1.39×**、领先 Transformers **4.22×**
-- 详见 [refactoring-plan.md §3 当前性能基线](./refactoring-plan.md#3-当前性能基线phase-192026-06-09)
+- 详见 [archive/refactoring-plan.md §3 当前性能基线](../archive/refactoring-plan.md#3-当前性能基线phase-192026-06-09)
 
 ---
 
@@ -360,4 +360,4 @@
 - **Level 2 (NPU op precision)**: 新增的 NPU graph 与 Python reference cosine ≥ 0.999
 - **Level 3 (E2E)**: `test_accuracy.py` 三模式 ≥ 0.99
 
-参考: `docs/testing-guide.md`
+参考: `docs/archive/testing-guide.md`（历史 310P 验证日志）、`docs/evergreen/platform-310p.md`（平台适配现况）
