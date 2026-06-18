@@ -55,7 +55,13 @@ class Qwen3VLEngine:
     def __init__(self, model_dir: str):
         self._closed = False
         self._lock = threading.Lock()
-        import torch_npu  # noqa: F401 — required for ATB NPU ops
+        try:
+            import torch_npu  # noqa: F401 — required for ATB NPU ops
+        except ImportError as e:
+            raise ImportError(
+                "torch_npu is required but not installed. "
+                "Install with: pip install torch_npu"
+            ) from e
 
         self.model_dir = Path(model_dir)
 
@@ -100,34 +106,64 @@ class Qwen3VLEngine:
         self.pp_max_px = pp["max_pixels"]
 
         # ── Cached weights (NPU-resident float16) ────────────────────
-        self.embed_w = get_embed_weight(self.weights)
-        self.norm_w = get_text_norm_weight(self.weights).half().npu()
-        self.t_layer_weights = [
-            [to_npu_half(w) for w in get_text_layer_weights(self.weights, i)]
-            for i in range(self.n_layer)
-        ]
+        try:
+            self.embed_w = get_embed_weight(self.weights)
+        except KeyError as e:
+            raise KeyError(f"Failed to load embedding weight: missing key {e}") from e
+        try:
+            self.norm_w = get_text_norm_weight(self.weights).half().npu()
+        except KeyError as e:
+            raise KeyError(f"Failed to load text norm weight: missing key {e}") from e
+        self.t_layer_weights = []
+        for i in range(self.n_layer):
+            try:
+                self.t_layer_weights.append(
+                    [to_npu_half(w) for w in get_text_layer_weights(self.weights, i)])
+            except KeyError as e:
+                raise KeyError(
+                    f"Failed to load text layer {i} weights: missing key {e}") from e
 
         # Vision: block weights by layer (NPU-resident)
-        self.v_block_weights = [
-            [to_npu_half(w) for w in get_vision_block_weights(self.weights, i)]
-            for i in range(self.v_depth)
-        ]
-        self.v_pe_w, self.v_pe_b = get_patch_embed_weights(
-            self.weights, self.v_cfg["hidden_size"])
+        self.v_block_weights = []
+        for i in range(self.v_depth):
+            try:
+                self.v_block_weights.append(
+                    [to_npu_half(w) for w in get_vision_block_weights(self.weights, i)])
+            except KeyError as e:
+                raise KeyError(
+                    f"Failed to load vision block {i} weights: missing key {e}") from e
+        try:
+            self.v_pe_w, self.v_pe_b = get_patch_embed_weights(
+                self.weights, self.v_cfg["hidden_size"])
+        except KeyError as e:
+            raise KeyError(
+                f"Failed to load patch embed weights: missing key {e}") from e
         self.v_pe_w = to_npu_half(self.v_pe_w)
         self.v_pe_b = to_npu_half(self.v_pe_b)
-        self.v_pos_embed = get_vision_pos_embed(self.weights)
+        try:
+            self.v_pos_embed = get_vision_pos_embed(self.weights)
+        except KeyError as e:
+            raise KeyError(
+                f"Failed to load vision position embedding: missing key {e}") from e
         self.v_pe_w_table = to_npu_half(self.v_pos_embed)  # NPU fp16 for ATB Gather
         self.num_grid = int(self.v_cfg["num_position_embeddings"] ** 0.5)
 
         # Vision: merger weights (NPU-resident)
-        self.v_merger_w = [to_npu_half(w) for w in
-                           get_merger_weights(self.weights, is_deepstack=False)]
-        self.v_ds_w = [
-            [to_npu_half(w) for w in
-             get_merger_weights(self.weights, is_deepstack=True, ds_idx=i)]
-            for i in range(len(self.ds_indexes))
-        ]
+        try:
+            self.v_merger_w = [to_npu_half(w) for w in
+                               get_merger_weights(self.weights, is_deepstack=False)]
+        except KeyError as e:
+            raise KeyError(
+                f"Failed to load merger weights: missing key {e}") from e
+        self.v_ds_w = []
+        for i in range(len(self.ds_indexes)):
+            try:
+                self.v_ds_w.append(
+                    [to_npu_half(w) for w in
+                     get_merger_weights(self.weights, is_deepstack=True, ds_idx=i)])
+            except KeyError as e:
+                raise KeyError(
+                    f"Failed to load deepstack merger {i} weights: missing key {e}") from e
 
         # ── Build ATB graphs ────────────────────────────────────────
         self._build_graphs()
@@ -246,7 +282,9 @@ class Qwen3VLEngine:
                     f"[Qwen3VLEngine.close] {len(resource_errors)} resource "
                     f"release error(s): {resource_errors}", file=sys.stderr)
             except Exception:
-                pass
+                print(
+                    f"[ERROR] Qwen3VLEngine.close(): failed to log resource errors",
+                    file=sys.stderr)
 
     def __del__(self):
         """Destructor — release NPU resources on garbage collection."""
@@ -255,7 +293,13 @@ class Qwen3VLEngine:
         except Exception:
             # Must not raise from __del__, and we cannot assume that
             # torch / torch_npu / ATB are still importable at this point.
-            pass
+            try:
+                import sys
+                print(
+                    f"[ERROR] Qwen3VLEngine.__del__: cleanup failed",
+                    file=sys.stderr)
+            except Exception:
+                pass  # Nothing we can do
 
     def __enter__(self):
         """Enter context manager — returns self for use in `with` block."""
@@ -310,6 +354,18 @@ class Qwen3VLEngine:
 
     def preprocess_image(self, image: torch.Tensor):
         """Preprocess raw image (C,H,W uint8) → ATB-compatible format."""
+        if not isinstance(image, torch.Tensor):
+            raise TypeError(
+                f"preprocess_image: expected torch.Tensor, "
+                f"got {type(image).__name__}")
+        if image.dtype != torch.uint8:
+            raise TypeError(
+                f"preprocess_image: expected uint8 image, "
+                f"got {image.dtype}")
+        if image.dim() != 3:
+            raise ValueError(
+                f"preprocess_image: expected 3D tensor (C,H,W), "
+                f"got {image.dim()}D")
         return preprocess_image(
             image, patch_size=self.patch_size,
             temporal_patch_size=self.tp, merge_size=self.merge_size,
@@ -635,6 +691,10 @@ class Qwen3VLEngine:
         self._validate_inputs(input_ids, pixel_values, image_grid_thw)
 
         # 1. Text embeddings → NPU
+        if self.embed_w is None:
+            raise RuntimeError(
+                "Embedding weight not loaded — "
+                "engine initialization may have failed silently")
         inputs_embeds = F.embedding(input_ids, self.embed_w).half().npu()
 
         # 2. Vision features — all NPU-resident

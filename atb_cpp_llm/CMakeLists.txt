@@ -180,8 +180,8 @@ function(add_atb_test name source)
             ${ASCEND_TOOLKIT_DIR}/lib64
     )
     target_link_libraries(${name} PRIVATE atb_llm_engine atb ascendcl)
-    # Register as CTest target unless it's a benchmark
-    if(NOT name MATCHES "^bench_")
+    # Register as CTest target unless it's a benchmark (names starting with "bench")
+    if(NOT name MATCHES "^bench")
         add_test(NAME ${name} COMMAND ${name})
         # Auto-derive a CTest label from the source path:
         #   tests/level1_cpu_pure/foo.cpp  →  label "level1_cpu_pure"
@@ -325,17 +325,19 @@ set_tests_properties(
 # ── Reference-data dependency labels ──────────────────────
 # Tests that fopen() /tmp/{cpu_,preprocess_,stage_,posembed_npu_,visrope_npu_}*.bin
 # files produced by tests/python_reference/gen_all.py. When those .bin
-# files are absent the tests silently skip (LOG_ERROR + return), which
-# looks like PASS from ctest's perspective — a real footgun.
+# files are absent, every test listed below correctly returns a non-zero exit code
+# (true failure), so ctest will report them as FAIL — not PASS.
 #
-# build_and_test.sh's --no-refdata mode passes `ctest -LE "needs_refdata"`
-# to actively exclude these tests when reference data is unavailable
+# The "needs_refdata" label is defense-in-depth: build_and_test.sh's
+# --no-refdata mode passes `ctest -LE "^needs_refdata$"` to proactively
+# exclude these tests when reference data is known to be unavailable
 # (either explicitly via the flag, or via auto-fallback from
-# --no-refresh-refdata when sentinel files are missing).
+# --no-refresh-refdata when sentinel files are missing). This avoids
+# noisy, expected failures that would distract from real regressions.
 #
 # Maintenance contract: when a new test reads a /tmp/*.bin file, list it
 # here. Discovered via: grep -lE '/tmp/(cpu_|preprocess_|stage_|posembed_npu_|visrope_npu_)' \
-#                          tests/level*/*.cpp
+#                          tests/level*/*.cpp | grep -v test_config_wiring
 set(REFDATA_DEPENDENT_TESTS
     # Level 0 framework tests
     test_io_adapters

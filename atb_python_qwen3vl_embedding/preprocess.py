@@ -69,6 +69,12 @@ def preprocess_image(image: torch.Tensor,
 
         For single images, grid_t = 1.
     """
+    if not isinstance(image, torch.Tensor):
+        raise TypeError(f"preprocess_image: expected torch.Tensor, got {type(image).__name__}")
+    if image.dtype != torch.uint8:
+        raise TypeError(f"preprocess_image: expected uint8 image, got {image.dtype}")
+    if image.dim() != 3:
+        raise ValueError(f"preprocess_image: expected 3D (C,H,W), got {image.dim()}D")
     image = image.float()
     _, h, w = image.shape
     factor = patch_size * merge_size

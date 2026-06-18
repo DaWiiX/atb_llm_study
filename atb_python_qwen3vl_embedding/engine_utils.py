@@ -160,10 +160,13 @@ def get_text_layer_weights(weights: dict, layer_idx: int) -> list[torch.Tensor]:
     a = lambda name: weights[f"{pfx}self_attn.{name}.weight"]
     m = lambda name: weights[f"{pfx}mlp.{name}.weight"]
     n = lambda name: weights[f"{pfx}{name}.weight"]
-    return [a("q_proj"), a("k_proj"), a("v_proj"), a("o_proj"),
-            a("q_norm"), a("k_norm"),
-            m("gate_proj"), m("up_proj"), m("down_proj"),
-            n("input_layernorm"), n("post_attention_layernorm")]
+    try:
+        return [a("q_proj"), a("k_proj"), a("v_proj"), a("o_proj"),
+                a("q_norm"), a("k_norm"),
+                m("gate_proj"), m("up_proj"), m("down_proj"),
+                n("input_layernorm"), n("post_attention_layernorm")]
+    except KeyError as e:
+        raise KeyError(f"get_text_layer_weights(layer={layer_idx}): missing weight key {e}") from e
 
 
 def get_text_norm_weight(weights: dict) -> torch.Tensor:
@@ -184,12 +187,15 @@ def get_vision_block_weights(weights: dict, block_idx: int) -> list[torch.Tensor
     """
     pfx = f"model.visual.blocks.{block_idx}."
     b = lambda name: weights[f"{pfx}{name}"]
-    return [b("attn.qkv.weight"), b("attn.qkv.bias"),
-            b("attn.proj.weight"), b("attn.proj.bias"),
-            b("mlp.linear_fc1.weight"), b("mlp.linear_fc1.bias"),
-            b("mlp.linear_fc2.weight"), b("mlp.linear_fc2.bias"),
-            b("norm1.weight"), b("norm1.bias"),
-            b("norm2.weight"), b("norm2.bias")]
+    try:
+        return [b("attn.qkv.weight"), b("attn.qkv.bias"),
+                b("attn.proj.weight"), b("attn.proj.bias"),
+                b("mlp.linear_fc1.weight"), b("mlp.linear_fc1.bias"),
+                b("mlp.linear_fc2.weight"), b("mlp.linear_fc2.bias"),
+                b("norm1.weight"), b("norm1.bias"),
+                b("norm2.weight"), b("norm2.bias")]
+    except KeyError as e:
+        raise KeyError(f"get_vision_block_weights(block={block_idx}): missing weight key {e}") from e
 
 
 def get_patch_embed_weights(weights: dict, hidden_size: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -197,8 +203,13 @@ def get_patch_embed_weights(weights: dict, hidden_size: int) -> tuple[torch.Tens
 
     Returns (weight, bias) where weight is (hidden_size, C*tp*p*p).
     """
-    w = weights["model.visual.patch_embed.proj.weight"]  # (hs, C, tp, p, p)
-    b = weights["model.visual.patch_embed.proj.bias"]    # (hs,)
+    try:
+        w = weights["model.visual.patch_embed.proj.weight"]  # (hs, C, tp, p, p)
+        b = weights["model.visual.patch_embed.proj.bias"]    # (hs,)
+    except KeyError as e:
+        raise KeyError(f"get_patch_embed_weights: missing weight key {e}") from e
+    if w.dim() != 5:
+        raise ValueError(f"patch_embed weight expected 5D (hs,C,tp,p,p), got {w.shape}")
     ksize = w.shape[1] * w.shape[2] * w.shape[3] * w.shape[4]  # C*tp*p*p
     w = w.reshape(hidden_size, ksize).contiguous()
     return w, b

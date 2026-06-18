@@ -262,8 +262,8 @@ double MeanStage(const std::vector<TimedResult>& results,
 // ── Report stage timings (human-readable) ────────────────────
 void ReportStages(const std::vector<TimedResult>& results,
                   const char* label, int seq_len, int vis_tokens,
-                  const Stats& e2e_stats) {
-    double preprocess = MeanStage(results, [](const atb_llm::StageTimings& t) { return t.preprocess_ms; });
+                  const Stats& e2e_stats, double preprocess_ms = 0.0) {
+    double preprocess = preprocess_ms;
     double vision_pos = MeanStage(results, [](const atb_llm::StageTimings& t) { return t.vision_pos_ms; });
     double vision_model = MeanStage(results, [](const atb_llm::StageTimings& t) { return t.vision_model_ms; });
     double text_embed = MeanStage(results, [](const atb_llm::StageTimings& t) { return t.text_embed_ms; });
@@ -297,8 +297,8 @@ void ReportStages(const std::vector<TimedResult>& results,
 void ReportStagesCompact(const std::vector<TimedResult>& results,
                          const char* mode, const char* resolution,
                          int seq_len, int vis_tokens,
-                         const Stats& e2e_stats) {
-    double preprocess = MeanStage(results, [](const atb_llm::StageTimings& t) { return t.preprocess_ms; });
+                         const Stats& e2e_stats, double preprocess_ms = 0.0) {
+    double preprocess = preprocess_ms;
     double vision_pos = MeanStage(results, [](const atb_llm::StageTimings& t) { return t.vision_pos_ms; });
     double vision_model = MeanStage(results, [](const atb_llm::StageTimings& t) { return t.vision_model_ms; });
     double text_embed = MeanStage(results, [](const atb_llm::StageTimings& t) { return t.text_embed_ms; });
@@ -576,9 +576,6 @@ int RunMultimodalBenchmark(atb_llm::LLMEngine* engine,
                                 nullptr, cold);
     if (results.empty()) return 1;
     double pre_ms = std::chrono::duration<double, std::milli>(pre_end - pre_start).count();
-    for (auto& r : results) {
-        r.timings.preprocess_ms = pre_ms;
-    }
 
     std::vector<double> e2e_times;
     for (auto& r : results) e2e_times.push_back(r.e2e_ms);
@@ -587,13 +584,13 @@ int RunMultimodalBenchmark(atb_llm::LLMEngine* engine,
     if (cmp_mode) {
         ReportStagesCompact(results, "mm", resolution,
                             static_cast<int>(seq_len),
-                            static_cast<int>(vis_tokens), e2e_stats);
+                            static_cast<int>(vis_tokens), e2e_stats, pre_ms);
     } else {
         char label[64];
         std::snprintf(label, sizeof(label), "%dx%d", img_w, img_h);
         ReportStages(results, label,
                      static_cast<int>(seq_len),
-                     static_cast<int>(vis_tokens), e2e_stats);
+                     static_cast<int>(vis_tokens), e2e_stats, pre_ms);
     }
 
     // B4: Throughput benchmark (after warmup+hot iterations, engine is warm)
@@ -712,9 +709,6 @@ int RunImageOnlyBenchmark(atb_llm::LLMEngine* engine,
                                 nullptr, cold);
     if (results.empty()) return 1;
     double pre_ms = std::chrono::duration<double, std::milli>(pre_end - pre_start).count();
-    for (auto& r : results) {
-        r.timings.preprocess_ms = pre_ms;
-    }
 
     std::vector<double> e2e_times;
     for (auto& r : results) e2e_times.push_back(r.e2e_ms);
@@ -723,13 +717,13 @@ int RunImageOnlyBenchmark(atb_llm::LLMEngine* engine,
     if (cmp_mode) {
         ReportStagesCompact(results, "io", resolution,
                             static_cast<int>(seq_len),
-                            static_cast<int>(vis_tokens), e2e_stats);
+                            static_cast<int>(vis_tokens), e2e_stats, pre_ms);
     } else {
         char label[64];
         std::snprintf(label, sizeof(label), "image-only %dx%d", img_w, img_h);
         ReportStages(results, label,
                      static_cast<int>(seq_len),
-                     static_cast<int>(vis_tokens), e2e_stats);
+                     static_cast<int>(vis_tokens), e2e_stats, pre_ms);
     }
 
     // B4: Throughput benchmark (after warmup+hot iterations, engine is warm)
@@ -933,16 +927,13 @@ int RunCompareMode(atb_llm::LLMEngine* engine,
             auto results = RunBenchmark(engine, request, num_warmup, num_iter, true,
                                          save_path);
             if (results.empty()) { ret = 1; break; }
-            for (auto& r : results) {
-                r.timings.preprocess_ms = pre_ms;
-            }
 
             std::vector<double> e2e_times;
             for (auto& r : results) e2e_times.push_back(r.e2e_ms);
             Stats e2e_stats = ComputeStats(e2e_times);
             ReportStagesCompact(results, "io", resolution_str,
                                 static_cast<int>(vis_tokens),
-                                static_cast<int>(vis_tokens), e2e_stats);
+                                static_cast<int>(vis_tokens), e2e_stats, pre_ms);
         }
 
         // ── IMAGE_AND_TEXT ────────────────────────────────────────
@@ -1002,16 +993,13 @@ int RunCompareMode(atb_llm::LLMEngine* engine,
             auto results = RunBenchmark(engine, request, num_warmup, num_iter, true,
                                          save_path);
             if (results.empty()) { ret = 1; break; }
-            for (auto& r : results) {
-                r.timings.preprocess_ms = pre_ms;
-            }
 
             std::vector<double> e2e_times;
             for (auto& r : results) e2e_times.push_back(r.e2e_ms);
             Stats e2e_stats = ComputeStats(e2e_times);
             ReportStagesCompact(results, "mm", resolution_str,
                                 static_cast<int>(seq_len),
-                                static_cast<int>(vis_tokens), e2e_stats);
+                                static_cast<int>(vis_tokens), e2e_stats, pre_ms);
         }
     }
 

@@ -753,10 +753,12 @@ inline std::string GetModelDir() {
 | 维度 | 已完成 | 进行中 | 待开始 |
 |------|--------|--------|--------|
 | C++ 端鲁棒性 | G1, G2, G3 ✅ | — | — |
-| Benchmark 增强 | B1, B2 ✅ | — | B3-B7 |
-| Python 端 P0 | P0-1, P0-2, P0-3 ✅ | — | P0-4 |
+| Benchmark 增强 | B1, B2, B3, B4 ✅ | — | B5-B7 |
+| Python 端 P0 | P0-1, P0-2, P0-3, P0-4 ✅ | — | — |
+| Benchmark 紧急修复 | F1, F2, F3 ✅ | — | — |
+| 🧪 测试基础设施优化 | R1, R2, P0-1(并行化), P0-2(自动排除) ✅ | — | — |
 | Python 端 P1/P2 | — | — | 48 项 |
-| ⚠️ 运行时验证 | — | **待执行** | — |
+| ⚠️ 运行时验证 | ✅ 已完成（全量 PASS） | — | — |
 
 ### 11.2 第 2 批完成清单
 
@@ -770,20 +772,126 @@ inline std::string GetModelDir() {
 
 | # | 目标 | 严重程度 | 预估工作量 | 说明 |
 |---|------|----------|------------|------|
-| **F1** | 🔴 修复 benchmark.py token 命名不匹配 | P0 | 1h | 改用 chat_tokenizer + `tokens_chat_*` 命名，对齐 C++ 期望 |
-| **F2** | 🔴 创建 `gen_compare_tokens.py` | P0 | 0.5h | 一键生成 C++ compare 模式所需的 13 个 token 文件 |
+| **F1** | 🔴 修复 benchmark.py token 命名不匹配 | P0 | 1h | ✅ 已完成 (`107a76d`) |
+| **F2** | 🔴 创建 `gen_compare_tokens.py` | P0 | 0.5h | ✅ 已完成 (`05ff1cb`) |
+| **F3** | 🔴 GetModelDir() std::abort() 修复 | P0 | 0.5h | ✅ 已完成 (`eb45c6e`) |
 | **P0-4** | engine.py forward() 输入校验 | P0 | 1h | 检查 input_ids dtype/shape、pixel_values/image_grid_thw 一致性、token_id 范围 |
-| **B3** | 冷启动 benchmark | P2 | 1.5h | 测量首次推理的 H2D 拷贝和 graph 编译开销 |
-| **B4** | 吞吐量 benchmark | P2 | 2h | 多 stream/批量并发吞吐量测试 |
-| **回溯验证** | 运行全量测试验证第 1-2 批修改 | P0 | 1h | `python tests/run_all.py` + `bash atb_cpp_llm/build_and_test.sh` |
+| **B3** | 冷启动 benchmark | P2 | 2h | 详见 §11.3.1 |
+| **B4** | 吞吐量 benchmark | P2 | 2.5h | 详见 §11.3.2 |
+| **回溯验证** | 运行全量测试验证 F1-F3 修改 | P0 | 进行中 | `python tests/run_all.py` + `bash atb_cpp_llm/build_and_test.sh` |
+
+### 11.3.1 B3 冷启动 Benchmark 详细规格（2026-06-17 需求确认）
+
+**定义**: Engine 已就绪（权重已加载、graph 已构建），测量第一个 `forward()` 调用的端到端延迟，与后续热迭代均值对比，量化 NPU cache 冷启动惩罚。
+
+**覆盖范围**:
+
+| Mode | 分辨率/SeqLen | 说明 |
+|------|---------------|------|
+| text | seq=2048 | Text-only，纯 DecoderLayer graph |
+| io | 1080×1920 | Image only，纯 VisionBlock graph |
+| mm | 1080×1920 | Image+text，DecoderLayer + VisionBlock graph |
+
+**Engine 生命周期**: 在 `--mode all` 中，每个 mode 独立创建 engine → 冷启动测量 → warmup+热迭代 → B4 吞吐量 → 销毁。三次 engine 生命周期，确保每个 mode 的冷启动是真正的首次 forward。
+
+**每个 mode 流程**:
+```
+创建 engine → Cold(第1帧,记录e2e_ms) → Warmup(丢弃) → Hot iters(N次,取均值) → 吞吐量(20s) → 销毁
+```
+
+**度量指标**:
+
+| 指标 | 说明 |
+|------|------|
+| `cold_e2e_ms` | 首次 forward 端到端延迟 |
+| `warm_e2e_ms` | 热迭代平均端到端延迟 |
+| `cold_penalty_pct` | `(cold - warm) / warm * 100` |
+
+**输出格式** (同时输出 human + machine 两种):
+
+```
+=== Cold-Start Benchmark ===
+mode  | resolution | cold_e2e_ms | warm_e2e_ms | penalty_pct
+text  | seq=2048   |       45.23 |       28.10 |     +60.9%
+io    | 1080x1920  |      178.34 |      102.90 |     +73.3%
+mm    | 1080x1920  |      215.67 |      135.40 |     +59.4%
+BENCH_COLD: mode=text cold_ms=45.23 warm_ms=28.10 penalty_pct=60.9
+BENCH_COLD: mode=io cold_ms=178.34 warm_ms=102.90 penalty_pct=73.3
+BENCH_COLD: mode=mm cold_ms=215.67 warm_ms=135.40 penalty_pct=59.4
+```
+
+**CLI 参数**: `--mode cold`（独立运行）、`--mode all`（自动追加）。
+
+**实现位置**:
+- Python: `atb_python_qwen3vl_embedding/tests/benchmark.py` — 新增 `benchmark_cold_start()` 函数
+- C++: `atb_cpp_llm/tests/benchmark.cpp` — 在 `RunTextBenchmark()`/`RunMultimodalBenchmark()`/`RunImageOnlyBenchmark()` 中添加冷启动捕获
+
+**验收标准** (详见 §11.3.3)。
+
+### 11.3.2 B4 吞吐量 Benchmark 详细规格（2026-06-17 需求确认）
+
+**定义**: 热 engine 下连续推理 20 秒，统计请求数、总 tokens、tokens/sec、平均延迟。贴近生产环境中"服务启动后连续处理请求"的场景。
+
+**覆盖范围**: 与 B3 相同（text seq=2048, io 1080×1920, mm 1080×1920）。
+
+**Engine**: 复用该 mode 的热 engine（不重建）。在 B3 和热迭代完成后立即开始。
+
+**每个 mode 流程**:
+```
+创建 engine → Cold → Warmup → Hot iters → [B4开始] 循环 forward 直到 20s → [B4结束] → 销毁
+```
+
+**度量指标**:
+
+| 指标 | 说明 |
+|------|------|
+| `requests` | 20s 内完成的请求数 |
+| `total_tokens` | 所有请求的 tokens 总和（含 vision tokens + text tokens） |
+| `tokens_per_sec` | `total_tokens / elapsed_sec` |
+| `avg_latency_ms` | `elapsed_ms / requests` |
+
+**输出格式** (同时输出 human + machine 两种):
+
+```
+=== Throughput Benchmark (20s) ===
+mode  | requests | total_tokens | tokens/sec | avg_latency_ms
+text  |      427 |      874,496 |     43,725 |           46.8
+io    |      187 |      228,514 |     11,426 |          106.7
+mm    |      143 |      407,264 |     20,363 |          139.2
+BENCH_TPUT: mode=text requests=427 total_tokens=874496 tps=43725 avg_ms=46.8
+BENCH_TPUT: mode=io requests=187 total_tokens=228514 tps=11426 avg_ms=106.7
+BENCH_TPUT: mode=mm requests=143 total_tokens=407264 tps=20363 avg_ms=139.2
+```
+
+**CLI 参数**: `--mode throughput`（独立运行）、`--mode all`（自动追加）。
+
+**实现位置**:
+- Python: `atb_python_qwen3vl_embedding/tests/benchmark.py` — 新增 `benchmark_throughput()` 函数
+- C++: `atb_cpp_llm/tests/benchmark.cpp` — 在三个 benchmark 函数中添加吞吐量循环
+
+**验收标准** (详见 §11.3.3)。
+
+### 11.3.3 B3/B4 验收标准
+
+| 项目 | 条件 |
+|------|------|
+| **B3 功能** | ① `cold_e2e_ms > warm_e2e_ms`（正冷启动惩罚）② 连续 3 次运行 `cold_penalty_pct` 偏差 < 10% ③ 输出表格/机器行无缺失字段 |
+| **B4 功能** | ① `tokens_per_sec > 0` ② `requests ≥ 1` ③ `total_tokens = requests × tokens_per_request`（算术自洽，允许 vision token 动态计算误差）④ 连续 3 次运行 TPS 偏差 < 5% |
+| **代码质量** | 通过 §9.7 Dev→Reviewer 循环，审查 agent 零问题 |
+| **不破坏现有** | Python `run_all.py` + C++ `build_and_test.sh` 全量测试 PASS |
+| **跨语言一致性** | Python 和 C++ 的 B3/B4 使用相同的 mode/resolution/时间参数 |
 
 ### 11.4 后续批次概览
 
-| 批次 | 内容 | 触发条件 |
-|------|------|----------|
-| 第 3 批 | P0-4（输入校验）+ B3（冷启动）+ B4（吞吐量）+ **回溯验证** | 当前 |
-| 第 4 批 | Python P1 项（28 项）+ B5（回归检测） | 第 3 批完成 |
-| 第 5 批 | Python P2 项（20 项）+ B6/B7（preprocess 计时 + 硬编码数据清理） | 第 4 批完成 |
+| 批次 | 内容 | 状态 |
+|------|------|------|
+| 第 3 批 | P0-4（输入校验）+ B3（冷启动）+ B4（吞吐量）+ F1-F3 紧急修复 | ✅ 已完成 |
+| 第 3.5 批 🧪 | 测试基础设施优化：R1（CTest 注册修复）+ R2（注释修正）+ 并行化 + 自动排除 | ✅ 已完成 |
+| 第 3.6 批 🔧 | B6（preprocess 计时修复）+ B7（硬编码 timing 清理） | ✅ 已完成 |
+| 第 4 批 | Python P1 项（28→35 项）+ B5（回归检测） | 🔄 进行中 (12/35 P1 HIGH ✅, B5 ✅) |
+| 第 5 批 | Python P2 项（20 项）| 待定 |
+
+每完成 4 项目标后进行状态汇报和 plan 更新。
 
 每完成 4 项目标后进行状态汇报和 plan 更新。
 
@@ -797,3 +905,11 @@ inline std::string GetModelDir() {
 | 2026-06-16 | 第 1 批修复完成：G1, G2, G3, B1（4/4 ✅）；新增第 8-12 节 |
 | 2026-06-16 | 第 2 批修复完成：P0-1, P0-2, P0-3, B2（4/4 ✅）；新增 §9.4 强制性运行时测试规则；新增 §10 审查清单中的运行时验证要求 |
 | 2026-06-16 | 🔴 **310P+910B benchmark 失败事件**：新增 §9.6（3 个根因分析 + 元认知缺陷分析）；更新 §10.1 根因表（+4 行）；更新 §10.2 审查清单（+5 项）+ 架构师自我检查清单（+2 项）；更新 §11.3 第 3 批计划（含 F1-F3 紧急修复） |
+| 2026-06-17 | F1/F2/F3 紧急修复完成（3 commits 推送至 `origin/fix/benchmark`）；F3+文档更新达到 4 项目标汇报点；启动回溯验证 agent；通过 grill-me skill 完成 B3/B4 详细需求确认（§11.3.1–§11.3.3） |
+| 2026-06-17 | P0-4/B3/B4 完成（3 commits）；第 3 批目标（F1-F3, P0-4, B3, B4）全部交付 |
+| 2026-06-18 | 🧪 **测试基础设施优化批次**：R1（benchmark CTest 注册修复，regex `^bench_`→`^bench`）+ R2（refdata 注释修正，3 个后续修复）；Python 测试并行化（资源组隔离 + 4 路并行，33m44s→19m6s，↓43.4%）；910B 自动排除 310P 测试（100% 通过率）；8 个审查问题修复（fail-fast hang、资源组分类错误、异常处理缺失等） |
+| 2026-06-18 | 测试性能基线实测：Python 串行 33m44s → 并行 19m6s（↓43.4%）；C++ 14m28s（49/49，benchmark 已排除）；全量 ~34min（原 ~48min，↓30%） |
+| 2026-06-18 | **B6 完成**：C++ benchmark preprocess 不再回填迭代（接受 `preprocess_ms` 参数传入 `ReportStages`/`ReportStagesCompact`，移除 4 处回填循环，1 轮 Review 通过）|
+| 2026-06-18 | **B7 完成**：`compare_py_cpp.py` 删除 3 个硬编码 timing dict，简化为纯 cosine 对比表，2 轮 Review（首轮 2 问题→修复，复审通过）|
+| 2026-06-18 | **第 4 批启动 — B5**：实现 Python benchmark 性能回归检测（`save_baseline`/`check_regression` + `BENCH_CHECK` 机器行 + `--save-baseline`/`--check-regression`/`--regression-threshold` CLI），2 轮 Review（首轮 8 问题→全部修复，复审通过）|
+| 2026-06-18 | **第 4 批 — Python P1 HIGH**：12 项 HIGH 严重度 P1 修复（engine.py 6 项 + engine_utils.py 3 项 + utils.py 1 项 + preprocess.py 2 项），engine.py 1 轮 Review + 1 个修复，其余 1 轮通过。剩余 23 项 MEDIUM 待处理 |

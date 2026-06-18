@@ -118,6 +118,27 @@ def percentile(vals, p):
 # ═══════════════════════════════════════════════════════════════════
 
 
+def _compute_e2e_stats(e2e_times_sec):
+    """Compute summary statistics from list of E2E times in seconds.
+
+    Args:
+        e2e_times_sec: iterable of wall-clock seconds per iteration.
+
+    Returns:
+        dict with mean, std, p50, p95, p99 (all in ms).
+    """
+    if not e2e_times_sec:
+        return {'mean': 0.0, 'std': 0.0, 'p50': 0.0, 'p95': 0.0, 'p99': 0.0}
+    arr = ms(e2e_times_sec)
+    return {
+        'mean': float(arr.mean()),
+        'std': float(arr.std()),
+        'p50': float(percentile(arr, 0.50)),
+        'p95': float(percentile(arr, 0.95)),
+        'p99': float(percentile(arr, 0.99)),
+    }
+
+
 def _start_npu_peak_measurement():
     """Capture baseline memory and reset the peak tracker.
 
@@ -531,6 +552,137 @@ def _report_throughput(results):
 
 
 # ═══════════════════════════════════════════════════════════════════
+# Baseline save / regression check
+# ═══════════════════════════════════════════════════════════════════
+
+
+def save_baseline(results, baseline_path):
+    """Save current benchmark results as a baseline JSON file.
+
+    Args:
+        results: dict mapping test key → {e2e_ms: stats_dict, cosine_min?: float}
+        baseline_path: path to write the baseline JSON to.
+    """
+    import json
+    import subprocess
+    from datetime import datetime, timezone
+
+    # Resolve current commit hash
+    try:
+        commit = subprocess.check_output(
+            ['git', 'rev-parse', '--short', 'HEAD'],
+            cwd=os.path.dirname(os.path.dirname(os.path.dirname(
+                os.path.abspath(__file__)))),
+            stderr=subprocess.DEVNULL,
+        ).decode().strip()
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+        commit = "unknown"
+
+    baseline = {
+        "version": 1,
+        "created": datetime.now(timezone.utc).isoformat(),
+        "commit": commit,
+        "engine": "ATB_Python",
+        "tests": results,
+    }
+
+    os.makedirs(os.path.dirname(baseline_path) or '.', exist_ok=True)
+    with open(baseline_path, 'w') as f:
+        json.dump(baseline, f, indent=2)
+
+    print(f"\nBaseline saved to: {baseline_path}")
+
+
+def check_regression(results, baseline_path, threshold=1.2):
+    """Compare current benchmark results against a baseline JSON file.
+
+    For each test present in both, compares e2e_ms.mean.  Prints a
+    human-readable table followed by machine-parseable BENCH_CHECK lines.
+
+    Args:
+        results: dict mapping test key → {e2e_ms: stats_dict, ...}
+        baseline_path: path to the baseline JSON file.
+        threshold: e2e time multiplier above which a result is considered
+                   a regression (default 1.2 = +20%).
+
+    Returns:
+        True if at least one regression was detected, False otherwise.
+    """
+    import json
+
+    try:
+        with open(baseline_path, 'r') as f:
+            baseline = json.load(f)
+    except FileNotFoundError:
+        print(f"Error: baseline file not found: {baseline_path}", file=sys.stderr)
+        return True
+    except json.JSONDecodeError as e:
+        print(f"Error: baseline file is not valid JSON: {baseline_path}\n  {e}",
+              file=sys.stderr)
+        return True
+
+    baseline_tests = baseline.get('tests', {})
+
+    print(f"\n{'─' * 76}")
+    print(f"  === Regression Check (baseline: {baseline_path}) ===")
+    print(f"{'─' * 76}")
+    print(f"  {'mode':<6} {'resolution':<14} {'baseline_ms':>12} "
+          f"{'current_ms':>12} {'ratio':>8} {'status':>12}")
+    print(f"  {'─' * 6} {'─' * 14} {'─' * 12} {'─' * 12} "
+          f"{'─' * 8} {'─' * 12}")
+
+    any_regression = False
+    machine_lines = []
+
+    for key, current_stats in sorted(results.items()):
+        if key not in baseline_tests:
+            print(f"  [WARN] {key} not in baseline, skipping")
+            continue
+
+        bl = baseline_tests[key]
+        baseline_mean = bl.get('e2e_ms', {}).get('mean')
+        current_mean = current_stats.get('e2e_ms', {}).get('mean')
+
+        if baseline_mean is None or current_mean is None:
+            print(f"  [WARN] {key} missing e2e_ms.mean, skipping")
+            continue
+
+        ratio = current_mean / baseline_mean if baseline_mean > 0 else float('inf')
+        is_reg = current_mean > baseline_mean * threshold
+        status = "REGRESSION" if is_reg else "PASS"
+
+        if is_reg:
+            any_regression = True
+
+        # Parse mode and resolution from key: "text_seq=2048" → text, seq=2048
+        parts = key.split('_', 1)
+        mode = parts[0]
+        resolution = parts[1] if len(parts) > 1 else key
+
+        print(f"  {mode:<6} {resolution:<14} {baseline_mean:>12.2f} "
+              f"{current_mean:>12.2f} {ratio:>7.2f}x {status:>12}")
+
+        machine_lines.append(
+            f"BENCH_CHECK: mode={mode} resolution={resolution} "
+            f"baseline_ms={baseline_mean:.2f} current_ms={current_mean:.2f} "
+            f"ratio={ratio:.2f} status={status}"
+        )
+
+    # ── Warn about baseline-only keys (present in baseline, missing in current) ─
+    for key in sorted(baseline_tests):
+        if key not in results:
+            print(f"  [WARN] {key} in baseline but not in current results")
+
+    print(f"{'─' * 76}")
+
+    # Machine-parseable lines
+    for line in machine_lines:
+        print(line)
+
+    return any_regression
+
+
+# ═══════════════════════════════════════════════════════════════════
 # Transformers reference benchmark
 # ═══════════════════════════════════════════════════════════════════
 
@@ -738,12 +890,21 @@ def parse_args(argv: Optional[list] = None):
                         'token sequences.')
     p.add_argument('--model-dir', default=QWEN3VL_EMB_MODEL_DIR,
                    help='Override QWEN3VL_EMB_MODEL_DIR from .env')
+    p.add_argument('--save-baseline', metavar='PATH',
+                   help='Save current benchmark results as baseline JSON.')
+    p.add_argument('--check-regression', metavar='PATH',
+                   help='Compare against baseline JSON and report regressions.')
+    p.add_argument('--regression-threshold', type=float, default=1.2,
+                   help='E2E time regression threshold (default 1.2 = +20%%)')
     p.set_defaults(ref=True)
     return p.parse_args(argv)
 
 
 def main(argv: Optional[list] = None) -> int:
     args = parse_args(argv)
+    if args.regression_threshold <= 0:
+        print("Error: --regression-threshold must be > 0", file=sys.stderr)
+        return 2
     if args.mode == 'cold':
         modes_to_run = ['cold']
     elif args.mode == 'all':
@@ -754,6 +915,7 @@ def main(argv: Optional[list] = None) -> int:
         modes_to_run = [args.mode]
     cold_results = []  # aggregated for --mode all and --mode cold
     throughput_results = []  # aggregated for --mode all and --mode throughput
+    all_e2e_results = {}  # aggregated for --save-baseline / --check-regression
     resolutions = parse_resolutions(args.resolutions)
     seq_lengths = parse_seq_lengths(args.seq)
     print(f"Model dir : {args.model_dir}")
@@ -826,12 +988,30 @@ def main(argv: Optional[list] = None) -> int:
                 'valid': valid,
             })
 
+            # Collect E2E stats for regression detection
+            all_e2e_results[f"cold_{mode_name}_{resolution_str}"] = {
+                'e2e_ms': _compute_e2e_stats(warm_times),
+            }
+
             torch.npu.synchronize()
             del engine
             torch.npu.synchronize()
             torch.npu.empty_cache()
 
         _report_cold_start(cold_results)
+
+        # ── Baseline save / regression check ────────────────────────
+        regression_detected = False
+        if args.check_regression:
+            regression_detected = check_regression(
+                all_e2e_results, args.check_regression,
+                threshold=args.regression_threshold)
+        if args.save_baseline:
+            if args.check_regression:
+                print("\nRegression check complete; saving new baseline...")
+            save_baseline(all_e2e_results, args.save_baseline)
+        if regression_detected:
+            return 2
         return 0
 
     # ═════════════════════════════════════════════════════════════════
@@ -861,6 +1041,10 @@ def main(argv: Optional[list] = None) -> int:
         result['mode'] = 'text'
         result['resolution'] = 'seq_2048'
         throughput_results.append(result)
+        all_e2e_results[f"tput_text_seq_2048"] = {
+            'e2e_ms': {'mean': result['avg_latency_ms'], 'std': 0.0,
+                       'p50': 0.0, 'p95': 0.0, 'p99': 0.0},
+        }
         torch.npu.synchronize()
         del engine
         torch.npu.synchronize()
@@ -879,6 +1063,10 @@ def main(argv: Optional[list] = None) -> int:
         result['mode'] = 'io'
         result['resolution'] = '1080x1920'
         throughput_results.append(result)
+        all_e2e_results[f"tput_io_1080x1920"] = {
+            'e2e_ms': {'mean': result['avg_latency_ms'], 'std': 0.0,
+                       'p50': 0.0, 'p95': 0.0, 'p99': 0.0},
+        }
         torch.npu.synchronize()
         del engine
         torch.npu.synchronize()
@@ -897,12 +1085,29 @@ def main(argv: Optional[list] = None) -> int:
         result['mode'] = 'mm'
         result['resolution'] = '1080x1920'
         throughput_results.append(result)
+        all_e2e_results[f"tput_mm_1080x1920"] = {
+            'e2e_ms': {'mean': result['avg_latency_ms'], 'std': 0.0,
+                       'p50': 0.0, 'p95': 0.0, 'p99': 0.0},
+        }
         torch.npu.synchronize()
         del engine
         torch.npu.synchronize()
         torch.npu.empty_cache()
 
         _report_throughput(throughput_results)
+
+        # ── Baseline save / regression check ────────────────────────
+        regression_detected = False
+        if args.check_regression:
+            regression_detected = check_regression(
+                all_e2e_results, args.check_regression,
+                threshold=args.regression_threshold)
+        if args.save_baseline:
+            if args.check_regression:
+                print("\nRegression check complete; saving new baseline...")
+            save_baseline(all_e2e_results, args.save_baseline)
+        if regression_detected:
+            return 2
         return 0
 
     # ═════════════════════════════════════════════════════════════════
@@ -1026,6 +1231,11 @@ def main(argv: Optional[list] = None) -> int:
                         'valid': True,
                     })
 
+            # Collect E2E stats for regression detection
+            all_e2e_results[f"text_seq={seq}"] = {
+                'e2e_ms': _compute_e2e_stats(e2e_times),
+            }
+
         # Destroy per-mode engine for --mode all
         if args.mode == 'all':
             # B4: Throughput benchmark (after all seq_lengths, engine is warm)
@@ -1107,6 +1317,11 @@ def main(argv: Optional[list] = None) -> int:
 
             print_atb_report((w, h), S, n_vis, stages, atb_e2e,
                              staged_mem=staged_mem, e2e_mem=e2e_mem)
+
+            # Collect E2E stats for regression detection
+            all_e2e_results[f"io_{w}x{h}"] = {
+                'e2e_ms': _compute_e2e_stats(atb_e2e),
+            }
 
         # Destroy per-mode engine for --mode all (IO)
         if args.mode == 'all':
@@ -1223,6 +1438,11 @@ def main(argv: Optional[list] = None) -> int:
             print_atb_report((w, h), S, n_vis, stages, atb_e2e,
                              staged_mem=staged_mem, e2e_mem=e2e_mem)
 
+            # Collect E2E stats for regression detection
+            all_e2e_results[f"mm_{w}x{h}"] = {
+                'e2e_ms': _compute_e2e_stats(atb_e2e),
+            }
+
             all_results[(w, h)] = {
                 'S': S, 'n_vis': n_vis, 'inputs': inputs,
                 'stages': stages, 'atb_e2e': atb_e2e, 'tf_e2e': None,
@@ -1262,6 +1482,10 @@ def main(argv: Optional[list] = None) -> int:
             tf_arr = ms(r['tf_e2e'])
             acc_str = f"  cosine={r['accuracy']:.6f}" if r['accuracy'] is not None else ""
             print(f"[TF]  E2E: {tf_arr.mean():.2f} ± {tf_arr.std():.2f} ms{acc_str}")
+            # Update e2e results with cosine accuracy
+            mm_key = f"mm_{w}x{h}"
+            if r['accuracy'] is not None and mm_key in all_e2e_results:
+                all_e2e_results[mm_key]['cosine_min'] = r['accuracy']
         del ref
         torch.npu.empty_cache()
 
@@ -1275,6 +1499,22 @@ def main(argv: Optional[list] = None) -> int:
     # ── Throughput report for --mode all ─────────────────────────────
     if args.mode == 'all' and throughput_results:
         _report_throughput(throughput_results)
+
+    # ── Baseline save / regression check ────────────────────────────
+    regression_detected = False
+
+    if args.check_regression:
+        regression_detected = check_regression(
+            all_e2e_results, args.check_regression,
+            threshold=args.regression_threshold)
+
+    if args.save_baseline:
+        if args.check_regression:
+            print("\nRegression check complete; saving new baseline...")
+        save_baseline(all_e2e_results, args.save_baseline)
+
+    if regression_detected:
+        return 2
 
     return 0
 
