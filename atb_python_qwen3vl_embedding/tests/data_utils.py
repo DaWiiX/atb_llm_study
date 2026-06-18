@@ -5,6 +5,8 @@ Provides timing helpers, similarity metrics, and TF reference model loading.
 
 import time
 
+import os
+
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -113,7 +115,12 @@ def _build_tf_ref(model_dir: str, precision: str, device: str):
 
     if precision in ("half", "float16"):
         model = model.half()
-    elif precision != "float32":
+    elif precision == "float32":
+        # Force float32: safetensors may store BFloat16 weights, which CPU
+        # cannot matmul against float32 inputs (and which silently differ
+        # from a true fp32 model on NPU too). Normalize the whole model.
+        model = model.float()
+    else:
         raise ValueError(
             f"Unknown precision: {precision!r}, expected 'float32' or 'half'")
 
@@ -128,6 +135,8 @@ def _build_tf_ref(model_dir: str, precision: str, device: str):
     sd = {k.removeprefix("model."): v for k, v in sd.items()}
     if precision in ("half", "float16"):
         sd = {k: v.half() for k, v in sd.items()}
+    else:  # float32
+        sd = {k: v.float() for k, v in sd.items()}
 
     missing, unexpected = model.load_state_dict(sd, strict=False)
     assert not missing and not unexpected, \
@@ -203,6 +212,14 @@ def load_tf_ref(model_dir: str, precision: str = "float32", device: str = "npu")
     if device != "npu":
         raise ValueError(
             f"Unknown device: {device!r}, expected 'npu' or 'cpu'")
+
+    # Debug escape hatch: force the CPU fallback path even on NPU-capable
+    # hardware (e.g. verify fallback on 910B, where the probe would otherwise
+    # succeed). Not for production use. Set TFREF_FORCE_CPU=1 to enable.
+    if os.environ.get("TFREF_FORCE_CPU") == "1":
+        print("[load_tf_ref] TFREF_FORCE_CPU=1 — forcing CPU float32 reference.")
+        model = _build_tf_ref(model_dir, "float32", "cpu")
+        return _TFRef(model, torch.device("cpu"), torch.float32)
 
     model = _build_tf_ref(model_dir, precision, "npu")
     npu_dev = next(model.parameters()).device
