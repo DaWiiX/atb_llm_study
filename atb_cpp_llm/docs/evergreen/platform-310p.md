@@ -619,7 +619,7 @@ mask 缓存在 `self._cached_mask` 中，后续 `_run_text()` 直接通过 `caus
 | `atb_python_qwen3vl_embedding/engine.py:135-152` | _ensure_text_graph() — 310P mask 创建（调用 make_causal_mask_nz_npu）|
 | `atb_python_qwen3vl_embedding/tests/test_310p_diag.py` | 310P 快速诊断 |
 | `atb_python_qwen3vl_embedding/tests/test_310p_combinations.py` | 310P 参数深度扫描 |
-| `atb_cpp_llm/docs/platform-310p.md` | 本文档 |
+| `atb_cpp_llm/docs/evergreen/platform-310p.md` | 本文档 |
 | `atb_cpp_llm/src/utils/cpp11_compat.h:74-89` | C++ 平台检测 |
 | `atb_cpp_llm/src/utils/float_utils.h:47-48` | C++ MakeCausalMaskNzFp16() — FRACTAL_NZ mask 创建 |
 | `atb_cpp_llm/src/adapters/qwen3vl_embedding/qwen3vl_model.cpp` | C++ Model::Load() — NZ mask 创建 |

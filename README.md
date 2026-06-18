@@ -104,10 +104,10 @@ cd atb_python_qwen3vl_embedding
 python tests/test_310p_diag.py
 python tests/test_vision_model.py
 
-# 端到端推理引擎测试（text-only / image-only / text+image）
-python tests/test_engine.py
+# 端到端推理引擎测试（encode 全流水线，text-only / image-only / text+image）
+python tests/test_embedder_e2e.py
 
-# 完整 pipeline vs transformers 参考实现对比
+# 完整 pipeline vs transformers 参考实现对比（forward 路径）
 python tests/test_e2e.py
 
 # 性能基准
@@ -147,7 +147,7 @@ bash build_and_test.sh --list                                                 # 
 - **位置参数自动识别**：命中 `level0_framework` / `level1_cpu_pure` / `level2_op_precision` / `level3_integration` / `level4_e2e` 当作 level 过滤，否则当作测试名过滤。
 - **参考数据三态**：默认每次刷新（~90s），`--no-refresh-refdata` 复用已有（缺失自动 fallback 到 `--no-refdata`），`--no-refdata` 主动排除 27 个依赖参考数据的测试并打印清单。
 
-详细规则、维护契约、边界用例见 [`atb_cpp_llm/docs/testing-guide.md` § 一·五](atb_cpp_llm/docs/testing-guide.md)。
+详细规则、维护契约、边界用例见 [`atb_cpp_llm/docs/archive/testing-guide.md` § 一·五](atb_cpp_llm/docs/archive/testing-guide.md)。
 
 脚本会：
 
@@ -166,7 +166,7 @@ bash build_and_test.sh --list                                                 # 
 python atb_cpp_llm/tests/python_reference/gen_all.py
 
 # gen_all.py 自身的 --skip-fresh: 跳过哨兵文件已存在的生成器（脚本默认 mode 不传这个 flag，
-# 用户在脚本层用 --no-refresh-refdata 控制，详见 atb_cpp_llm/docs/testing-guide.md § 一·五 #8）
+# 用户在脚本层用 --no-refresh-refdata 控制，详见 atb_cpp_llm/docs/archive/testing-guide.md § 一·五 #8）
 python atb_cpp_llm/tests/python_reference/gen_all.py --skip-fresh
 ```
 
@@ -222,7 +222,7 @@ atb_llm/
     │   ├── io/                        # safetensors_reader / weight_loader
     │   └── adapters/ utils/ log/
     ├── tests/                         # level0~4 分层测试
-    └── docs/                          # 设计文档 / 重构计划 / 优化路线
+    └── docs/                          # 文档（STATUS 现状 / WORKFLOW 方法论 / lessons 踩坑 / evergreen 常青 / archive 归档）
 ```
 
 ---
@@ -275,5 +275,5 @@ atb_llm/
 
 - [`CLAUDE.md`](./CLAUDE.md) — 项目总览（Python 子项目架构、split-graph 策略、deepstack 融合、关键约束）
 - [`atb_python_qwen3vl_embedding/__init__.py`](./atb_python_qwen3vl_embedding/__init__.py) — Python 模块清单
-- [`atb_cpp_llm/docs/README.md`](./atb_cpp_llm/docs/README.md) — C++ 设计文档索引（架构、重构计划、优化路线、测试指南）
+- [`atb_cpp_llm/docs/README.md`](./atb_cpp_llm/docs/README.md) — C++ 文档索引（STATUS 现状 / WORKFLOW 方法论 / lessons 踩坑 / 架构 / 部署 / 优化路线 / 310P 适配）
 - [`atb_cpp_llm/tests/README.md`](./atb_cpp_llm/tests/README.md) — C++ 测试金字塔说明

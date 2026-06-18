@@ -787,9 +787,15 @@ atb_cpp_llm/
 ├── README.md
 ├── build_and_test.sh
 ├── docs/
-│   ├── design.md                     # 本文档
-│   ├── platform-310p.md              # 310P 平台适配文档
-│   └── refactoring-plan.md           # 重构计划
+│   ├── README.md                     # 索引 + 记录纪律
+│   ├── STATUS.md                     # 当前状态（单一真相源）
+│   ├── lessons-learned.md            # 踩坑经验集（按主题）
+│   ├── evergreen/                    # 常青参考
+│   │   ├── design.md                 # 本文档
+│   │   ├── platform-310p.md          # 310P 平台适配
+│   │   ├── deployment-checklist.md   # 部署核查
+│   │   └── optimization-roadmap.md   # 性能路线
+│   └── archive/                      # 已冻结快照（历史记录，不代表现状）
 │
 ├── include/atb_llm/                  # 公共头文件（10 个）
 │   ├── build_result.h                # BuildResult + 验证合约
