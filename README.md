@@ -104,10 +104,10 @@ cd atb_python_qwen3vl_embedding
 python tests/test_310p_diag.py
 python tests/test_vision_model.py
 
-# 端到端推理引擎测试（text-only / image-only / text+image）
-python tests/test_engine.py
+# 端到端推理引擎测试（encode 全流水线，text-only / image-only / text+image）
+python tests/test_embedder_e2e.py
 
-# 完整 pipeline vs transformers 参考实现对比
+# 完整 pipeline vs transformers 参考实现对比（forward 路径）
 python tests/test_e2e.py
 
 # 性能基准
@@ -222,7 +222,7 @@ atb_llm/
     │   ├── io/                        # safetensors_reader / weight_loader
     │   └── adapters/ utils/ log/
     ├── tests/                         # level0~4 分层测试
-    └── docs/                          # 设计文档 / 重构计划 / 优化路线
+    └── docs/                          # 文档（STATUS 现状 / WORKFLOW 方法论 / lessons 踩坑 / evergreen 常青 / archive 归档）
 ```
 
 ---
@@ -275,5 +275,5 @@ atb_llm/
 
 - [`CLAUDE.md`](./CLAUDE.md) — 项目总览（Python 子项目架构、split-graph 策略、deepstack 融合、关键约束）
 - [`atb_python_qwen3vl_embedding/__init__.py`](./atb_python_qwen3vl_embedding/__init__.py) — Python 模块清单
-- [`atb_cpp_llm/docs/README.md`](./atb_cpp_llm/docs/README.md) — C++ 设计文档索引（架构、重构计划、优化路线、测试指南）
+- [`atb_cpp_llm/docs/README.md`](./atb_cpp_llm/docs/README.md) — C++ 文档索引（STATUS 现状 / WORKFLOW 方法论 / lessons 踩坑 / 架构 / 部署 / 优化路线 / 310P 适配）
 - [`atb_cpp_llm/tests/README.md`](./atb_cpp_llm/tests/README.md) — C++ 测试金字塔说明
