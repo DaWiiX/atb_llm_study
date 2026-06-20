@@ -31,6 +31,7 @@
 #include "utils/float_utils.h"
 #include "test_env.h"
 
+#include <acl/acl.h>
 #include <cstdio>
 #include <cstring>
 #include <vector>
@@ -288,21 +289,25 @@ void ReportStages(const std::vector<TimedResult>& results,
 
     auto pct = [&](double v) { return staged_sum > 0 ? v / staged_sum * 100.0 : 0.0; };
 
-    LOG_INFO("------------------------------------------------------------");
-    LOG_INFO("  %s   S=%d   vision_tokens=%d", label, seq_len, vis_tokens);
-    LOG_INFO("------------------------------------------------------------");
-    LOG_INFO("  Stage              Mean (ms)   %% of staged");
-    LOG_INFO("  %-18s %8.2f      %5.1f%%", "Preprocess", preprocess, pct(preprocess));
-    LOG_INFO("  %-18s %8.2f      %5.1f%%", "Vision PosEmb", vision_pos, pct(vision_pos));
-    LOG_INFO("  %-18s %8.2f      %5.1f%%", "Vision Model", vision_model, pct(vision_model));
-    LOG_INFO("  %-18s %8.2f      %5.1f%%", "Text Embed+Inj", text_embed, pct(text_embed));
-    LOG_INFO("  %-18s %8.2f      %5.1f%%", "Position IDs", position_ids, pct(position_ids));
-    LOG_INFO("  %-18s %8.2f      %5.1f%%", "Text Model", text_model, pct(text_model));
-    LOG_INFO("  %-18s %8.2f      %5.1f%%", "Pooling", pooling, pct(pooling));
-    LOG_INFO("  ---------------- --------------- ------------");
-    LOG_INFO("  %-18s %8.2f", "Staged sum", staged_sum);
-    LOG_INFO("  %-18s %8.2f +/- %.2f", "E2E (no sync)",
-             e2e_stats.mean, e2e_stats.stddev);
+    // Human-readable table → stdout (not LOG_INFO). Default LOG_LEVEL=WARN
+    // swallows LOG_INFO, hiding this table; ReportStagesCompact already uses
+    // printf, so routing the human table to stdout too keeps machine+human
+    // output together and always visible regardless of LOG_LEVEL.
+    printf("------------------------------------------------------------\n");
+    printf("  %s   S=%d   vision_tokens=%d\n", label, seq_len, vis_tokens);
+    printf("------------------------------------------------------------\n");
+    printf("  Stage              Mean (ms)   %% of staged\n");
+    printf("  %-18s %8.2f      %5.1f%%\n", "Preprocess", preprocess, pct(preprocess));
+    printf("  %-18s %8.2f      %5.1f%%\n", "Vision PosEmb", vision_pos, pct(vision_pos));
+    printf("  %-18s %8.2f      %5.1f%%\n", "Vision Model", vision_model, pct(vision_model));
+    printf("  %-18s %8.2f      %5.1f%%\n", "Text Embed+Inj", text_embed, pct(text_embed));
+    printf("  %-18s %8.2f      %5.1f%%\n", "Position IDs", position_ids, pct(position_ids));
+    printf("  %-18s %8.2f      %5.1f%%\n", "Text Model", text_model, pct(text_model));
+    printf("  %-18s %8.2f      %5.1f%%\n", "Pooling", pooling, pct(pooling));
+    printf("  ---------------- --------------- ------------\n");
+    printf("  %-18s %8.2f\n", "Staged sum", staged_sum);
+    printf("  %-18s %8.2f +/- %.2f\n", "E2E (no sync)",
+           e2e_stats.mean, e2e_stats.stddev);
 }
 
 // ── Report stage timings (compact) ───────────────────────────
@@ -334,23 +339,24 @@ void ReportStagesCompact(const std::vector<TimedResult>& results,
 void ReportColdStart(const std::vector<std::tuple<std::string, std::string, ColdMetrics>>& cold_results) {
     if (cold_results.empty()) return;
 
-    // Human-readable table
-    LOG_INFO("============================================================");
-    LOG_INFO("  === Cold-Start Benchmark ===");
-    LOG_INFO("============================================================");
-    LOG_INFO("  mode   resolution     cold_e2e_ms  warm_e2e_ms  penalty_pct");
-    LOG_INFO("  ------ -------------- ------------ ------------ -----------");
+    // Human-readable table → stdout (visible regardless of LOG_LEVEL; default
+    // WARN would otherwise hide it, leaving only the BENCH_COLD machine line).
+    printf("============================================================\n");
+    printf("  === Cold-Start Benchmark ===\n");
+    printf("============================================================\n");
+    printf("  mode   resolution     cold_e2e_ms  warm_e2e_ms  penalty_pct\n");
+    printf("  ------ -------------- ------------ ------------ -----------\n");
     for (const auto& entry : cold_results) {
         const std::string& mode = std::get<0>(entry);
         const std::string& resolution = std::get<1>(entry);
         const ColdMetrics& cm = std::get<2>(entry);
         char buf[128];
         std::snprintf(buf, sizeof(buf), "%+.1f%%", cm.penalty_pct);
-        LOG_INFO("  %-6s %-14s %12.2f %12.2f %11s",
-                 mode.c_str(), resolution.c_str(),
-                 cm.cold_e2e_ms, cm.warm_e2e_ms, buf);
+        printf("  %-6s %-14s %12.2f %12.2f %11s\n",
+               mode.c_str(), resolution.c_str(),
+               cm.cold_e2e_ms, cm.warm_e2e_ms, buf);
     }
-    LOG_INFO("============================================================");
+    printf("============================================================\n");
 
     // Machine-parseable lines
     for (const auto& entry : cold_results) {
@@ -405,22 +411,23 @@ ThroughputMetrics RunThroughputBenchmark(
 void ReportThroughput(const std::vector<std::tuple<std::string, std::string, ThroughputMetrics>>& results) {
     if (results.empty()) return;
 
-    // Human-readable table
-    LOG_INFO("============================================================");
-    LOG_INFO("  === Throughput Benchmark (20s) ===");
-    LOG_INFO("============================================================");
-    LOG_INFO("  mode   resolution     requests  total_tokens  tokens/sec  avg_lat_ms");
-    LOG_INFO("  ------ -------------- --------  ------------  ----------  ----------");
+    // Human-readable table → stdout (visible regardless of LOG_LEVEL; default
+    // WARN would otherwise hide it, leaving only the BENCH_TPUT machine line).
+    printf("============================================================\n");
+    printf("  === Throughput Benchmark (20s) ===\n");
+    printf("============================================================\n");
+    printf("  mode   resolution     requests  total_tokens  tokens/sec  avg_lat_ms\n");
+    printf("  ------ -------------- --------  ------------  ----------  ----------\n");
     for (const auto& entry : results) {
         const std::string& mode = std::get<0>(entry);
         const std::string& resolution = std::get<1>(entry);
         const ThroughputMetrics& m = std::get<2>(entry);
-        LOG_INFO("  %-6s %-14s %8d  %12ld  %10.0f  %10.1f",
-                 mode.c_str(), resolution.c_str(),
-                 m.requests, static_cast<long>(m.total_tokens),
-                 m.tokens_per_sec, m.avg_latency_ms);
+        printf("  %-6s %-14s %8d  %12ld  %10.0f  %10.1f\n",
+               mode.c_str(), resolution.c_str(),
+               m.requests, static_cast<long>(m.total_tokens),
+               m.tokens_per_sec, m.avg_latency_ms);
     }
-    LOG_INFO("============================================================");
+    printf("============================================================\n");
 
     // Machine-parseable lines
     for (const auto& entry : results) {
@@ -1040,6 +1047,61 @@ int RunCompareMode(atb_llm::LLMEngine* engine,
     return ret;
 }
 
+// ── Platform self-check (best-effort, non-fatal) ───────────────────────
+// Loudly warns when the configured ASCEND_PLATFORM (shell env > .env > "910B"
+// default, same resolution as Is310P()/Is910B()) disagrees with the actual
+// NPU chip, or when ASCEND_PLATFORM is entirely unset and the chip cannot be
+// probed. Never aborts — a misjudged probe must not block a working env.
+//
+// Why this matters: a silent 910B fallback on 310P selects the 910B ND mask
+// path and crashes SelfAttention ("TransdataOperation mki node infer shape
+// fail"). ctest hid this because build_and_test.sh / CMakeLists ENVIRONMENT
+// bake ASCEND_PLATFORM into the process env; a bare `./benchmark` did not.
+// aclrtGetSocName() returns the SoC name with no prior aclInit/SetDevice
+// (verified on 910B), so it is safe to call before engine construction.
+static void CheckPlatformConfiguration() {
+    // "" <=> ASCEND_PLATFORM absent from both shell env and .env.
+    // Is310P()/Is910B() then default to 910B.
+    std::string configured = GetEnv("ASCEND_PLATFORM", nullptr);
+    bool unset = configured.empty();
+
+    const char* soc = aclrtGetSocName();
+    if (soc != nullptr && soc[0] != '\0') {
+        // Probe available — compare config intent vs actual chip.
+        bool hw_310p = std::strstr(soc, "310P") != nullptr;
+        bool cfg_310p = (configured == "310P");  // matches Is310P() semantics
+        if (cfg_310p != hw_310p) {
+            LOG_ERROR("============================================================");
+            LOG_ERROR("  PLATFORM MISMATCH: ASCEND_PLATFORM=%s but NPU='%s'",
+                      unset ? "<unset, defaulting to 910B>" : configured.c_str(),
+                      soc);
+            if (cfg_310p && !hw_310p) {
+                LOG_ERROR("  310P mask path selected on non-310P hardware —");
+                LOG_ERROR("  SelfAttention may fail. Set ASCEND_PLATFORM=910B in");
+                LOG_ERROR("  <repo>/.env or `export ASCEND_PLATFORM=910B`.");
+            } else {
+                LOG_ERROR("  Hardware is 310P-family but ASCEND_PLATFORM is not 310P.");
+                LOG_ERROR("  The 910B ND mask path will crash SelfAttention");
+                LOG_ERROR("  (TransdataOperation infer shape fail). Fix: add");
+                LOG_ERROR("  ASCEND_PLATFORM=310P to <repo>/.env or");
+                LOG_ERROR("  `export ASCEND_PLATFORM=310P`.");
+            }
+            LOG_ERROR("  Continuing anyway — this is a warning, not a hard abort.");
+            LOG_ERROR("============================================================");
+        }
+        // Match (incl. unset on 910B hardware): silent — probe confirmed OK.
+    } else {
+        // Probe unavailable — degrade to the unset-presence reminder only.
+        if (unset) {
+            LOG_WARN("ASCEND_PLATFORM is not set in the shell environment or .env");
+            LOG_WARN("(defaulting to 910B); hardware could not be probed to verify.");
+            LOG_WARN("If running on 310P, set ASCEND_PLATFORM=310P in <repo>/.env or");
+            LOG_WARN("`export ASCEND_PLATFORM=310P` — otherwise SelfAttention uses the");
+            LOG_WARN("910B mask path and crashes.");
+        }
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════
 // Main
 // ═══════════════════════════════════════════════════════════════
@@ -1083,6 +1145,11 @@ int main(int argc, char** argv) {
         LOG_INFO("Model: %s", model_dir.c_str());
         LOG_INFO("Mode: %s", mode.c_str());
     }
+
+    // Platform self-check before any engine/graph construction — catches a
+    // silent 910B fallback on 310P (which would crash SelfAttention) early
+    // with an actionable message. Non-fatal; see CheckPlatformConfiguration().
+    CheckPlatformConfiguration();
 
     // Engine config (shared by all factory calls)
     atb_llm::EngineConfig config;

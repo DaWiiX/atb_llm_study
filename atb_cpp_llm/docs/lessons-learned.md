@@ -45,6 +45,8 @@
 4. **`ASCEND_PLATFORM` 配错会静默 fallback**
    `is_310p()` 依赖 `.env` 的 `ASCEND_PLATFORM=310P`；配错则返回 False，静默用 910B 的 ND mask，310P 上图编译失败。正确行为隐式依赖人工配置——配错不报错最危险。— `arch §9.6`
 
+   **根治（2026-06-20）**：根因比"配错"更深——`Is310P()` 只读 `std::getenv` **不读 `.env`**，而 ctest 单测靠 CMake `ENVIRONMENT` + `build_and_test.sh` source .env 把 `ASCEND_PLATFORM` 烤进进程环境才过；裸启动 `./benchmark` 读不到 `.env` → `Is310P()=false` → 310P 撞 `TransdataOperation ... inDims is not support`。修复：把 `.env` 三级解析抽到 `src/utils/dotenv.h`，`Is310P()`/`Is910B()` 改用 `GetEnv`（getenv > .env > 默认）；并加 `aclrtGetSocName()` 启动期硬件探针自检，配置与硬件不符 `LOG_ERROR` 提醒（不静默）。教训：**配置读取入口必须全代码库统一**（生产代码与 test 不能各读各的），否则"单测过、裸二进制挂"的静默缺口必然在跨平台暴露。
+
 5. **GQA 在 310P 原生支持，无需 Is310P() 守卫**
    实测 cos=1.0。早期文档说"310P 不支持 GQA"是错的，guard 已全部移除。— `310p`
 
