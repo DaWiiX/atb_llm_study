@@ -327,9 +327,9 @@ set_tests_properties(test_benchmark_modes PROPERTIES LABELS "level4_e2e;needs_np
 # Propagate env vars (ASCEND_PLATFORM, model dir) to the test subprocess
 # so the spawned benchmark can locate the model checkpoint — mirrors the
 # ENVIRONMENT logic inside add_atb_test() above.
-# LOG_LEVEL=1 forces INFO output so the human-readable ReportStages table
-# (emitted via LOG_INFO, otherwise muted at the default WARN level) is
-# captured and asserted by the test.
+# LOG_LEVEL=1 forces INFO output so diagnostic banners (otherwise muted at
+# the default WARN level) are captured alongside the printf-based report
+# tables asserted by the test.
 set(_bm_env "LOG_LEVEL=1")
 if(DEFINED ENV{ASCEND_PLATFORM})
     list(APPEND _bm_env "ASCEND_PLATFORM=$ENV{ASCEND_PLATFORM}")

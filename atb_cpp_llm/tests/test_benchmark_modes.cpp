@@ -5,7 +5,7 @@
  * combined stdout+stderr to verify that:
  *   - the machine-readable `BENCH_RESULT:` line is emitted with all
  *     expected fields (mode, resolution, S, vis, e2e_mean), and
- *   - the human-readable stage table (ReportStages via LOG_INFO) is
+ *   - the human-readable stage table (ReportStages via printf to stdout) is
  *     present, including the "Stage" header, "Preprocess" and "E2E" rows.
  *
  * Prevents regression of §9.8 (benchmark not in CTest, output quality
@@ -56,8 +56,8 @@ TEST_CASE("benchmark --mode text 输出格式") {
     CHECK(out.find("vis=") != std::string::npos);
     CHECK(out.find("e2e_mean=") != std::string::npos);
 
-    // 4. Human-readable stage table (ReportStages uses LOG_INFO → stderr,
-    //    merged into stdout by 2>&1). Check for header + key stage rows.
+    // 4. Human-readable stage table (ReportStages uses printf → stdout,
+    //    merged with stderr by 2>&1). Check for header + key stage rows.
     CHECK(out.find("Stage") != std::string::npos);
     CHECK(out.find("Preprocess") != std::string::npos);
     CHECK(out.find("E2E") != std::string::npos);

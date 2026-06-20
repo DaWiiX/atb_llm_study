@@ -529,8 +529,8 @@ Status Qwen3VLModel::ForwardWithTiming(const InferRequest& request,
     // ── P0: MRoPE cos/sin + Causal mask — direct fp16 + NPU cache ──
     // When seq_len is unchanged across calls, reuse the cached NPU tensors
     // to avoid regeneration + H2D upload (saves ~212ms at S=4096).
-    // On 310P, SelfAttention uses MASK_TYPE_CAUSAL (no external mask tensor)
-    // so mask generation and caching are skipped.
+    // Both platforms generate + cache an external mask below (310P in NZ
+    // layout, 910B in ND); SelfAttention uses MASK_TYPE_NORM for both.
     bool cache_hit = (seq_len == cached_text_seq_len_ && cached_cos_npu_);
     if (!cache_hit) {
         // Generate cos/sin directly in fp16 (skip fp32 intermediate)
@@ -646,8 +646,8 @@ Status Qwen3VLModel::ForwardWithTiming(const InferRequest& request,
                 return ERROR_NPU_MEMORY;
             }
             atb::VariantPack vp;
-            // All platforms use MASK_TYPE_NORM with external mask tensor.
-            // 310P additionally sets isTriuMask=1 inside SelfAttentionOp::Create().
+            // All platforms use MASK_TYPE_NORM with an external mask tensor
+            // (310P: NZ layout, 910B: ND); no isTriuMask — see SelfAttentionOp::Create().
             vp.inTensors = {*h_npu.Get(),
                             lw.q_weight, lw.k_weight, lw.v_weight, lw.o_weight,
                             lw.q_norm_weight, lw.k_norm_weight,

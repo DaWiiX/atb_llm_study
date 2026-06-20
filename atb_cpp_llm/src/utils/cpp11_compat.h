@@ -58,24 +58,29 @@ const T& clamp(const T& v, const T& lo, const T& hi) {
 }  // namespace atb_llm
 
 // ─────────────────────────────────────────────────────────────
-// Platform detection helpers (inline, no dependency).
+// Platform detection helpers (inline).
 //
-// Reads ASCEND_PLATFORM from environment once per call.
+// Resolve ASCEND_PLATFORM via GetEnv() (utils/dotenv.h), which applies the
+// same three-tier precedence as GetModelDir(): shell getenv > .env file >
+// "910B" default. A bare `./benchmark` invocation — where the shell has not
+// sourced .env — now honours ASCEND_PLATFORM=310P written in .env. Previously
+// Is310P() read getenv only and silently fell back to 910B on 310P, which
+// selected the 910B ND mask path and crashed SelfAttention's ND->NZ transdata
+// ("TransdataOperation mki node infer shape fail"). ctest avoided this because
+// build_and_test.sh / CMakeLists ENVIRONMENT bake ASCEND_PLATFORM into the
+// process environment.
 // Valid values: "910B" (Atlas A2), "310P" (Atlas推理系列).
 // ─────────────────────────────────────────────────────────────
-#include <cstdlib>
-#include <cstring>
+#include "utils/dotenv.h"
 
 namespace atb_llm {
 
 inline bool Is310P() {
-    const char* p = std::getenv("ASCEND_PLATFORM");
-    return p != nullptr && std::strcmp(p, "310P") == 0;
+    return GetEnv("ASCEND_PLATFORM", "910B") == "310P";
 }
 
 inline bool Is910B() {
-    const char* p = std::getenv("ASCEND_PLATFORM");
-    return p == nullptr || std::strcmp(p, "910B") == 0;
+    return GetEnv("ASCEND_PLATFORM", "910B") == "910B";
 }
 
 }  // namespace atb_llm

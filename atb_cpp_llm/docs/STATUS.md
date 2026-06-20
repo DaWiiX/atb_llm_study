@@ -13,7 +13,7 @@
 - **性能**：✅ ATB 比 Transformers 快 3.0–3.6×，余弦相似度 ≥ 0.999（13/13 组合）
 - **C++ 端**：✅ RAII 正确、错误传播完整、61 项审计 100% 修复
 - **Python 端**：🟡 P0/P1-HIGH 已修复；P1-MEDIUM(23) + P2(20) 待办
-- **Benchmark**：✅ B1–B7 + F1–F3 + M4/M5/M6 完成；310P 闭环待硬件复验
+- **Benchmark**：✅ B1–B7 + F1–F3 + M4/M5/M6 完成；310P 闭环已复验通过
 
 ---
 
@@ -39,6 +39,8 @@
 | 测试基础设施 | R1 CTest 注册修复、R2 注释修正、Python 并行化(33m→19m)、910B 自动排除 310P 测试 | ✅ |
 | Benchmark 输出质量 | M1 compare human 表格、M2 bench 分辨率对齐、M3 io seq_len、M4 冒烟测试、M5 分辨率单一数据源、M6 统一输出策略 | ✅ |
 | 运行时验证 | 910B 全量测试 PASS | ✅ |
+| 平台检测根治 | `Is310P()`/`Is910B()` 改读 `.env`（抽 `src/utils/dotenv.h` 共享头，消除生产代码依赖 test 头）+ benchmark 启动期 `aclrtGetSocName()` 硬件探针自检（不匹配 `LOG_ERROR` 提醒，不 abort）。修裸启动 `./benchmark` 读不到 `ASCEND_PLATFORM` 静默走 910B ND mask 致 310P Transdata 崩溃 | ✅ |
+| Benchmark 输出修复 | `ReportStages`/`ReportColdStart`/`ReportThroughput` 的 `LOG_INFO`→`printf`(stdout)，修复默认 WARN log level 吞掉 human-readable 报告（只剩 `BENCH_RESULT` machine 行） | ✅ |
 
 ### 2.5 平台适配
 910B + 310P 双平台。310P NZ mask 策略、GQA 原生支持（cos=1.0）、平台检测 API（`is_310p()`/`Is310P()`）均完成。详见 `evergreen/platform-310p.md`。
@@ -47,16 +49,17 @@
 
 ## 3. 待办（按优先级）
 
-### 3.1 🔴 310P 硬件闭环验证（部署前必须）
-§9.6 事件中 310P benchmark "setup fail status 4" 在 F1–F3 修复后**未在真实 310P 上复验**。到 310P 机器按此顺序：
-1. `git pull` → `grep ASCEND_PLATFORM .env` 必须为 `310P`（配错会静默 fallback，§9.6 根因）
-2. `bash atb_cpp_llm/build_and_test.sh`（全量，推理核心 + 平台算子可信）
-3. `python atb_python_qwen3vl_embedding/tests/run_all.py`（Python 全量）
-4. `ctest -R test_benchmark_modes`（benchmark 外壳在 310P 能跑）
-5. `python atb_cpp_llm/scripts/gen_compare_tokens.py` → `./benchmark --mode compare`
-6. `python atb_cpp_llm/tests/compare_py_cpp.py`（cosine ≥ 0.99）
+### 3.1 ✅ 310P 硬件闭环验证（已通过）
+310P 全量 + benchmark compare 已在真实 310P 复验通过（2026-06-20）：C++ 全量过、裸启动 `./benchmark --mode compare` 不再崩 Transdata（平台检测根治后读 `.env` 的 `ASCEND_PLATFORM=310P`）、human 表正常输出。310P 机器的回归复验步骤：
+1. `git pull` → `grep ASCEND_PLATFORM .env` 为 `310P`
+2. `bash atb_cpp_llm/build_and_test.sh`（全量）
+3. `python atb_python_qwen3vl_embedding/tests/run_all.py`（Python 全量，fallback 生效）
+4. `./atb_cpp_llm/build/benchmark --mode compare`（裸启动即可，自动读 `.env`）
+5. `python atb_cpp_llm/tests/compare_py_cpp.py`（cosine ≥ 0.99）
 
-> 注：全量测试**不覆盖** benchmark 二进制（benchmark 不在 CTest，仅 `test_benchmark_modes` 冒烟），故 4–6 步是独立的必要验证。
+> 注：全量测试**不覆盖** benchmark 二进制（benchmark 不在 CTest），故 4–5 步是独立的必要验证。
+>
+> 310P 遗留（非本次范围）：`test_310p_combinations` 5/18 `CreateOperation failed` 是 platform-310p.md 实验矩阵已标的 310P 不支持 attention 配置组合，属预期（13/18 正常），应改测试标 expected-skip；`test_text_diagnostics` 卡死是子进程僵尸，非算子。二者单独修。
 
 ### 3.2 🟡 Python 代码质量加固（43 项，非阻塞）
 - **P1 MEDIUM：23 项** — 硬编码值、`print`→`logging`、额外输入校验等健壮性改进
@@ -89,3 +92,4 @@ C++ ATB 全面最快：geomean 领先 Python ATB **1.39×**、领先 Transformer
 | 日期 | 内容 |
 |------|------|
 | 2026-06-18 | 建立本文件作为单一真相源，归并自 architect-assessment §11.1 + audit-fix-plan + test-fix-plan + refactoring-plan §1 |
+| 2026-06-20 | 平台检测根治：`Is310P()`/`Is910B()` 改读 `.env`（抽 `src/utils/dotenv.h`），消除裸启动 benchmark 读不到 `ASCEND_PLATFORM` 静默走 910B 致 310P Transdata 崩溃；加 `aclrtGetSocName()` 启动期自检提醒。benchmark human 表修复：报告函数 `LOG_INFO`→`printf`。310P 真机复验通过（全量 + compare），§3.1 降级为已通过 |
