@@ -24,9 +24,13 @@ namespace {
 // These syncs are NOT needed for correctness — they only ensure the
 // NPU timer captures true GPU execution time rather than launch time.
 //
-// The D2H-before-CopyToHost syncs (vision merger, text FinalNorm) and
-// the deepstack InjectFeatures sync are NEVER skipped — those are
-// correctness-critical.
+// The D2H-before-CopyToHost syncs (vision merger, text FinalNorm) are
+// NEVER skipped — those are correctness-critical: ATB runs on its own
+// stream, so a synchronous aclrtMemcpy D2H does not wait for in-flight ATB
+// work and would read stale data without an explicit Synchronize first.
+// The deepstack InjectFeatures sync was removed (H4): IndexAdd runs on the
+// same single ATB stream as its producers, so FIFO ordering suffices and the
+// FinalNorm sync at the end of forward covers correctness.
 bool SkipTimingSyncs() {
     const char* env = getenv("ATB_SKIP_TIMING_SYNCS");
     return env != nullptr;
@@ -477,6 +481,15 @@ Status Qwen3VLModel::ForwardWithTiming(const InferRequest& request,
             Status s = ExecuteGraph(vision_runner_->GetMergerGraph(), vp);
             if (s != STATUS_OK) return s;
 
+            // H1: the merger graph launches async (per-op sync is off by
+            // default). Synchronize before the D2H copy so CopyToHost reads
+            // completed merger output — mirrors the text FinalNorm sync below.
+            // Without this, aclrtMemcpy D2H races the merger and reads stale
+            // data (IMAGE_ONLY cosine collapses to ~0.19). This is a host-
+            // needs-data sync, not a per-op sync; it does not undo H1's
+            // pipelining win (1 sync here vs ~62 per-op syncs removed by H1).
+            runtime_->Synchronize();
+
             size_t merged_bytes = static_cast<size_t>(merged_tokens) *
                                   vis_embed_dim * sizeof(uint16_t);
             s = alloc->CopyToHost(vis_embeds_host.data(), *merged_out.Get(), merged_bytes);
@@ -486,7 +499,6 @@ Status Qwen3VLModel::ForwardWithTiming(const InferRequest& request,
             }
         }
 
-        runtime_->Synchronize();
         auto t_vis_model = std::chrono::high_resolution_clock::now();
         double v_merger_ms = std::chrono::duration<double, std::milli>(
             t_vis_model - t_v_merger).count();
@@ -916,7 +928,13 @@ Status Qwen3VLModel::RunVision(const uint16_t* pixel_values, int64_t num_patches
             return s;
         }
 
-        // Copy merged vision embeddings to host
+        // Copy merged vision embeddings to host. Synchronize first: the merger
+        // graph launched async (per-op sync off by default) and ATB uses its own
+        // stream, so a synchronous D2H copy would race the merger and read stale
+        // data. Mirrors ForwardWithTiming's merger sync. (RunVision is currently
+        // uncalled — Forward→ForwardWithTiming inlines its own vision path — but
+        // this guards correctness if the path is ever revived.)
+        runtime_->Synchronize();
         size_t merged_bytes = static_cast<size_t>(merged_tokens) *
                               config_.vis_out_hidden_size * sizeof(uint16_t);
         s = alloc->CopyToHost(vis_embeds_out, *merged_out.Get(), merged_bytes);

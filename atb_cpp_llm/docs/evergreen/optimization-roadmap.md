@@ -244,6 +244,11 @@
 - **经验教训**: 见 [lessons-learned.md 主题1第3条](../lessons-learned.md#主题-1精度调试)（NPU sync 不是"加了更安全"）
 - **相关测试**: ✅ G5 `test_sync_safety.{cpp,py}`（2026-06-09）— per-op sync 和 timing sync 均可安全移除（cosine=1.000 bit-exact），deepstack 和 D2H sync 必须保留
 
+> **后续演进（Batch 1, 2026-06-21）**：上述结论已部分超越。
+> - **H1**：per-op sync 默认从 ON 翻转为 **OFF**。env 名从 opt-out `ATB_DISABLE_PER_OP_SYNC` 改为 opt-in `ATB_ENABLE_PER_OP_SYNC`（旧名不再读取）。A/B 实测默认 async 拿到 12–13% e2e 收益（text 65.5→57.1ms，io/mm 115.7→100.6ms，stddev 0.71→0.04）。
+> - **H4**：deepstack `InjectFeatures` 的 `sync=true` **已移除**——IndexAdd 与其生产者同在单 ATB stream，FIFO 排序保证输入就绪，forward 末尾 FinalNorm sync 兜底正确性。结论中「deepstack per-op sync 必须保留」不再成立。
+> - **D2H sync 仍必须保留**且强化：ATB 跑在独立 stream，同步 `aclrtMemcpy` D2H **不**等待 ATB 待决 work，故 vision merger / text FinalNorm 的 `CopyToHost` 前必须有显式 `Synchronize()`（否则 IMAGE_ONLY cos 崩至 ~0.19）。`RunVision` 同步补齐；`debug::DumpNpuFp16` 的 sync 移到 D2H 之前修复 debug 保真度。
+
 ---
 
 ### ⏳ 候选未来项（按优先级排序）

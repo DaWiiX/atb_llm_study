@@ -10,7 +10,7 @@
 
 🟡 **有条件可部署**（功能 + 精度 + benchmark 线已完成；代码质量加固剩 43 项非阻塞）
 
-- **性能**：✅ ATB 比 Transformers 快 3.0–3.6×，余弦相似度 ≥ 0.999（13/13 组合）
+- **性能**：✅ ATB 比 Transformers 快 4.1–4.8×（Batch 1 异步优化后），余弦相似度 ≥ 0.999（13/13 组合）。Batch 1 异步流水恢复净赚 12–13% e2e（text 65.5→57.1ms, io/mm 115.7→100.6ms），stddev 0.71→0.04
 - **C++ 端**：✅ RAII 正确、错误传播完整、61 项审计 100% 修复
 - **Python 端**：🟡 P0/P1-HIGH 已修复；P1-MEDIUM(23) + P2(20) 待办
 - **Benchmark**：✅ B1–B7 + F1–F3 + M4/M5/M6 完成；310P 闭环已复验通过
@@ -44,6 +44,9 @@
 
 ### 2.5 平台适配
 910B + 310P 双平台。310P NZ mask 策略、GQA 原生支持（cos=1.0）、平台检测 API（`is_310p()`/`Is310P()`）均完成。详见 `evergreen/platform-310p.md`。
+
+### 2.6 性能优化 Batch 1（异步流水恢复）
+全部 ✅（2026-06-21）。翻转 per-op sync 默认 OFF（env 名 opt-out→opt-in `ATB_ENABLE_PER_OP_SYNC`）、移除 deepstack `InjectFeatures` 硬编码 sync + idx/alpha 缓存复用、补齐 async 模式 D2H 前置 sync、修复 debug dump 保真度。验收：构建零 warning、op 9/9 + e2e 6/6 全过（含 test_sync_safety 5 配置 cos≥0.999）、12–13% e2e 收益（text 65.5→57.1ms / io 115.7→102.6ms / mm 115.7→100.6ms，stddev 0.71→0.04）、100-iter 无 HBM 泄漏、compare 13/13 裸跑正常。M1（ws_size 缓存 + GRAPH_LAUNCH_MODE）暂缓为后续批次。详见 `evergreen/optimization-roadmap.md` P4 后续演进注记。
 
 ---
 
@@ -92,4 +95,5 @@ C++ ATB 全面最快：geomean 领先 Python ATB **1.39×**、领先 Transformer
 | 日期 | 内容 |
 |------|------|
 | 2026-06-18 | 建立本文件作为单一真相源，归并自 architect-assessment §11.1 + audit-fix-plan + test-fix-plan + refactoring-plan §1 |
-| 2026-06-20 | 平台检测根治：`Is310P()`/`Is910B()` 改读 `.env`（抽 `src/utils/dotenv.h`），消除裸启动 benchmark 读不到 `ASCEND_PLATFORM` 静默走 910B 致 310P Transdata 崩溃；加 `aclrtGetSocName()` 启动期自检提醒。benchmark human 表修复：报告函数 `LOG_INFO`→`printf`。310P 真机复验通过（全量 + compare），§3.1 降级为已通过 |
+| 2026-06-20 | 平台检测根治 + benchmark human 表修复 + 310P 真机复验通过 |
+| 2026-06-21 | 性能优化 Batch 1：异步流水恢复（H1 per-op sync 默认 OFF + H4 deepstack sync 移除 + idx/alpha 缓存 + async D2H sync 补齐）。12–13% e2e 收益，精度无损，Dev→Reviewer→Re-review 闭环 |

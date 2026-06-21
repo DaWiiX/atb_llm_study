@@ -12,15 +12,20 @@ namespace atb_llm {
 namespace families {
 
 namespace {
-// P4 experiment: when ATB_DISABLE_PER_OP_SYNC=1, skip the per-op Synchronize
-// in ExecuteGraph.  On a single stream, FIFO ordering guarantees that op N+1
-// does not launch until op N finishes, so the per-op sync is redundant for
-// correctness.  The host still needs to sync before reading device→host copies.
+// Per-op sync is OFF by default. On the single ATB stream, FIFO ordering
+// serialises graph launches, so a Synchronize after every ExecuteGraph is
+// redundant for correctness and breaks the graph compiler's async pipelining
+// (A/B validated a ~12-13% e2e win on 910B: text 65.5→57.8ms, io/mm 116→100ms,
+// stddev 0.71→0.11). The correctness syncs the host actually needs — before
+// D2H reads (e.g. text FinalNorm / vision merger in qwen3vl_model.cpp) — stay
+// explicit and unconditional; they are not affected by this flag.
 //
-// ASCEND_LAUNCH_BLOCKING=1 (CANN env) makes every kernel launch synchronous,
-// providing an even stronger guarantee — useful for debugging / validation.
-bool PerOpSyncDisabled() {
-    const char* env = getenv("ATB_DISABLE_PER_OP_SYNC");
+// Set ATB_ENABLE_PER_OP_SYNC=1 to opt back into per-op Synchronize for
+// debugging stream-ordering issues. (Replaces the old opt-out
+// ATB_DISABLE_PER_OP_SYNC, which is no longer read — disabling is now the
+// default, so the opt-out had no remaining use.)
+bool PerOpSyncEnabled() {
+    const char* env = getenv("ATB_ENABLE_PER_OP_SYNC");
     return env != nullptr;
 }
 }  // namespace
@@ -35,10 +40,10 @@ Status BaseModel::ExecuteGraph(OperationHandle& graph,
 
     uint64_t ws_size = 0;
 
-    // P4: Per-op sync is skipped when ATB_DISABLE_PER_OP_SYNC=1.
-    // Stream FIFO ordering guarantees ops are serialised on the same stream;
-    // the host only *must* sync before reading device→host copies.
-    bool sync = !PerOpSyncDisabled();
+    // Default: async (no per-op Synchronize). Stream FIFO ordering serialises
+    // ops on the single ATB stream; ATB_ENABLE_PER_OP_SYNC=1 opts back in for
+    // debugging. See PerOpSyncEnabled() for the safety rationale.
+    bool sync = PerOpSyncEnabled();
 
     return ExecuteOperation(graph.get(), vp, runtime_, ws_size, sync);
 }

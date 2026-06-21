@@ -87,6 +87,12 @@ private:
     OperationHandle deepstack_graph_;
     OperationHandle inject_op_;            // IndexAdd op for NPU-side injection
     std::vector<DeepstackMergerWeights> merger_weights_;
+    // H4: cache idx/alpha device tensors across the 3 injections per forward.
+    // alpha is the constant 1.0 multiplier; cached_idx_npu_ holds the int32
+    // image-token positions, re-uploaded only when `positions` changes value.
+    NpuTensor alpha_npu_;
+    NpuTensor cached_idx_npu_;
+    std::vector<int64_t> cached_positions_;
 };
 
 }  // namespace components

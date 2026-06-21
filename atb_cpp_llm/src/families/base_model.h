@@ -26,7 +26,7 @@ protected:
     IRuntime* runtime_ = nullptr;
 
     // ── NPU 图执行 ────────────────────────────────────────
-    /// 执行 ATB 图：Setup → GetWorkspace → Execute → Synchronize
+    /// 执行 ATB 图：Setup → GetWorkspace → Execute（默认异步；ATB_ENABLE_PER_OP_SYNC=1 时加 Synchronize）
     Status ExecuteGraph(OperationHandle& graph, atb::VariantPack& vp);
 
 #ifdef DEBUG
