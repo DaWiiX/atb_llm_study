@@ -51,8 +51,19 @@
 ### 2.7 性能优化 Batch 2-A（CPU 预处理 PIL 式重写）
 全部 ✅（2026-06-22）。`qwen3vl_preprocess.cpp` 移植 PIL `Resample.c` 三大手法：可分离两阶段卷积（16→8 tap）+ 系数预算表（`PrecomputeCoeffs`，运行时零 `CubicWeight` 重算）+ normalize 融合进 vertical pass + patch `f` 帧去重。验收：构建零 warning；`test_preprocess_cpu` 6/6（TestBicubicVsPython/TestPreprocessImageVsPython cos=1.000000）+ `test_io_adapters` magic number 不变 + e2e/accuracy/patch_embed 全过；preprocess 4 分辨率 4.3–5.0× 加速（416×672 129→27ms、720×1280 460→92ms、1080×1920 657→141ms、1440×2560 657→154ms）；compare 13/13 正常。数学等价（edge-clamp Catmull-Rom 语义不变，double 累加精度更高）。Reviewer 零阻塞 bug，独立非二进制维度验证 max_diff≤9.2e-5。详见 `evergreen/optimization-roadmap.md` P10。
 
-### 2.8 P10-B 精度 spike（aclnnUpsampleBicubic2d 闸口验证）
-✅ 闸口通过（2026-06-22）。验证 `aclnnUpsampleBicubic2d` vs PIL BICUBIC（权威基准）在 **4 个生产分辨率**上 cos≥0.9993（416×672 0.9997 / 720×1280 0.9993 / 1080×1920 0.9993 / 1440×2560 0.9993），远超 0.99 闸口。max_diff 43–72 为 boundary band 差异（torch 无 antialias edge vs PIL symmetric），与 test_preprocess_cpu Test 6 已记录的边界差异同源，属预期。修复 wrapper 两处缺陷：①不手动调 `aclDestroyAclOpExecutor`（stream 生命周期管理，手动 destroy 致 double-free，官方示例不调）；②`aclCreateTensor` 用 `ACL_FORMAT_ND` + 显式 strides（官方模式）。新增 `test_aclnn_bicubic_spike`（level2，40 assertions）+ gen 脚本生产分辨率 case（`pil_only` 跳过慢的 C++算法翻译参考）。**文档纠正**：roadmap 原"aclnn 仅 910b、无 310P"是错的——CANN 9.0.0 官方文档确认 910B 与 310P 都 √ 支持，移除 `Is910B()` 守卫，P10-B 升级为跨平台方案。**过程教训**：本轮暴露 5 项失误（闸口未验先铺工程化 / 不熟 API 不查文档先猜试错 / 测试不覆盖生产分布 / 工具异常慢盲等 / 盲信旧文档平台结论），已归并进 `lessons-learned.md` 主题 7 第 7–11 条。下一步 P10-B 工程化（实现 `PreprocessImageNpu` + dispatch 双路径 + 性能实测）待启动。
+### 2.8 P10-B 精度 spike（aclnnUpsampleBicubic2d / AA 闸口验证）
+✅ P10-B 闸口通过（2026-06-22，Developer→Reviewer→Re-review 闭环）。验证 aclnn 与 PIL BICUBIC 在 **引擎真实 smart_resize 参数**（factor=32/min_pixels=4096/max_pixels=1310720）下的 cosine：
+
+| 分辨率 | 引擎输出 | 非 AA cos | AA cos (仅910B) |
+|--------|----------|-----------|-----------------|
+| 416×672 | 416×672 | 1.000000 ✅ | 1.000000 ✅ |
+| 720×1280 | 704×1280 | 0.999680 ✅ | 0.999984 ✅ |
+| 1080×1920 | 832×1504 | 0.986983 ❌ | **0.999993** ✅ |
+| 1440×2560 | 832×1504 | 0.958426 ❌ | **0.999996** ✅ |
+
+**关键发现**：①非 AA（`aclnnUpsampleBicubic2d`，torch a=-0.75 Mitchell 无 antialias）在降采样（1080/1440→832）时严重偏离 PIL，闸口失败；②**AA 版本（`aclnnUpsampleBicubic2dAA`，含抗混叠预滤波）rescues P10-B**，降采样从 0.958 拉回 0.999996。③**AA 仅支持 910B**（CANN 商用版产品表：Atlas 推理系列=310P 为 ×，`@domain aclnn_ops_train`），310P 上 AA 不可用。**P10-B 双路径**：910B → `NpuBicubicResizeAA`（4/4 全部 ≥0.99998）；310P → 非 AA（2/4 通过）+ 降采样 case 降级 P10-A CPU 兜底。
+
+修复 wrapper：非 AA + AA 两版均使用 `ACL_FORMAT_ND` + 显式 strides（官方模式）、Execute 后 `aclrtSynchronizeStream`、**不**手动 `aclDestroyAclOpExecutor`。新增 `test_aclnn_bicubic_spike`（level2，两个 TEST_CASE：非 AA 基线 + AA 闸口）+ gen 脚本生产分辨率 case。审查过程发现并修复 4 BLOCKER（gen 参数错误→闸口翻转 / REFDATA 未登记假阳性 / header 合约不一致 / 死代码）、5 MAJOR（含 sync 热路径声明）、4 MINOR。过程教训 5+1 项（含 solo 开发复发）归并进 `lessons-learned.md` 主题 7 第 0/7–11 条。下一步 P10-B 工程化（实现 `PreprocessImageNpu` + dispatch 双路径 + 性能实测）待启动。
 
 ---
 
@@ -104,4 +115,4 @@ C++ ATB 全面最快：geomean 领先 Python ATB **1.39×**、领先 Transformer
 | 2026-06-20 | 平台检测根治 + benchmark human 表修复 + 310P 真机复验通过 |
 | 2026-06-21 | 性能优化 Batch 1：异步流水恢复（H1 per-op sync 默认 OFF + H4 deepstack sync 移除 + idx/alpha 缓存 + async D2H sync 补齐）。12–13% e2e 收益，精度无损，Dev→Reviewer→Re-review 闭环 |
 | 2026-06-22 | 性能优化 Batch 2-A：CPU 预处理 PIL 式重写（可分离两阶段卷积 + 系数预算表 + normalize 融合 + patch f 帧去重）。preprocess 4.3–5.0× 加速（657→141ms@1080×1920），cos=1.0 精度无损，Dev→Reviewer→Re-review 闭环 |
-| 2026-06-22 | P10-B 精度 spike：aclnnUpsampleBicubic2d vs PIL 在 4 生产分辨率 cos≥0.999 过闸口；修复 wrapper double-free（不手动 destroy executor + ND/strides）；纠正 roadmap 平台结论（910B+310P 都支持）；5 项过程失误归并进 lessons-learned 主题 7 第 7–11 条 |
+| 2026-06-22 | P10-B 精度 spike：非 AA 降采样 1080/1440→832 vs PIL cos=0.987/0.958 闸口失败 → **aclnnUpsampleBicubic2dAA rescues P10-B**，降采样从 0.958 拉回 0.999996。AA 仅 910B（310P ×）。双路径确立。全程 Developer→Reviewer→Re-review 闭环：4 BLOCKER 修复 + 5 项过程失误归并 lessons（含 solo 复发主题 7 第 0 条）|

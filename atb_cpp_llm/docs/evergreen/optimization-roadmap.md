@@ -321,15 +321,15 @@
 
 **ATB 化方向约束**（重要，勿走偏）：
 - ATB 层（`atb/infer_op_params.h`）**无 resize/interpolate 算子**。
-- aclnn 有 `aclnnUpsampleBicubic2d`（语义=torch）和 `aclnnResize`，但**仅 fp16 + 仅 910b kernel，无 310P** → 310P 上不可用，是移植性硬阻塞。
-- **ATB 版预处理应优先用 ATB 基础算子组合计算图**（reshape/transpose/concat/elewise 等，引擎 `src/ops/` 已封装），而非直接调 aclnn——这是项目既有方向。aclnn 仅作为 910b 特化候选。
+- aclnn 有 `aclnnUpsampleBicubic2d`（语义=torch，a=-0.75 Mitchell、无 antialias、align_corners=False）和 `aclnnResize`。**【2026-06-22 纠正】** 早先记录"仅 910b kernel、无 310P"是错的——回查 CANN 9.0.0 官方文档产品支持表：Atlas 训练系列（910B）√ **与** Atlas 推理系列（310P）√ **都支持**。aclnn 路径跨平台可用，不再是移植性硬阻塞。（教训见 lessons-learned 主题 7 第 11 条：文档里的平台/能力结论是易过期事实，使用前回查权威源。）
+- **ATB 版预处理应优先用 ATB 基础算子组合计算图**（reshape/transpose/concat/elewise 等，引擎 `src/ops/` 已封装），而非直接调 aclnn——这是项目既有方向。aclnn 作为跨平台加速候选（P10-B 已验证精度可用）。
 
 **三阶段计划**：
-- **P10-A（CPU PIL 式重写，零移植风险，确定收益）**：移植 Resample.c 三大手法到 `qwen3vl_preprocess.cpp`——可分离两阶段卷积 + 系数预算表 + normalize 融合进 vertical pass 输出 + patch `f` 帧去重。预期 657→~180ms（3.6×），x86/ARM 通用、零新库、数学等价（edge-clamp Catmull-Rom，对齐现有 test_preprocess_cpu 阈值）。**作为后续 ATB 化的 baseline。**
-- **P10-B（aclnn 官方插值，910b 特化）**：先试 `aclnnUpsampleBicubic2d` 能否用（需 Cast uint8→fp16 + normalize elewise + patch reshape/transpose）。能用则作 910b 特化路径；不能用则进 P10-C。310P 保留 P10-A CPU 路径。
-- **P10-C（ATB 基础算子组合 PIL resample）**：aclnn 不可用时，用 ATB 基础算子（Elewise/Concat/Transpose/Reshape）组合出 PIL resample 计算图。跨平台（含 310P）。
+- **P10-A（CPU PIL 式重写，零移植风险，确定收益）** ✅：移植 Resample.c 三大手法到 `qwen3vl_preprocess.cpp`——可分离两阶段卷积 + 系数预算表 + normalize 融合进 vertical pass 输出 + patch `f` 帧去重。实测 657→141ms@1080×1920（4.7×），x86/ARM 通用、零新库、数学等价（edge-clamp Catmull-Rom，对齐现有 test_preprocess_cpu 阈值）。**作为后续 ATB 化的 baseline。**
+- **P10-B（aclnn 官方插值，双平台，AA 910B 特化）** 🔬精度闸口已过（Developer→Reviewer→Re-review 闭环）：`aclnnUpsampleBicubic2d`（非 AA）在降采样 1080/1440→832 时 vs PIL 仅 cos=0.987/0.958 ❌，**`aclnnUpsampleBicubic2dAA`（含抗混叠预滤波）rescues P10-B**，降采样从 0.958 拉回 0.999996 ✅。AA 仅支持 910B（CANN 商用版产品表：Atlas 推理系列=310P ×）。**双路径**：910B → `NpuBicubicResizeAA`（4/4 ≥0.99998）；310P → 非 AA（2/4 通过，降采样 case P10-A CPU 兜底）。wrapper `NpuBicubicResize`/`NpuBicubicResizeAA` 已实现（`aclnn_bicubic_resize.cpp`，ND+strides、不手动 destroy executor、Execute 后 sync）。**工程化待做**：实现 `PreprocessImageNpu`（Cast uint8→fp16 H2D → NpuBicubicResizeAA/Resize → normalize elewise → patch extract，全程 NPU）+ dispatch 双路径 + 4 分辨率性能实测 vs P10-A baseline（141ms@1080×1920）。
+- **P10-C（ATB 基础算子组合 PIL resample）**：aclnn 不可用或需更高精度对齐 PIL boundary 时的备选，用 ATB 基础算子（Elewise/Concat/Transpose/Reshape）组合出 PIL resample 计算图。跨平台。P10-B 精度已达标，P10-C 优先级降低，仅作 long-shot 储备。
 
-**验收**：cosine ≥ 现有 test_preprocess_cpu 阈值（对齐 PIL/torch）；4 分辨率（416×672/720×1280/1080×1920/1440×2560）性能实测对比 baseline。
+**验收**：cosine ≥ 0.99 vs PIL（P10-B spike 已在 4 生产分辨率达标）；4 分辨率（416×672/720×1280/1080×1920/1440×2560）性能实测对比 P10-A baseline。
 
 ---
 
