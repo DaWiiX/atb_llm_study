@@ -102,6 +102,7 @@ set(ENGINE_SRCS
     src/components/vision/pos_embed_interp.cpp
     src/components/vision/pos_embed_npu_graph.cpp
     src/components/vision/vis_rope_npu_graph.cpp
+    src/components/vision/aclnn_bicubic_resize.cpp
     # runners
     src/runners/vision_runner.cpp
     src/runners/text_runner.cpp
@@ -144,6 +145,7 @@ target_link_libraries(atb_llm_engine
     PRIVATE
         thirdparty
         ascendcl
+        opapi
         atb
 )
 
@@ -228,6 +230,7 @@ add_atb_test(test_vision_stages       tests/level3_integration/test_vision_stage
 add_atb_test(test_pos_embed_npu_graph tests/level2_op_precision/test_pos_embed_npu_graph.cpp)
 add_atb_test(test_vis_rope_npu_graph  tests/level2_op_precision/test_vis_rope_npu_graph.cpp)
 add_atb_test(test_index_add_npu       tests/level2_op_precision/test_index_add_npu.cpp)
+add_atb_test(test_aclnn_bicubic_spike tests/level2_op_precision/test_aclnn_bicubic_spike.cpp)
 
 # Level 1 CPU pure-function tests (no NPU dependency for the logic,
 # but link against engine library for the implementation).
@@ -363,7 +366,7 @@ set_tests_properties(
 )
 
 # ── Reference-data dependency labels ──────────────────────
-# Tests that fopen() /tmp/{cpu_,preprocess_,stage_,posembed_npu_,visrope_npu_}*.bin
+# Tests that fopen() /tmp/{cpu_,preprocess_,stage_,posembed_npu_,visrope_npu_,bicubic_}*.bin
 # files produced by tests/python_reference/gen_all.py. When those .bin
 # files are absent, every test listed below correctly returns a non-zero exit code
 # (true failure), so ctest will report them as FAIL — not PASS.
@@ -376,7 +379,7 @@ set_tests_properties(
 # noisy, expected failures that would distract from real regressions.
 #
 # Maintenance contract: when a new test reads a /tmp/*.bin file, list it
-# here. Discovered via: grep -lE '/tmp/(cpu_|preprocess_|stage_|posembed_npu_|visrope_npu_)' \
+# here. Discovered via: grep -lE '/tmp/(cpu_|preprocess_|stage_|posembed_npu_|bicubic_|visrope_npu_)' \
 #                          tests/level*/*.cpp | grep -v test_config_wiring
 set(REFDATA_DEPENDENT_TESTS
     # Level 0 framework tests
@@ -406,6 +409,7 @@ set(REFDATA_DEPENDENT_TESTS
     test_vision_block_precision
     test_patch_embed_precision
     test_vision_merger_precision
+    test_aclnn_bicubic_spike
     test_pos_embed_npu_graph
     test_vis_rope_npu_graph
     # Level 3 integration
