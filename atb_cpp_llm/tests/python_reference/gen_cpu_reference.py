@@ -491,7 +491,8 @@ def _pil_bicubic_resize(arr_chw: np.ndarray, out_h: int, out_w: int) -> np.ndarr
     return out
 
 
-def _gen_bicubic_case(name: str, input_np: np.ndarray, out_h: int, out_w: int):
+def _gen_bicubic_case(name: str, input_np: np.ndarray, out_h: int, out_w: int,
+                      pil_only: bool = False):
     """Run the C++-equivalent bicubic on `input_np` (C,H,W float32) and
     dump input + output as f32 bins. The reference exactly mirrors the
     C++ algorithm (Catmull-Rom a=-0.5 + edge clamp), so the C++ test
@@ -510,11 +511,17 @@ def _gen_bicubic_case(name: str, input_np: np.ndarray, out_h: int, out_w: int):
     assert input_np.dtype == np.float32 and input_np.ndim == 3
     input_u8 = np.clip(np.round(input_np), 0.0, 255.0).astype(np.uint8)
     input_q = input_u8.astype(np.float32)
-    y_np = _cpp_bicubic_resize(input_q, out_h, out_w).astype(np.float32)
-    y_pil = _pil_bicubic_resize(input_q, out_h, out_w).astype(np.float32)
     write_f32(f"{OUTPUT_DIR}/bicubic_{name}_input.bin", input_q)
-    write_f32(f"{OUTPUT_DIR}/bicubic_{name}_output.bin", y_np)
+    y_pil = _pil_bicubic_resize(input_q, out_h, out_w).astype(np.float32)
     write_f32(f"{OUTPUT_DIR}/bicubic_{name}_pil_output.bin", y_pil)
+    if pil_only:
+        # Production-resolution cases: the C++-algo translation is an
+        # O(C*out*out*16) pure-Python scalar loop (~minutes at 1080x1920),
+        # and the P10-B spike only needs the PIL ground truth. Skip it.
+        print(f"  → bicubic_{name}: in{input_np.shape} -> out{(0, out_h, out_w)} (PIL ref only)")
+        return
+    y_np = _cpp_bicubic_resize(input_q, out_h, out_w).astype(np.float32)
+    write_f32(f"{OUTPUT_DIR}/bicubic_{name}_output.bin", y_np)
     print(f"  → bicubic_{name}: in{input_np.shape} -> out{y_np.shape} (+ PIL ref)")
 
 
@@ -556,6 +563,25 @@ def gen_bicubic_preprocess():
     np.random.seed(42)
     rand_rgb = (np.random.rand(3, 8, 8) * 255.0).astype(np.float32)
     _gen_bicubic_case("random_8x8_to_16x16_3ch", rand_rgb, 16, 16)
+
+    # ── Production-resolution cases [P10-B spike] ───────────────
+    # Cover the actual image sizes the engine sees (1080×1920 etc.).
+    # Output dims come from the real smart_resize so the spike validates the
+    # genuine engine resize path, not an arbitrary target. Random RGB input
+    # (fixed seed for reproducibility). These exercise aclnnUpsampleBicubic2d
+    # at scale where the interior dominates — the regime that matters in prod.
+    from atb_python_qwen3vl_embedding.preprocess import smart_resize
+    np.random.seed(2026)
+    for in_h, in_w in [(416, 672), (720, 1280), (1080, 1920), (1440, 2560)]:
+        # factor = patch_size * merge_size = 16 * 2 = 32 (from preprocessor_config.json)
+        # min_pixels / max_pixels from preprocessor_config.json
+        out_h, out_w = smart_resize(in_h, in_w, factor=32,
+                                    min_pixels=4096,
+                                    max_pixels=1310720)
+        img = (np.random.rand(3, in_h, in_w) * 255.0).astype(np.float32)
+        name = f"prod_{in_h}x{in_w}"
+        _gen_bicubic_case(name, img, out_h, out_w, pil_only=True)
+
 
     # ── PreprocessImage cases ───────────────────────────────────
     # Load the in-repo Python reference (matches engine.preprocess_image).
