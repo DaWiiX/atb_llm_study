@@ -45,6 +45,8 @@
 #include <vector>
 #include <cmath>
 #include <string>
+#include <chrono>
+#include <algorithm>
 
 #define IS_OK(s) ((s) == atb_llm::STATUS_OK)
 
@@ -373,4 +375,126 @@ TEST_CASE("PreprocessImageNpu vs PreprocessImage CPU full-pipeline precision") {
     LOG_INFO("[FULL-PIPELINE GATE] non-AA path cos >= 0.99 required");
     LOG_INFO("  AA path (910B downsample) gated by AA spike test above");
     LOG_INFO("================================================================");
+}
+
+TEST_CASE("aclnn-bicubic-spike-perf: PreprocessImageNpu vs PreprocessImage CPU latency") {
+    // Measure end-to-end PreprocessImageNpu (NPU) vs PreprocessImage (CPU P10-A)
+    // at 4 production resolutions.  Warmup 3 rounds, time 5 rounds, report median.
+
+    auto runtime = atb_llm::CreateRuntime(0, 1LL * 1024 * 1024 * 1024);
+    REQUIRE(runtime);
+
+    atb_llm::adapters::Qwen3VLConfig cfg{};
+    cfg.pp_patch_size = 16;
+    cfg.pp_merge_size = 2;
+    cfg.pp_temporal_patch_size = 2;
+    cfg.pp_min_pixels = 4096;
+    cfg.pp_max_pixels = 1310720;
+    cfg.pp_image_mean = {0.5f, 0.5f, 0.5f};
+    cfg.pp_image_std  = {0.5f, 0.5f, 0.5f};
+
+    struct {
+        const char* name;
+        int32_t height, width;
+    } cases[] = {
+        {"416x672",    416,  672},
+        {"720x1280",   720,  1280},
+        {"1080x1920",  1080, 1920},
+        {"1440x2560",  1440, 2560},
+    };
+
+    const int32_t channels  = 3;
+    const int32_t factor    = cfg.pp_patch_size * cfg.pp_merge_size;  // 32
+    const int32_t patch_dim = static_cast<int32_t>(
+        static_cast<int64_t>(channels)
+        * cfg.pp_temporal_patch_size
+        * cfg.pp_patch_size * cfg.pp_patch_size);  // 3*2*16*16 = 1536
+
+    double speedups[4];
+    std::srand(42);
+
+    for (int i = 0; i < 4; i++) {
+        const auto& c = cases[i];
+
+        // Generate random uint8 image (fixed seed per case for reproducibility).
+        size_t img_size = static_cast<size_t>(channels) * c.height * c.width;
+        std::vector<uint8_t> image(img_size);
+        for (size_t j = 0; j < img_size; j++) {
+            image[j] = static_cast<uint8_t>(std::rand() % 256);
+        }
+
+        // Compute output size via SmartResize (shared between both paths).
+        int32_t new_h, new_w;
+        atb_llm::adapters::SmartResize(c.height, c.width, factor,
+            cfg.pp_min_pixels, cfg.pp_max_pixels, new_h, new_w);
+        int64_t grid_h = new_h / cfg.pp_patch_size;
+        int64_t grid_w = new_w / cfg.pp_patch_size;
+        int64_t num_patches_exp = 1 * grid_h * grid_w;
+        int64_t total_elems = num_patches_exp * patch_dim;
+
+        // Allocate separate output buffers for CPU and NPU paths.
+        std::vector<uint16_t> cpu_buf(total_elems);
+        std::vector<uint16_t> npu_buf(total_elems);
+
+        // ── Warmup: 3 rounds each path (not timed) ──
+        for (int w = 0; w < 3; w++) {
+            int64_t np = 0;
+            int64_t gthw[3] = {0, 0, 0};
+            (void)atb_llm::adapters::PreprocessImage(
+                image.data(), channels, c.height, c.width, cfg,
+                cpu_buf.data(), np, gthw);
+        }
+        for (int w = 0; w < 3; w++) {
+            int64_t np = 0;
+            int64_t gthw[3] = {0, 0, 0};
+            (void)atb_llm::adapters::PreprocessImageNpu(
+                runtime.get(), image.data(), channels, c.height, c.width, cfg,
+                npu_buf.data(), np, gthw);
+        }
+
+        // ── Timed: 5 rounds each path, take median ──
+        std::vector<double> cpu_times(5), npu_times(5);
+
+        for (int t = 0; t < 5; t++) {
+            int64_t np = 0;
+            int64_t gthw[3] = {0, 0, 0};
+            auto t0 = std::chrono::high_resolution_clock::now();
+            auto s  = atb_llm::adapters::PreprocessImage(
+                image.data(), channels, c.height, c.width, cfg,
+                cpu_buf.data(), np, gthw);
+            auto t1 = std::chrono::high_resolution_clock::now();
+            REQUIRE(s == atb_llm::STATUS_OK);
+            cpu_times[t] = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        }
+
+        for (int t = 0; t < 5; t++) {
+            int64_t np = 0;
+            int64_t gthw[3] = {0, 0, 0};
+            auto t0 = std::chrono::high_resolution_clock::now();
+            auto s  = atb_llm::adapters::PreprocessImageNpu(
+                runtime.get(), image.data(), channels, c.height, c.width, cfg,
+                npu_buf.data(), np, gthw);
+            auto t1 = std::chrono::high_resolution_clock::now();
+            REQUIRE(s == atb_llm::STATUS_OK);
+            npu_times[t] = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        }
+
+        std::sort(cpu_times.begin(), cpu_times.end());
+        std::sort(npu_times.begin(), npu_times.end());
+        double cpu_ms   = cpu_times[2];   // median
+        double npu_ms   = npu_times[2];
+        double speedup  = cpu_ms / npu_ms;
+        speedups[i]     = speedup;
+
+        LOG_INFO("[PERF] %dx%d -> %dx%d: CPU=%.2fms NPU=%.2fms speedup=%.1fx",
+                 c.height, c.width, new_h, new_w, cpu_ms, npu_ms, speedup);
+    }
+
+    // ── Geomean summary ──
+    double log_sum = 0.0;
+    for (int i = 0; i < 4; i++) {
+        log_sum += std::log(speedups[i]);
+    }
+    double geomean = std::exp(log_sum / 4.0);
+    LOG_INFO("[PERF SUMMARY] geomean speedup: %.1fx", geomean);
 }
