@@ -48,6 +48,9 @@
 ### 2.6 性能优化 Batch 1（异步流水恢复）
 全部 ✅（2026-06-21）。翻转 per-op sync 默认 OFF（env 名 opt-out→opt-in `ATB_ENABLE_PER_OP_SYNC`）、移除 deepstack `InjectFeatures` 硬编码 sync + idx/alpha 缓存复用、补齐 async 模式 D2H 前置 sync、修复 debug dump 保真度。验收：构建零 warning、op 9/9 + e2e 6/6 全过（含 test_sync_safety 5 配置 cos≥0.999）、12–13% e2e 收益（text 65.5→57.1ms / io 115.7→102.6ms / mm 115.7→100.6ms，stddev 0.71→0.04）、100-iter 无 HBM 泄漏、compare 13/13 裸跑正常。M1（ws_size 缓存 + GRAPH_LAUNCH_MODE）暂缓为后续批次。详见 `evergreen/optimization-roadmap.md` P4 后续演进注记。
 
+### 2.7 性能优化 Batch 2-A（CPU 预处理 PIL 式重写）
+全部 ✅（2026-06-22）。`qwen3vl_preprocess.cpp` 移植 PIL `Resample.c` 三大手法：可分离两阶段卷积（16→8 tap）+ 系数预算表（`PrecomputeCoeffs`，运行时零 `CubicWeight` 重算）+ normalize 融合进 vertical pass + patch `f` 帧去重。验收：构建零 warning；`test_preprocess_cpu` 6/6（TestBicubicVsPython/TestPreprocessImageVsPython cos=1.000000）+ `test_io_adapters` magic number 不变 + e2e/accuracy/patch_embed 全过；preprocess 4 分辨率 4.3–5.0× 加速（416×672 129→27ms、720×1280 460→92ms、1080×1920 657→141ms、1440×2560 657→154ms）；compare 13/13 正常。数学等价（edge-clamp Catmull-Rom 语义不变，double 累加精度更高）。Reviewer 零阻塞 bug，独立非二进制维度验证 max_diff≤9.2e-5。后续 P10-B（aclnn 910b 特化）/ P10-C（ATB 算子组合）待启动。详见 `evergreen/optimization-roadmap.md` P10。
+
 ---
 
 ## 3. 待办（按优先级）
@@ -97,3 +100,4 @@ C++ ATB 全面最快：geomean 领先 Python ATB **1.39×**、领先 Transformer
 | 2026-06-18 | 建立本文件作为单一真相源，归并自 architect-assessment §11.1 + audit-fix-plan + test-fix-plan + refactoring-plan §1 |
 | 2026-06-20 | 平台检测根治 + benchmark human 表修复 + 310P 真机复验通过 |
 | 2026-06-21 | 性能优化 Batch 1：异步流水恢复（H1 per-op sync 默认 OFF + H4 deepstack sync 移除 + idx/alpha 缓存 + async D2H sync 补齐）。12–13% e2e 收益，精度无损，Dev→Reviewer→Re-review 闭环 |
+| 2026-06-22 | 性能优化 Batch 2-A：CPU 预处理 PIL 式重写（可分离两阶段卷积 + 系数预算表 + normalize 融合 + patch f 帧去重）。preprocess 4.3–5.0× 加速（657→141ms@1080×1920），cos=1.0 精度无损，Dev→Reviewer→Re-review 闭环 |

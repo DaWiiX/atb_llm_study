@@ -297,6 +297,40 @@
 - **结论**: ❌ 不可行（NPU 内存太宝贵，不值得占用）
 - **保持现状**: CPU lookup 然后 H2D。当前已经只 H2D 一次。
 
+#### 🟡 P10: Preprocess 加速（Batch 2，2026-06-22 启动）
+
+**权威基准源**（任何预处理改动对齐这个，不要自己定语义）：
+- 官方实现 `/mnt/workspace/gitCode/Qwen3-VL-Embedding`（模型权重/推理脚本）调 transformers + qwen_vl_utils。
+- 图像 resize 权威链路在 `/mnt/workspace/gitCode/Qwen3-VL/qwen-vl-utils/src/qwen_vl_utils/vision_process.py:140`：`Image.open → to_rgb → smart_resize → image.resize((w,h))`，**`image.resize` 不传 resample 参数 → PIL 默认 `Image.BICUBIC`**。这就是官方预处理 resize 的真值来源。
+- transformers Qwen3VL `image_processing_qwen3_vl` / `video_processing_qwen3_vl` 同样 `resample = PILImageResampling.BICUBIC`。
+- Python 参考侧 `atb_python_qwen3vl_embedding/preprocess.py` 用 torch `F.interpolate(mode='bicubic', align_corners=False)`，与 PIL 在 boundary handling 上有可观察差异（自然图像上 cosine 仍 ≥0.999）。**PIL（`vision_process.py:140`）是最权威基准**。
+- PIL resize 内部实现参考：`docs/archive/Resample.c`（PIL 官方 libImaging/Resample.c）。
+
+**当前瓶颈**（910B 实测，1080×1920）：
+| 阶段 | 耗时 | 占比 |
+|---|---|---|
+| bicubic | 516ms | 78.5% |
+| patch extraction | 116ms | 17.6% |
+| normalize | 25ms | 3.8% |
+| smartresize | ~0 | 0% |
+| **total** | **657ms** | |
+
+根因：当前 `qwen3vl_preprocess.cpp:BicubicResize` 不可分离（4×4=16 tap/像素）+ 每像素 16 次浮点 `CubicWeight`（含 fabs/floor/分支）+ 运行时 clamp 分支。PIL Resample.c 的优化正好是反面：两阶段可分离（16→8 tap）+ 系数预算表（运行时零三角函数）+ 8bpc 定点整数 + clip8 查找表。
+
+**数据搬运不是瓶颈**：当前 H2D fp16 pixel_values 最大 14MiB（<1ms），ATB 流程 H2D uint8 原图更小（1.36–4×减少）。657ms 是 CPU compute，不是搬运。
+
+**ATB 化方向约束**（重要，勿走偏）：
+- ATB 层（`atb/infer_op_params.h`）**无 resize/interpolate 算子**。
+- aclnn 有 `aclnnUpsampleBicubic2d`（语义=torch）和 `aclnnResize`，但**仅 fp16 + 仅 910b kernel，无 310P** → 310P 上不可用，是移植性硬阻塞。
+- **ATB 版预处理应优先用 ATB 基础算子组合计算图**（reshape/transpose/concat/elewise 等，引擎 `src/ops/` 已封装），而非直接调 aclnn——这是项目既有方向。aclnn 仅作为 910b 特化候选。
+
+**三阶段计划**：
+- **P10-A（CPU PIL 式重写，零移植风险，确定收益）**：移植 Resample.c 三大手法到 `qwen3vl_preprocess.cpp`——可分离两阶段卷积 + 系数预算表 + normalize 融合进 vertical pass 输出 + patch `f` 帧去重。预期 657→~180ms（3.6×），x86/ARM 通用、零新库、数学等价（edge-clamp Catmull-Rom，对齐现有 test_preprocess_cpu 阈值）。**作为后续 ATB 化的 baseline。**
+- **P10-B（aclnn 官方插值，910b 特化）**：先试 `aclnnUpsampleBicubic2d` 能否用（需 Cast uint8→fp16 + normalize elewise + patch reshape/transpose）。能用则作 910b 特化路径；不能用则进 P10-C。310P 保留 P10-A CPU 路径。
+- **P10-C（ATB 基础算子组合 PIL resample）**：aclnn 不可用时，用 ATB 基础算子（Elewise/Concat/Transpose/Reshape）组合出 PIL resample 计算图。跨平台（含 310P）。
+
+**验收**：cosine ≥ 现有 test_preprocess_cpu 阈值（对齐 PIL/torch）；4 分辨率（416×672/720×1280/1080×1920/1440×2560）性能实测对比 baseline。
+
 ---
 
 ## 实测性能演变表
