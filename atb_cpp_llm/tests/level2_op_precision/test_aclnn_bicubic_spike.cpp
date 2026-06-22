@@ -32,7 +32,10 @@
 #include "atb_llm/runtime.h"
 #include "engine/runtime_impl.h"
 #include "components/vision/aclnn_bicubic_resize.h"
+#include "adapters/qwen3vl_embedding/qwen3vl_preprocess.h"
+#include "adapters/qwen3vl_embedding/qwen3vl_config.h"
 #include "utils/float_utils.h"    // Fp32ToFp16, Fp16ToF32
+#include "utils/cpp11_compat.h"  // Is910B
 #include "log/logger.h"
 
 #include "acl/acl.h"
@@ -242,4 +245,132 @@ TEST_CASE("aclnn-bicubic-spike-AA: measure AA variant on all 4 production resolu
     for (int i = 0; i < 4; i++) {
         CHECK(cos_aa[i] >= 0.99);
     }
+}
+
+TEST_CASE("PreprocessImageNpu vs PreprocessImage CPU full-pipeline precision") {
+    // Compare the full NPU preprocessing pipeline (SmartResize + bicubic + normalize
+    // + patch extraction) against the CPU reference implementation at all 4
+    // production resolutions.  Both paths share identical SmartResize and patch
+    // extraction logic; differences come from the bicubic kernel (Mitchell vs
+    // Catmull-Rom) and fp16 vs fp32 arithmetic.
+    //
+    // BLOCKER-1 fix: only genuine downsampling on 910B triggers AA.  AA changes
+    // the output fundamentally (adds a pre-filter) so the NPU output diverges
+    // from CPU non-AA at heavy downsampling.  This is EXPECTED and CORRECT —
+    // the AA path is independently validated by the AA spike test above
+    // (cos >= 0.99999 vs PIL at all 4 resolutions).  This full-pipeline test
+    // gates on the shared non-AA path (identity / mild-scale cases on both
+    // platforms, all cases on 310P).
+    //
+    // Gate summary:
+    //   Non-downsample (either platform):  CHECK cos >= 0.99 (NPU non-AA vs CPU)
+    //   Downsample on 310P:                CHECK cos >= 0.99 (both non-AA)
+    //   Downsample on 910B:                INFO only (NPU AA vs CPU non-AA diverges;
+    //                                      AA path gated by AA spike test above)
+
+    auto runtime = atb_llm::CreateRuntime(0, 1LL * 1024 * 1024 * 1024);
+    REQUIRE(runtime);
+
+    atb_llm::adapters::Qwen3VLConfig cfg{};
+    cfg.pp_patch_size = 16;
+    cfg.pp_temporal_patch_size = 2;
+    cfg.pp_merge_size = 2;
+    cfg.pp_min_pixels = 4096;
+    cfg.pp_max_pixels = 1310720;
+
+    struct {
+        const char* name;
+        int32_t height, width;
+    } cases[] = {
+        {"416x672",    416,  672},
+        {"720x1280",   720,  1280},
+        {"1080x1920",  1080, 1920},
+        {"1440x2560",  1440, 2560},
+    };
+
+    bool is_910b = atb_llm::Is910B();
+    std::srand(42);
+
+    for (const auto& c : cases) {
+        const int32_t channels = 3;
+        int32_t factor = cfg.pp_patch_size * cfg.pp_merge_size;
+
+        // Generate random uint8 image (fixed seed for reproducibility).
+        size_t img_size = static_cast<size_t>(channels) * c.height * c.width;
+        std::vector<uint8_t> image(img_size);
+        for (size_t i = 0; i < img_size; i++) {
+            image[i] = static_cast<uint8_t>(std::rand() % 256);
+        }
+
+        // Compute expected output size via SmartResize (both paths use the
+        // same algorithm, so output dims match exactly).
+        int32_t new_h, new_w;
+        atb_llm::adapters::SmartResize(c.height, c.width, factor,
+            cfg.pp_min_pixels, cfg.pp_max_pixels, new_h, new_w);
+        int64_t grid_h = new_h / cfg.pp_patch_size;
+        int64_t grid_w = new_w / cfg.pp_patch_size;
+        int64_t num_patches_exp = 1 * grid_h * grid_w;
+        int64_t patch_dim = static_cast<int64_t>(channels)
+                          * cfg.pp_temporal_patch_size
+                          * cfg.pp_patch_size * cfg.pp_patch_size;
+        int64_t total_pixels = num_patches_exp * patch_dim;
+
+        // ── CPU reference ──
+        std::vector<uint16_t> cpu_out(total_pixels);
+        int64_t num_patches_cpu = 0;
+        int64_t grid_thw_cpu[3] = {0, 0, 0};
+        auto s_cpu = atb_llm::adapters::PreprocessImage(
+            image.data(), channels, c.height, c.width, cfg,
+            cpu_out.data(), num_patches_cpu, grid_thw_cpu);
+        REQUIRE(s_cpu == atb_llm::STATUS_OK);
+
+        // ── NPU pipeline ──
+        std::vector<uint16_t> npu_out(total_pixels);
+        int64_t num_patches_npu = 0;
+        int64_t grid_thw_npu[3] = {0, 0, 0};
+        auto s_npu = atb_llm::adapters::PreprocessImageNpu(
+            runtime.get(), image.data(), channels, c.height, c.width, cfg,
+            npu_out.data(), num_patches_npu, grid_thw_npu);
+        REQUIRE(s_npu == atb_llm::STATUS_OK);
+
+        // Grid/metadata must be byte-identical (SmartResize is CPU-only, shared).
+        CHECK(grid_thw_cpu[0] == grid_thw_npu[0]);
+        CHECK(grid_thw_cpu[1] == grid_thw_npu[1]);
+        CHECK(grid_thw_cpu[2] == grid_thw_npu[2]);
+        CHECK(num_patches_cpu == num_patches_npu);
+
+        // Convert both outputs to fp32 and compare via cosine similarity.
+        int64_t n = num_patches_cpu * patch_dim;
+        std::vector<float> cpu_f32(n), npu_f32(n);
+        for (int64_t i = 0; i < n; i++) {
+            cpu_f32[i] = atb_llm::Fp16ToF32(cpu_out[i]);
+            npu_f32[i] = atb_llm::Fp16ToF32(npu_out[i]);
+        }
+
+        double cos = CosineSim(cpu_f32.data(), npu_f32.data(), n);
+        float max_d = MaxAbsDiff(cpu_f32.data(), npu_f32.data(), n);
+
+        bool downsample = (new_h < c.height || new_w < c.width);
+        // On 910B, genuine downsampling triggers AA which intentionally
+        // diverges from CPU non-AA — gate that path via the AA spike test
+        // (cos >= 0.99999 vs PIL, independently validated above).
+        bool aa_active = is_910b && downsample;
+
+        LOG_INFO("  [%s] %dx%d -> %dx%d grid=(%ld,%ld,%ld) patches=%ld cos=%.6f max_diff=%.4e%s",
+                 c.name, c.height, c.width, new_h, new_w,
+                 static_cast<long>(grid_thw_cpu[0]),
+                 static_cast<long>(grid_thw_cpu[1]),
+                 static_cast<long>(grid_thw_cpu[2]),
+                 static_cast<long>(num_patches_cpu), cos, max_d,
+                 aa_active ? "  [AA active - gated by AA spike test]" : "");
+
+        if (!aa_active) {
+            CHECK(cos >= 0.99);
+        }
+    }
+
+    LOG_INFO("================================================================");
+    LOG_INFO("[FULL-PIPELINE GATE] non-AA path cos >= 0.99 required");
+    LOG_INFO("  AA path (910B downsample) gated by AA spike test above");
+    LOG_INFO("================================================================");
 }

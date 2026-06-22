@@ -3,6 +3,9 @@
 #include "utils/float_utils.h"
 #include "log/logger.h"
 #include "utils/cpp11_compat.h"
+#include "atb_llm/runtime.h"
+#include "ops/elewise_op.h"
+#include "components/vision/aclnn_bicubic_resize.h"
 #include <cmath>
 #include <algorithm>
 #include <cstring>
@@ -295,6 +298,303 @@ Status PreprocessImage(const uint8_t* image,
              static_cast<long>(num_patches), static_cast<long>(patch_dim));
 
     return STATUS_OK;
+}
+
+Status PreprocessImageNpu(IRuntime* runtime,
+                          const uint8_t* image,
+                          int32_t channels, int32_t height, int32_t width,
+                          const Qwen3VLConfig& config,
+                          uint16_t* pixel_values,
+                          int64_t& num_patches,
+                          int64_t* grid_thw) {
+    if (runtime == nullptr || image == nullptr || pixel_values == nullptr || grid_thw == nullptr) {
+        LOG_ERROR("PreprocessImageNpu: null parameter (runtime=%p, image=%p, pixel_values=%p, grid_thw=%p)",
+                  static_cast<const void*>(runtime), static_cast<const void*>(image),
+                  static_cast<const void*>(pixel_values), static_cast<const void*>(grid_thw));
+        return ERROR_INVALID_PARAM;
+    }
+
+    int32_t patch_size = config.pp_patch_size;
+    int32_t tp = config.pp_temporal_patch_size;
+    int32_t merge_size = config.pp_merge_size;
+    int32_t factor = patch_size * merge_size;
+
+    // --- Step 1: SmartResize (CPU) ------------------------------------
+    int32_t new_h, new_w;
+    SmartResize(height, width, factor,
+                config.pp_min_pixels, config.pp_max_pixels,
+                new_h, new_w);
+
+    // --- Resources (all declared upfront for goto-cleanup) ------------
+    auto* alloc = runtime->GetAllocator();
+    auto* ctx = runtime->GetContext();
+    Status ret = STATUS_OK;
+
+    // Value-initialize all tensor handles: deviceData starts as nullptr so
+    // the cleanup block can distinguish allocated vs unallocated tensors.
+    atb::Tensor input_tensor{};
+    atb::Tensor resized_tensor{};
+    atb::Tensor normalize_tmp{};
+    atb::Tensor mean_bc{};
+    atb::Tensor inv_std_bc{};
+
+    // --- Step 2: H2D -- uint8->fp16 conversion + copy to device ---------
+    int64_t in_elems = static_cast<int64_t>(channels) * height * width;
+    std::vector<uint16_t> in_fp16(in_elems);
+    for (int64_t i = 0; i < in_elems; i++) {
+        in_fp16[i] = Fp32ToFp16(static_cast<float>(image[i]));
+    }
+
+    ret = alloc->AllocFloat16(input_tensor, {1, channels, height, width});
+    if (ret != STATUS_OK) {
+        LOG_ERROR("PreprocessImageNpu: AllocFloat16 input failed");
+        goto cleanup;
+    }
+    ret = alloc->CopyToDevice(input_tensor, in_fp16.data(), in_elems * sizeof(uint16_t));
+    if (ret != STATUS_OK) {
+        LOG_ERROR("PreprocessImageNpu: CopyToDevice input failed");
+        goto cleanup;
+    }
+
+    // --- Step 3: Bicubic Resize on NPU ---------------------------------
+    ret = alloc->AllocFloat16(resized_tensor, {1, channels, new_h, new_w});
+    if (ret != STATUS_OK) {
+        LOG_ERROR("PreprocessImageNpu: AllocFloat16 resized failed");
+        goto cleanup;
+    }
+
+    // AA pre-filtering is only beneficial when genuinely downsampling.
+    // At identity / near-identity scales AA smooths the image and
+    // degrades precision vs CPU (cos drops to ~0.950).  On 310P the AA
+    // op is not available so we always use non-AA.
+    {
+        bool downsample = (new_h < height || new_w < width);
+        if (Is910B() && downsample) {
+            ret = NpuBicubicResizeAA(runtime,
+                                     input_tensor.deviceData,
+                                     channels, height, width, new_h, new_w,
+                                     resized_tensor.deviceData);
+        } else {
+            ret = NpuBicubicResize(runtime,
+                                   input_tensor.deviceData,
+                                   channels, height, width, new_h, new_w,
+                                   resized_tensor.deviceData);
+        }
+    }
+    if (ret != STATUS_OK) {
+        LOG_ERROR("PreprocessImageNpu: NpuBicubicResize failed");
+        goto cleanup;
+    }
+
+    // Free input tensor early (no longer needed); Free() sets deviceData to
+    // nullptr so the cleanup block will skip it — no double-free.
+    alloc->Free(input_tensor);
+
+    // --- Step 4–6: Normalize + D2H + patch extraction -----------------
+    // Nested scope isolates all normalization local variables (mean, std_val,
+    // mean_neg, inv_std, RunElewise lambda) so that gotos from steps 2-3
+    // (above) don't cross their initialization — C++ forbids goto over
+    // variables with non-trivial destructors.
+    {
+        // ── Step 4: Normalize on NPU via 3 ATB ElewiseOps ──
+        // Formula: (x/255 - mean) / std
+        //
+        // ATB has no scalar add/subtract (no ELEWISE_ADDS).  We use broadcast
+        // tensors instead: ELEWISE_ADD/ELEWISE_MUL broadcast when corresponding
+        // dims are equal or at least one is 1.  A (1,C,1,1) tensor broadcasts
+        // to (1,C,H,W) -- one scalar per channel, perfect for per-channel mean/std.
+        //
+        // Ops: 4a. MULS(1/255)
+        //      4b. ADD(-mean broadcast)  --  x/255 + (-mean) = x/255 - mean
+        //      4c. MUL(1/std broadcast)  --  (x/255 - mean) * (1/std)
+
+        float mean[3] = {0.5f, 0.5f, 0.5f};
+        float std_val[3] = {0.5f, 0.5f, 0.5f};
+        if (config.pp_image_mean.size() >= 3) {
+            mean[0] = config.pp_image_mean[0];
+            mean[1] = config.pp_image_mean[1];
+            mean[2] = config.pp_image_mean[2];
+        }
+        if (config.pp_image_std.size() >= 3) {
+            std_val[0] = config.pp_image_std[0];
+            std_val[1] = config.pp_image_std[1];
+            std_val[2] = config.pp_image_std[2];
+        }
+
+        // Intermediate tensor (same shape as resized, used as ping-pong buffer)
+        ret = alloc->AllocFloat16(normalize_tmp, {1, channels, new_h, new_w});
+        if (ret != STATUS_OK) {
+            LOG_ERROR("PreprocessImageNpu: AllocFloat16 normalize_tmp failed");
+            goto cleanup;
+        }
+
+        // Per-channel broadcast tensors (1, C, 1, 1) -- just 3 elements each
+        std::vector<uint16_t> mean_neg(static_cast<size_t>(channels));
+        std::vector<uint16_t> inv_std(static_cast<size_t>(channels));
+        for (int32_t c = 0; c < channels; c++) {
+            mean_neg[c] = Fp32ToFp16(-mean[c]);
+            inv_std[c] = Fp32ToFp16(1.0f / std_val[c]);
+        }
+
+        ret = alloc->AllocFloat16(mean_bc, {1, channels, 1, 1});
+        if (ret != STATUS_OK) {
+            LOG_ERROR("PreprocessImageNpu: AllocFloat16 mean_bc failed");
+            goto cleanup;
+        }
+        ret = alloc->AllocFloat16(inv_std_bc, {1, channels, 1, 1});
+        if (ret != STATUS_OK) {
+            LOG_ERROR("PreprocessImageNpu: AllocFloat16 inv_std_bc failed");
+            goto cleanup;
+        }
+        ret = alloc->CopyToDevice(mean_bc, mean_neg.data(), mean_neg.size() * sizeof(uint16_t));
+        if (ret != STATUS_OK) goto cleanup;
+        ret = alloc->CopyToDevice(inv_std_bc, inv_std.data(), inv_std.size() * sizeof(uint16_t));
+        if (ret != STATUS_OK) goto cleanup;
+
+        // Run a single ATB ElewiseOp (Setup -> GetWorkspace -> Execute)
+        auto RunElewise = [&](OperationHandle op, atb::VariantPack& vp) -> Status {
+            uint64_t ws_size = 0;
+            atb::Status atb_s = op.get()->Setup(vp, ws_size, ctx);
+            if (atb_s != atb::NO_ERROR) {
+                LOG_ERROR("PreprocessImageNpu: Elewise Setup failed, atbStatus=%d",
+                          static_cast<int>(atb_s));
+                return ERROR_INFERENCE;
+            }
+            uint8_t* ws = nullptr;
+            if (ws_size > 0) {
+                auto wp = runtime->GetWorkspace(ws_size);
+                ws = wp.first;
+                if (wp.second != STATUS_OK) {
+                    LOG_ERROR("PreprocessImageNpu: GetWorkspace failed, size=%lu",
+                              static_cast<unsigned long>(ws_size));
+                    return wp.second;
+                }
+            }
+            atb_s = op.get()->Execute(vp, ws, ws_size, ctx);
+            if (atb_s != atb::NO_ERROR) {
+                LOG_ERROR("PreprocessImageNpu: Elewise Execute failed, atbStatus=%d",
+                          static_cast<int>(atb_s));
+                return ERROR_INFERENCE;
+            }
+            return STATUS_OK;
+        };
+
+        // 4a. MULS(1/255): resized -> normalize_tmp
+        {
+            atb::VariantPack vp;
+            vp.inTensors = {resized_tensor};
+            vp.outTensors = {normalize_tmp};
+            ret = RunElewise(ops::ElewiseOp::MakeMuls(1.0f / 255.0f), vp);
+            if (ret != STATUS_OK) goto cleanup;
+        }
+
+        // 4b. ADD(-mean broadcast): normalize_tmp + mean_bc -> resized_tensor (overwrite)
+        {
+            atb::VariantPack vp;
+            vp.inTensors = {normalize_tmp, mean_bc};
+            vp.outTensors = {resized_tensor};
+            ret = RunElewise(ops::ElewiseOp::MakeAdd(), vp);
+            if (ret != STATUS_OK) goto cleanup;
+        }
+
+        // 4c. MUL(1/std broadcast): resized_tensor * inv_std_bc -> normalize_tmp (final)
+        {
+            atb::VariantPack vp;
+            vp.inTensors = {resized_tensor, inv_std_bc};
+            vp.outTensors = {normalize_tmp};
+            ret = RunElewise(ops::ElewiseOp::MakeMul(), vp);
+            if (ret != STATUS_OK) goto cleanup;
+        }
+
+        // Ensure all NPU ops complete before D2H
+        ret = runtime->Synchronize();
+        if (ret != STATUS_OK) {
+            LOG_ERROR("PreprocessImageNpu: Synchronize after normalize failed");
+            goto cleanup;
+        }
+
+        // Free broadcast tensors and bicubic output (no longer needed);
+        // Free() sets deviceData to nullptr so cleanup skips them.
+        alloc->Free(mean_bc);
+        alloc->Free(inv_std_bc);
+        alloc->Free(resized_tensor);
+
+        // ── Step 5: D2H normalized data + CPU patch extraction ──
+        // normalize_tmp holds (1, C, new_h, new_w) fp16, already normalized.
+        // D2H first, then rearrange into patches (same merge ordering as
+        // PreprocessImage, but source is fp16 already-normalized instead of f32).
+        int64_t resized_elems = static_cast<int64_t>(channels) * new_h * new_w;
+        std::vector<uint16_t> normalized_fp16(resized_elems);
+        ret = alloc->CopyToHost(normalized_fp16.data(), normalize_tmp,
+                                resized_elems * sizeof(uint16_t));
+        if (ret != STATUS_OK) {
+            LOG_ERROR("PreprocessImageNpu: D2H normalize_tmp failed");
+            goto cleanup;
+        }
+        alloc->Free(normalize_tmp);
+
+        // ── Step 6: Patch extraction + compute grid_thw ──
+        int64_t patch_dim = static_cast<int64_t>(channels) * tp * patch_size * patch_size;
+        int32_t grid_t = 1;
+        int32_t grid_h = new_h / patch_size;
+        int32_t grid_w = new_w / patch_size;
+
+        grid_thw[0] = grid_t;
+        grid_thw[1] = grid_h;
+        grid_thw[2] = grid_w;
+        num_patches = static_cast<int64_t>(grid_t) * grid_h * grid_w;
+
+        int32_t merged_h = grid_h / merge_size;
+        int32_t merged_w = grid_w / merge_size;
+
+        size_t ps2 = static_cast<size_t>(patch_size) * patch_size;
+        int64_t patch_idx = 0;
+        for (int64_t br = 0; br < merged_h; br++) {
+            for (int64_t bc = 0; bc < merged_w; bc++) {
+                for (int64_t ir = 0; ir < merge_size; ir++) {
+                    for (int64_t ic = 0; ic < merge_size; ic++) {
+                        uint16_t* pixel_base = pixel_values + patch_idx * patch_dim;
+                        int64_t row_base = br * merge_size * patch_size + ir * patch_size;
+                        int64_t col_base = bc * merge_size * patch_size + ic * patch_size;
+                        for (int32_t c = 0; c < channels; c++) {
+                            const uint16_t* src_c = normalized_fp16.data()
+                                + static_cast<size_t>(c) * new_h * new_w;
+                            uint16_t* f0 = pixel_base + c * tp * ps2;
+                            for (int64_t ph = 0; ph < patch_size; ph++) {
+                                const uint16_t* src_row = src_c + (row_base + ph) * new_w + col_base;
+                                uint16_t* dst_row = f0 + ph * patch_size;
+                                for (int64_t pw = 0; pw < patch_size; pw++) {
+                                    dst_row[pw] = src_row[pw];
+                                }
+                            }
+                            for (int32_t f = 1; f < tp; f++) {
+                                std::memcpy(f0 + f * ps2, f0, ps2 * sizeof(uint16_t));
+                            }
+                        }
+                        patch_idx++;
+                    }
+                }
+            }
+        }
+
+        LOG_INFO("PreprocessImageNpu: %dx%d -> %dx%d, grid=(%d,%d,%d), patches=%ld, dim=%ld",
+                 height, width, new_h, new_w,
+                 grid_t, grid_h, grid_w,
+                 static_cast<long>(num_patches), static_cast<long>(patch_dim));
+    }
+
+    return STATUS_OK;
+
+cleanup:
+    // Free in reverse allocation order; Free() is idempotent (checks deviceData
+    // != nullptr and nulls it afterwards), so already-freed tensors are safe.
+    if (inv_std_bc.deviceData != nullptr)      { alloc->Free(inv_std_bc); }
+    if (mean_bc.deviceData != nullptr)         { alloc->Free(mean_bc); }
+    if (normalize_tmp.deviceData != nullptr)   { alloc->Free(normalize_tmp); }
+    if (resized_tensor.deviceData != nullptr)  { alloc->Free(resized_tensor); }
+    if (input_tensor.deviceData != nullptr)    { alloc->Free(input_tensor); }
+
+    return ret;
 }
 
 }  // namespace adapters

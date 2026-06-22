@@ -116,3 +116,4 @@ C++ ATB 全面最快：geomean 领先 Python ATB **1.39×**、领先 Transformer
 | 2026-06-21 | 性能优化 Batch 1：异步流水恢复（H1 per-op sync 默认 OFF + H4 deepstack sync 移除 + idx/alpha 缓存 + async D2H sync 补齐）。12–13% e2e 收益，精度无损，Dev→Reviewer→Re-review 闭环 |
 | 2026-06-22 | 性能优化 Batch 2-A：CPU 预处理 PIL 式重写（可分离两阶段卷积 + 系数预算表 + normalize 融合 + patch f 帧去重）。preprocess 4.3–5.0× 加速（657→141ms@1080×1920），cos=1.0 精度无损，Dev→Reviewer→Re-review 闭环 |
 | 2026-06-22 | P10-B 精度 spike：非 AA 降采样 1080/1440→832 vs PIL cos=0.987/0.958 闸口失败 → **aclnnUpsampleBicubic2dAA rescues P10-B**，降采样从 0.958 拉回 0.999996。AA 仅 910B（310P ×）。双路径确立。全程 Developer→Reviewer→Re-review 闭环：4 BLOCKER 修复 + 5 项过程失误归并 lessons（含 solo 复发主题 7 第 0 条）|
+| 2026-06-22 | P10-B 工程化：`PreprocessImageNpu`（6 步 NPU 管线：SmartResize→H2D→AA/非AA Bicubic→3×Elewise normalize→D2H→CPU patch）实现，goto-cleanup 内存安全，AA 降采样条件守卫。全管线精度测试 cos≥0.999（非降采样/非 AA）|
