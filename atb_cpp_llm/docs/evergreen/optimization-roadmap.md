@@ -329,7 +329,7 @@
 - **P10-B（aclnn 官方插值，双平台，AA 910B 特化）** 🔬精度闸口已过（Developer→Reviewer→Re-review 闭环）：`aclnnUpsampleBicubic2d`（非 AA）在降采样 1080/1440→832 时 vs PIL 仅 cos=0.987/0.958 ❌，**`aclnnUpsampleBicubic2dAA`（含抗混叠预滤波）rescues P10-B**，降采样从 0.958 拉回 0.999996 ✅。AA 仅支持 910B（CANN 商用版产品表：Atlas 推理系列=310P ×）。**双路径**：910B → `NpuBicubicResizeAA`（4/4 ≥0.99998）；310P → 非 AA（2/4 通过，降采样 case P10-A CPU 兜底）。wrapper `NpuBicubicResize`/`NpuBicubicResizeAA` 已实现（`aclnn_bicubic_resize.cpp`，ND+strides、不手动 destroy executor、Execute 后 sync）。**工程化待做**：实现 `PreprocessImageNpu`（Cast uint8→fp16 H2D → NpuBicubicResizeAA/Resize → normalize elewise → patch extract，全程 NPU）+ dispatch 双路径 + 4 分辨率性能实测 vs P10-A baseline（141ms@1080×1920）。
 - **P10-C（ATB 基础算子组合 PIL resample）**：aclnn 不可用或需更高精度对齐 PIL boundary 时的备选，用 ATB 基础算子（Elewise/Concat/Transpose/Reshape）组合出 PIL resample 计算图。跨平台。P10-B 精度已达标，P10-C 优先级降低，仅作 long-shot 储备。
 
-**验收**：cosine ≥ 0.99 vs PIL（P10-B spike 已在 4 生产分辨率达标）；4 分辨率（416×672/720×1280/1080×1920/1440×2560）性能实测对比 P10-A baseline。
+**验收**：cosine ≥ 0.99 vs PIL（P10-B spike 已在 4 生产分辨率达标）；4 分辨率性能实测完成（vs P10-A CPU，geomean 1.4×）：416×672 1.7×/720×1280 1.9×/1080×1920 1.4×/1440×2560 0.9×（退化根因 H2D 开销，待后续优化）。全管线精度测试 cos≥0.999（非降采样/非 AA 路径）。
 
 ---
 
