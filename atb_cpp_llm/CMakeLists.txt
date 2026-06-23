@@ -255,6 +255,7 @@ add_atb_test(test_split_concat_precision        tests/level2_op_precision/test_s
 add_atb_test(test_softmax_precision             tests/level2_op_precision/test_softmax_precision.cpp)
 add_atb_test(test_gather_reduce_precision       tests/level2_op_precision/test_gather_reduce_precision.cpp)
 add_atb_test(test_transpose_set_value_precision tests/level2_op_precision/test_transpose_set_value_precision.cpp)
+add_atb_test(test_patch_transpose_spike          tests/level2_op_precision/test_patch_transpose_spike.cpp)
 
 # Level 2 advanced precision tests (Wave 3)
 add_atb_test(test_rope_precision                tests/level2_op_precision/test_rope_precision.cpp)
