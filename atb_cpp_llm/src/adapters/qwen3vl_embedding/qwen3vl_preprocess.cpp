@@ -5,6 +5,7 @@
 #include "utils/cpp11_compat.h"
 #include "atb_llm/runtime.h"
 #include "ops/elewise_op.h"
+#include "ops/transpose_op.h"
 #include "components/vision/aclnn_bicubic_resize.h"
 #include <cmath>
 #include <algorithm>
@@ -337,6 +338,8 @@ Status PreprocessImageNpu(IRuntime* runtime,
     atb::Tensor normalize_tmp{};
     atb::Tensor mean_bc{};
     atb::Tensor inv_std_bc{};
+    atb::Tensor asstrided_out{};
+    atb::Tensor transpose_out{};
 
     // --- Step 2: H2D -- uint8->fp16 conversion + copy to device ---------
     int64_t in_elems = static_cast<int64_t>(channels) * height * width;
@@ -392,7 +395,7 @@ Status PreprocessImageNpu(IRuntime* runtime,
 
     // --- Step 4–6: Normalize + D2H + patch extraction -----------------
     // Nested scope isolates all normalization local variables (mean, std_val,
-    // mean_neg, inv_std, RunElewise lambda) so that gotos from steps 2-3
+    // mean_neg, inv_std, RunAtbOp lambda) so that gotos from steps 2-3
     // (above) don't cross their initialization — C++ forbids goto over
     // variables with non-trivial destructors.
     {
@@ -451,12 +454,14 @@ Status PreprocessImageNpu(IRuntime* runtime,
         ret = alloc->CopyToDevice(inv_std_bc, inv_std.data(), inv_std.size() * sizeof(uint16_t));
         if (ret != STATUS_OK) goto cleanup;
 
-        // Run a single ATB ElewiseOp (Setup -> GetWorkspace -> Execute)
-        auto RunElewise = [&](OperationHandle op, atb::VariantPack& vp) -> Status {
+        // Run a single ATB operation (Setup -> GetWorkspace -> Execute).  Works
+        // for any atb::Operation wrapped in OperationHandle (Elewise, AsStrided,
+        // Transpose, ...).  op is moved in and destroyed when the call returns.
+        auto RunAtbOp = [&](OperationHandle op, atb::VariantPack& vp) -> Status {
             uint64_t ws_size = 0;
             atb::Status atb_s = op.get()->Setup(vp, ws_size, ctx);
             if (atb_s != atb::NO_ERROR) {
-                LOG_ERROR("PreprocessImageNpu: Elewise Setup failed, atbStatus=%d",
+                LOG_ERROR("PreprocessImageNpu: ATB op Setup failed, atbStatus=%d",
                           static_cast<int>(atb_s));
                 return ERROR_INFERENCE;
             }
@@ -472,7 +477,7 @@ Status PreprocessImageNpu(IRuntime* runtime,
             }
             atb_s = op.get()->Execute(vp, ws, ws_size, ctx);
             if (atb_s != atb::NO_ERROR) {
-                LOG_ERROR("PreprocessImageNpu: Elewise Execute failed, atbStatus=%d",
+                LOG_ERROR("PreprocessImageNpu: ATB op Execute failed, atbStatus=%d",
                           static_cast<int>(atb_s));
                 return ERROR_INFERENCE;
             }
@@ -484,7 +489,7 @@ Status PreprocessImageNpu(IRuntime* runtime,
             atb::VariantPack vp;
             vp.inTensors = {resized_tensor};
             vp.outTensors = {normalize_tmp};
-            ret = RunElewise(ops::ElewiseOp::MakeMuls(1.0f / 255.0f), vp);
+            ret = RunAtbOp(ops::ElewiseOp::MakeMuls(1.0f / 255.0f), vp);
             if (ret != STATUS_OK) goto cleanup;
         }
 
@@ -493,7 +498,7 @@ Status PreprocessImageNpu(IRuntime* runtime,
             atb::VariantPack vp;
             vp.inTensors = {normalize_tmp, mean_bc};
             vp.outTensors = {resized_tensor};
-            ret = RunElewise(ops::ElewiseOp::MakeAdd(), vp);
+            ret = RunAtbOp(ops::ElewiseOp::MakeAdd(), vp);
             if (ret != STATUS_OK) goto cleanup;
         }
 
@@ -502,7 +507,7 @@ Status PreprocessImageNpu(IRuntime* runtime,
             atb::VariantPack vp;
             vp.inTensors = {resized_tensor, inv_std_bc};
             vp.outTensors = {normalize_tmp};
-            ret = RunElewise(ops::ElewiseOp::MakeMul(), vp);
+            ret = RunAtbOp(ops::ElewiseOp::MakeMul(), vp);
             if (ret != STATUS_OK) goto cleanup;
         }
 
@@ -519,63 +524,133 @@ Status PreprocessImageNpu(IRuntime* runtime,
         alloc->Free(inv_std_bc);
         alloc->Free(resized_tensor);
 
-        // ── Step 5: D2H normalized data + CPU patch extraction ──
-        // normalize_tmp holds (1, C, new_h, new_w) fp16, already normalized.
-        // D2H first, then rearrange into patches (same merge ordering as
-        // PreprocessImage, but source is fp16 already-normalized instead of f32).
-        int64_t resized_elems = static_cast<int64_t>(channels) * new_h * new_w;
-        std::vector<uint16_t> normalized_fp16(resized_elems);
-        ret = alloc->CopyToHost(normalized_fp16.data(), normalize_tmp,
-                                resized_elems * sizeof(uint16_t));
-        if (ret != STATUS_OK) {
-            LOG_ERROR("PreprocessImageNpu: D2H normalize_tmp failed");
-            goto cleanup;
-        }
-        alloc->Free(normalize_tmp);
-
-        // ── Step 6: Patch extraction + compute grid_thw ──
-        int64_t patch_dim = static_cast<int64_t>(channels) * tp * patch_size * patch_size;
+        // ── Step 5: Patch extraction on NPU (AsStrided + 8-D Transpose) ──
+        // Replaces the old D2H + CPU patch loop.  normalize_tmp [1,C,new_h,new_w]
+        // is logically [C, new_h, new_w] = [C, merged_h*ms*ps, merged_w*ms*ps].
+        // AsStrided reinterprets it as the 8-D patch grid [tp, C, merged_h, ms,
+        // ps, merged_w, ms, ps] with a 0 element-stride on tp (broadcasts the
+        // single frame to all tp frames — matches the CPU loop's f=0 -> f=1..tp-1
+        // memcpy).  Transpose perm [2,5,3,6,1,0,4,7] reorders to [merged_h,
+        // merged_w, ms, ms, C, tp, ps, ps], whose row-major layout is exactly
+        // [num_patches, patch_dim].  Bit-exact vs CPU (test_patch_transpose_spike).
         int32_t grid_t = 1;
         int32_t grid_h = new_h / patch_size;
         int32_t grid_w = new_w / patch_size;
+        int64_t merged_h = grid_h / merge_size;
+        int64_t merged_w = grid_w / merge_size;
 
         grid_thw[0] = grid_t;
         grid_thw[1] = grid_h;
         grid_thw[2] = grid_w;
+        int64_t patch_dim = static_cast<int64_t>(channels) * tp * patch_size * patch_size;
         num_patches = static_cast<int64_t>(grid_t) * grid_h * grid_w;
 
-        int32_t merged_h = grid_h / merge_size;
-        int32_t merged_w = grid_w / merge_size;
+        // 8-D shapes (grid_t=1 squeezed; tp handled by AsStrided broadcast).
+        // shape7 = [C, merged_h, ms, ps, merged_w, ms, ps] is the contiguous
+        // row-major view of [C, new_h, new_w]; shape8 prepends tp.
+        const int64_t ms = merge_size;
+        const int64_t ps = patch_size;
+        std::vector<int64_t> shape7 = {channels, merged_h, ms, ps, merged_w, ms, ps};
+        std::vector<int64_t> shape8 = {tp, channels, merged_h, ms, ps, merged_w, ms, ps};
 
-        size_t ps2 = static_cast<size_t>(patch_size) * patch_size;
-        int64_t patch_idx = 0;
-        for (int64_t br = 0; br < merged_h; br++) {
-            for (int64_t bc = 0; bc < merged_w; bc++) {
-                for (int64_t ir = 0; ir < merge_size; ir++) {
-                    for (int64_t ic = 0; ic < merge_size; ic++) {
-                        uint16_t* pixel_base = pixel_values + patch_idx * patch_dim;
-                        int64_t row_base = br * merge_size * patch_size + ir * patch_size;
-                        int64_t col_base = bc * merge_size * patch_size + ic * patch_size;
-                        for (int32_t c = 0; c < channels; c++) {
-                            const uint16_t* src_c = normalized_fp16.data()
-                                + static_cast<size_t>(c) * new_h * new_w;
-                            uint16_t* f0 = pixel_base + c * tp * ps2;
-                            for (int64_t ph = 0; ph < patch_size; ph++) {
-                                const uint16_t* src_row = src_c + (row_base + ph) * new_w + col_base;
-                                uint16_t* dst_row = f0 + ph * patch_size;
-                                for (int64_t pw = 0; pw < patch_size; pw++) {
-                                    dst_row[pw] = src_row[pw];
-                                }
-                            }
-                            for (int32_t f = 1; f < tp; f++) {
-                                std::memcpy(f0 + f * ps2, f0, ps2 * sizeof(uint16_t));
-                            }
-                        }
-                        patch_idx++;
-                    }
-                }
+        // Row-major element strides for shape7 (verified bit-exact in the spike);
+        // tp dim gets stride 0 (broadcast).
+        std::vector<int64_t> stride7(7);
+        {
+            int64_t s = 1;
+            for (int i = 6; i >= 0; --i) { stride7[i] = s; s *= shape7[i]; }
+        }
+        std::vector<int64_t> stride8;
+        stride8.push_back(0);
+        for (int64_t s7 : stride7) stride8.push_back(s7);
+
+        // 5a. AsStrided: normalize_tmp -> asstrided_out [shape8, stride8, offset 0]
+        {
+            atb::infer::AsStridedParam param;
+            for (int64_t s : shape8)  param.size.push_back(s);
+            for (int64_t s : stride8) param.stride.push_back(s);
+            param.offset.push_back(0);
+
+            atb::Operation* raw = nullptr;
+            atb::Status atb_s = atb::CreateOperation(param, &raw);
+            if (atb_s != atb::NO_ERROR || raw == nullptr) {
+                LOG_ERROR("PreprocessImageNpu: AsStrided CreateOperation failed, atbStatus=%d",
+                          static_cast<int>(atb_s));
+                ret = ERROR_INFERENCE;
+                goto cleanup;
+            }
+            OperationHandle asstrided_op(raw);
+
+            ret = alloc->AllocFloat16(asstrided_out, shape8);
+            if (ret != STATUS_OK) {
+                LOG_ERROR("PreprocessImageNpu: AllocFloat16 asstrided_out failed");
+                goto cleanup;
+            }
+
+            atb::VariantPack vp;
+            vp.inTensors  = {normalize_tmp};
+            vp.outTensors = {asstrided_out};
+            ret = RunAtbOp(std::move(asstrided_op), vp);
+            if (ret != STATUS_OK) {
+                LOG_ERROR("PreprocessImageNpu: AsStrided execute failed");
+                goto cleanup;
             }
         }
+
+        // 5b. Transpose perm [2,5,3,6,1,0,4,7]:
+        //   [tp,C,mh,ms,ps,mw,ms,ps] -> [mh,mw,ms,ms,C,tp,ps,ps]
+        // whose row-major layout == [num_patches, patch_dim].
+        {
+            const std::vector<int32_t> perm = {2, 5, 3, 6, 1, 0, 4, 7};
+            std::vector<int64_t> perm_out_shape(8);
+            for (int i = 0; i < 8; i++) {
+                perm_out_shape[i] = shape8[perm[i]];
+            }
+
+            OperationHandle transpose_op = ops::TransposeOp::Create(perm);
+            if (!transpose_op) {
+                LOG_ERROR("PreprocessImageNpu: TransposeOp::Create failed");
+                ret = ERROR_INFERENCE;
+                goto cleanup;
+            }
+
+            ret = alloc->AllocFloat16(transpose_out, perm_out_shape);
+            if (ret != STATUS_OK) {
+                LOG_ERROR("PreprocessImageNpu: AllocFloat16 transpose_out failed");
+                goto cleanup;
+            }
+
+            atb::VariantPack vp;
+            vp.inTensors  = {asstrided_out};
+            vp.outTensors = {transpose_out};
+            ret = RunAtbOp(std::move(transpose_op), vp);
+            if (ret != STATUS_OK) {
+                LOG_ERROR("PreprocessImageNpu: Transpose execute failed");
+                goto cleanup;
+            }
+        }
+
+        // ── Step 6: D2H final patch output ──
+        // transpose_out is already laid out as [num_patches, patch_dim] fp16;
+        // a single D2H delivers pixel_values directly (no CPU rearrange).  The
+        // sync ensures the async AsStrided+Transpose complete before the copy.
+        ret = runtime->Synchronize();
+        if (ret != STATUS_OK) {
+            LOG_ERROR("PreprocessImageNpu: Synchronize before D2H failed");
+            goto cleanup;
+        }
+        ret = alloc->CopyToHost(pixel_values, transpose_out,
+                                num_patches * patch_dim * sizeof(uint16_t));
+        if (ret != STATUS_OK) {
+            LOG_ERROR("PreprocessImageNpu: D2H transpose_out failed");
+            goto cleanup;
+        }
+
+        // Free patch-pipeline tensors (normalize_tmp was the AsStrided input;
+        // asstrided_out the Transpose input; transpose_out the D2H source).
+        alloc->Free(normalize_tmp);
+        alloc->Free(asstrided_out);
+        alloc->Free(transpose_out);
 
         LOG_INFO("PreprocessImageNpu: %dx%d -> %dx%d, grid=(%d,%d,%d), patches=%ld, dim=%ld",
                  height, width, new_h, new_w,
@@ -588,6 +663,8 @@ Status PreprocessImageNpu(IRuntime* runtime,
 cleanup:
     // Free in reverse allocation order; Free() is idempotent (checks deviceData
     // != nullptr and nulls it afterwards), so already-freed tensors are safe.
+    if (transpose_out.deviceData != nullptr)   { alloc->Free(transpose_out); }
+    if (asstrided_out.deviceData != nullptr)   { alloc->Free(asstrided_out); }
     if (inv_std_bc.deviceData != nullptr)      { alloc->Free(inv_std_bc); }
     if (mean_bc.deviceData != nullptr)         { alloc->Free(mean_bc); }
     if (normalize_tmp.deviceData != nullptr)   { alloc->Free(normalize_tmp); }
