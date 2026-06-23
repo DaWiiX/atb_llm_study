@@ -10,7 +10,7 @@
 
 ## 主题 1：精度调试
 
-**触发关键词**：cosine 低、NaN、精度下降、block 输出异常、fp16 二进制、跨语言数值
+**触发关键词**：cosine 低、NaN、精度下降、block 输出异常、fp16 二进制、跨语言数值、grid_t、actual_patches、隐式领域事实、单图多帧、temporal 折入
 
 1. **跨语言 fp16 二进制必须确认位解释一致**
    `np.frombuffer(raw, dtype=np.float16)` 正确；`struct.unpack` + `dtype=np.uint16` 再 `.astype(np.float16)` 是错的（那是数值 cast 不是比特重解释）。— `refactor §4.1`
@@ -26,6 +26,9 @@
 
 5. **多框架 benchmark 必须用完全相同输入**
    C++ 用裸 token、Python 走 chat template → cosine 只有 0.2–0.3。统一 token 生成脚本，所有框架加载同一批 `.bin`。— `refactor §4.7`
+
+6. **【2026-06-23 benchmark路径C Reviewer】隐式领域事实（如 grid_t=1）被多个口径隐式依赖，改动逼其显式化时要警惕视频/多帧场景**
+   Qwen3VL 单图推理：`temporal_patch_size` 折入 `patch_dim`，实际 `grid_t=1`（`actual_patches = grid_h*grid_w`）。但 benchmark 既有代码用 `grid_t=2` 算 `num_patches`（仅作 host buffer 2× 超分配），靠 `PreprocessImage` 回填 `actual_patches` 隐式修正 `vis_tokens`。路径 C 不调 `PreprocessImage`，被迫显式 `actual_patches = grid_h*grid_w`——正确，但 `vis_tokens` 现与 PreprocessImage 回填解耦、无运行时一致性校验。**当前单图 grid_t=1 恒成立无 bug；但视频/多帧场景 grid_t=2 时会静默错算 vis_tokens（input_ids 与引擎 patch 数不匹配）。** 教训：单图→多帧适配时，grep 所有 `grid_t`/`actual_patches`/`num_patches` 用法，确认每个是否假设 grid_t=1；buffer 超分配用的 grid_t 与语义用的 grid_t 不能混。— benchmark 路径C Reviewer MINOR
 
 ---
 
