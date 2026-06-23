@@ -78,13 +78,13 @@
 
 ## 主题 4：测试反模式
 
-**触发关键词**：静态审查、运行时测试、测试覆盖、refdata、跳过、阈值、假阳性
+**触发关键词**：静态审查、运行时测试、测试覆盖、refdata、跳过、阈值、假阳性、参数对齐、引擎真实参数、smart_resize factor、AA 降采样、抗锯齿守卫、恒等尺度
 
 1. **静态审查 ≠ 运行时测试**
    API 行为误解、运行时竞态、性能回归、兼容性、数值精度——这五类只有实际运行才能发现。审查通过 = 静态审查零问题 + 单元测试 PASS + 复现确认问题消失。— `arch §9.4`
 
-2. **needs_refdata 标签必须完整**
-   `test_io_adapters` 读 `preprocess_*.bin` 但不在 needs_refdata 列表 → `--no-refdata` 时静默跳过精度验证，CTest 仍报 PASS（假阳性）。新增读 `/tmp/*.bin` 的测试必须登记到 CMakeLists REFDATA_DEPENDENT_TESTS。— `audit C1`
+2. **needs_refdata 标签必须完整（已复发 2 次）**
+   `test_io_adapters` 读 `preprocess_*.bin` 但不在 needs_refdata 列表 → `--no-refdata` 时静默跳过精度验证，CTest 仍报 PASS（假阳性）。新增读 `/tmp/*.bin` 的测试必须登记到 CMakeLists REFDATA_DEPENDENT_TESTS。— `audit C1`。**复发 1**（P10-B spike）：`test_aclnn_bicubic_spike` 同样漏登，被 Reviewer BLOCKER-2 抓出。**复发 2** 提醒：这是高频坑，新增任何读 `/tmp/*.bin` 参考的测试，第一反应就是 grep REFDATA_DEPENDENT_TESTS 确认已登记。— `audit C1 + P10-B spike BLOCKER-2`
 
 3. **参考实现不能自证**
    BicubicResize 用自己的实现当参考 = 没有独立参考。参考实现必须是同输入下的黄金标准（本项目为 transformers）。— `test-fix-plan P7`
@@ -94,6 +94,12 @@
 
 5. **重复测试要合并**
    `test_consistency.cpp` 是 `test_accuracy.cpp` 子集、多个 NZ 验证脚本冗余——删除子集，保留最全的。— `test-fix-plan P9/P11`
+
+6. **【2026-06-23 P10-B spike BLOCKER-1】测试用例的参数必须对齐引擎真实参数，自己编的参数会让闸口结论失效**
+   spike gen 脚本 smart_resize 用 `factor=28`，引擎实际 `factor=32`（patch_size=16×merge_size=2）、`min_pixels=4096`、`max_pixels=1310720`（来自 `preprocessor_config.json`）。结果 1080×1920 在 spike 里是 1092×1932（近恒等），引擎实际 832×1504（大幅降采样）——**在错误尺寸上验证的 cos=0.999 全是假象**，纠正参数后 cos 立刻翻成 0.987/0.958 闸口失败。**任何验证引擎某阶段的测试，其输入参数（resize factor/像素上下限/dtype/shape）必须从引擎实际读取的 config 源对齐，不能自己编。** 先 grep 引擎代码确认真实参数来源（`preprocessor_config.json`/`config_`），再写测试。这是 7.9"测试覆盖生产分布"的延伸：不只覆盖生产分辨率，还要用生产的真实参数。
+
+7. **【2026-06-23 P10-B 工程化 BLOCKER-1】AA/抗锯齿算子只在降采样时有益，恒等/上采样时反而破坏精度**
+   `aclnnUpsampleBicubic2dAA`（含抗混叠预滤波）在降采样时 vs PIL cos=0.99999（rescues P10-B），但在恒等尺度（416×672→416×672）下 vs CPU cos=0.950——AA 预滤器对不需缩放的图像做了不必要的平滑。**抗锯齿 resize 算子必须加降采样条件守卫**：`downsample = (new_h<height || new_w<width)`，仅降采样时用 AA，恒等/上采样用非 AA。这是 AA 算子的固有语义陷阱：AA 是为降采样防混叠设计的，对非降采样是噪声源。注意：bicubic 核本身在恒等下是单位冲激（见 #2 证伪记录），问题出在 AA 的额外预滤步骤。— P10-B 工程化 BLOCKER-1
 
 ---
 
@@ -191,7 +197,7 @@
 
 ## 主题 8：代码设计
 
-**触发关键词**：config 字段、debug dump、DEPRECATED、wrapper、死代码、返回值、接口契约、host/device 指针、裸指针契约、数据位置绑死、张量抽象、D2H/H2D 往返、调用方 sync、free-safety sync、所有权转移、Detach 静默、double-free
+**触发关键词**：config 字段、debug dump、DEPRECATED、wrapper、死代码、返回值、接口契约、host/device 指针、裸指针契约、数据位置绑死、张量抽象、D2H/H2D 往返、调用方 sync、free-safety sync、所有权转移、Detach 静默、double-free、头注释合约漂移、stale 合约、goto-cleanup、资源泄漏、提前 return 泄漏、多资源分配
 
 1. **每个 config 字段必须有消费代码**
    新增字段问"谁读它？怎么验证它确实被读了？"用 `grep -rn "\.field_name"` 验证写→读链路。— `refactor §4.2`
@@ -222,6 +228,12 @@
 
 8. **【2026-06-23 路径C Reviewer】所有权转移 API（Detach/erase/release）对未跟踪/已转移对象必须显式告警，不能静默 no-op**
     `TensorAllocator::Detach` 用 `allocations_.erase(key)`，对未跟踪 tensor 返回 0、静默 no-op——可能掩盖 double-Detach 或 Detach 非 allocator tensor 的误用。所有权转移是 double-free 高危区，静默吞掉误用最危险。**所有"从跟踪/管理中移除"语义的 API（Detach/untrack/release），未命中时必须 LOG_WARN 或 debug assert，不能静默。** 正确调用方不受影响（总是操作 tracked 对象），误用时立即暴露。— 路径C MINOR-2
+
+9. **【2026-06-23 P10-B spike BLOCKER-3 + 工程化 Reviewer】头文件注释/合约必须与实现同步，改实现必改头注释**
+    `aclnn_bicubic_resize.h` 注释写"910B-only NPU bicubic resize"、"Returns ERROR_UNSUPPORTED on 310P"，但 `.cpp` 已改为跨平台（无平台守卫，永不返回 ERROR_UNSUPPORTED）。调用方若按 header 合约写 `if (Is910B()) ... else fallback`，在 310P 上会走多余 fallback；更糟的是 stale 合约是**错误信息**，误导未来 developer。根因：改了实现（去掉平台守卫）没同步改头注释。**改函数行为/平台支持/返回码语义时，头文件 doxygen 注释必须同步更新；合约漂移比没注释更危险。** Reviewer 审查时对照头声明与实现是固定检查项。— P10-B spike BLOCKER-3
+
+10. **【2026-06-23 P10-B 工程化 MAJOR-1】多资源分配函数必须用 goto-cleanup / RAII，提前 return 会泄漏已分配资源**
+    `PreprocessImageNpu` 分配 5 个 device tensor（input/resized/normalize_tmp/mean_bc/inv_std_bc）+ workspace，每步失败都 `return`——中间任一步失败，前面已分配的 tensor 全泄漏（device memory 不像 host 有 RAII 自动回收）。Reviewer 列出 8 条泄漏路径。**分配多个资源的函数，统一用 goto-cleanup 模式（或 RAII wrapper）：所有资源前置声明为空，错误路径 goto cleanup，cleanup 段逆序释放非空资源；正常路径也走 cleanup 或显式释放。** 判据：函数内 alloc >1 个 device/host 资源 + 有多个失败点 = 必须统一 cleanup。这是 C 资源管理的通则，device memory 更甚（泄漏不 crash 但耗尽 HBM）。— P10-B 工程化 MAJOR-1
 
 ---
 
