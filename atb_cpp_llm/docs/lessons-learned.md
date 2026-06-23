@@ -188,7 +188,7 @@
 
 ## 主题 8：代码设计
 
-**触发关键词**：config 字段、debug dump、DEPRECATED、wrapper、死代码、返回值
+**触发关键词**：config 字段、debug dump、DEPRECATED、wrapper、死代码、返回值、接口契约、host/device 指针、裸指针契约、数据位置绑死、张量抽象、D2H/H2D 往返
 
 1. **每个 config 字段必须有消费代码**
    新增字段问"谁读它？怎么验证它确实被读了？"用 `grep -rn "\.field_name"` 验证写→读链路。— `refactor §4.2`
@@ -204,6 +204,15 @@
 
 5. **返回值必须检查**
    16 处 `CopyToDevice`/`CopyToHost` 返回值未检查 → 静默失败。统一 `Status s = ...; if (s != STATUS_OK) { LOG_ERROR; return s; }`。— `arch G2`
+
+6. **【2026-06-23 P10-B】接口契约不要用裸 host 指针绑死数据位置，跨 host/device 流水会被迫往返搬运**
+   `PreprocessedImage.pixel_values` 用 `const void*`（CPU 指针）作为预处理结果的交付契约，是引擎公共接口（`InferRequest.preprocessed`），贯穿 `PreprocessImageNpu`→`ForwardWithTiming`→`RunVision` 整条链。后果：NPU preprocess 在 device 上算完 `transpose_out`，却因契约要求交付 CPU 指针被迫 D2H（~15MB），`RunVision` 拿到 CPU 指针又 H2D（~15MB）回 NPU 喂 PatchEmbed——数据已在 NPU 上却绕一圈 CPU，~30MB 往返纯浪费。改 device tensor 输出要动 6 处（结构 + 两实现 + Forward 传参 + RunVision 签名 + benchmark 对比路径 + 所有权），因为"数据在 host"这个实现细节被契约扩散到了链上每个环节。
+
+   **根因**：用裸指针做张量契约，把"数据当前在哪一侧（host/device）"这个本该运行时决定的事，写死进了类型签名。
+
+   **避免模式**：用 host/device 双栖的张量视图做契约（轻量描述符，同时记 `device_ptr`(可空)/`host_ptr`(可空)/shape/dtype + "数据当前在哪侧"状态）。生产方填自己产出的那侧，消费方按需取，需对侧才搬运。类似 PyTorch `Tensor` 可 `.cuda()/.cpu()` 或 ACL `aclTensor` 带 deviceData。
+
+   **何时引入（不要过早）**：等真正出现"数据已在 device 却被迫搬回 host 再搬回 device"的可测收益触发点再做。P10-B 当前收益仅几 ms（搬运非瓶颈，bicubic compute 是主体），且 `PreprocessedImage` 是已稳定的对外公共接口（`PREPROCESSED` 模式对外暴露），改它有破坏性。记为长期方向，等 NPU preprocess 接入主路径后若大图卡搬运再引入。**别为一个还没上线路径的搬运优化，提前做跨 6 处的公共契约改造。** — P10-B device tensor 输出评估
 
 ---
 
