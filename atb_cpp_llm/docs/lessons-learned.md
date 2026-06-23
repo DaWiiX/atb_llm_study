@@ -105,7 +105,7 @@
 
 ## 主题 5：构建与 CMake
 
-**触发关键词**：CMake、set_tests_properties、RESOURCE_LOCK、OOM、warning、-Wno、SYSTEM include、codemod、import
+**触发关键词**：CMake、set_tests_properties、RESOURCE_LOCK、OOM、warning、-Wno、SYSTEM include、codemod、import、PRIVATE 链接、链接传递、undefined reference、显式重链
 
 1. **CMake 顺序敏感，set_tests_properties 必须在所有 add_test 之后**
    RESOURCE_LOCK 声明引用的 target 必须已存在，放错位置 configure 报 `target not found`。— `refactor §4.13`
@@ -124,6 +124,9 @@
 
 6. **`set_atb_buffer_size` 不能跨进程复用**
    `gen_all.py` 必须用 `subprocess.call([sys.executable, script])` 而非 `import`，每个生成器独立子进程，否则第二个起 ATB 图输出全 0。— `refactor §4.12`
+
+7. **【2026-06-23 P10-B spike MAJOR-5】CMake `PRIVATE` 链接不传递到下游 target，下游直接用该库符号要显式重链**
+   `opapi` 加入 `atb_llm_engine` 的 `PRIVATE` link libraries 后，所有 `add_atb_test` 注册的测试 link `atb_llm_engine`，但 PRIVATE 不传递——测试若直接调 opapi 符号（如 spike 直接调 `aclnnUpsampleBicubic2dAA`）会 undefined reference。引擎内部用 opapi（通过 engine.so 的 NEEDED 间接加载）没问题，但下游 target 直接用就要 `target_link_libraries(test PRIVATE opapi)` 显式重链。**判据：target 直接调用某库符号 = 必须显式 link 该库，不能依赖上游 PRIVATE 传递。** PRIVATE 只保证"上游用"，不保证"下游也能用"。PUBLIC/INTERFACE 才传递。新增测试直接调 aclnn/ATB 算子时 grep 确认链接。— P10-B spike MAJOR-5（路径C阶段已移除冗余 opapi 显式链接，因 spike 改走 engine wrapper 不再直接调）
 
 ---
 
@@ -223,8 +226,8 @@
 
    **何时引入（不要过早）**：等真正出现"数据已在 device 却被迫搬回 host 再搬回 device"的可测收益触发点再做。P10-B 当前收益仅几 ms（搬运非瓶颈，bicubic compute 是主体），且 `PreprocessedImage` 是已稳定的对外公共接口（`PREPROCESSED` 模式对外暴露），改它有破坏性。记为长期方向，等 NPU preprocess 接入主路径后若大图卡搬运再引入。**别为一个还没上线路径的搬运优化，提前做跨 6 处的公共契约改造。** — P10-B device tensor 输出评估
 
-7. **【2026-06-23 路径C Reviewer】调用方加 sync 前先确认被调函数是否已 sync，避免空操作 + 误导注释**
-    `PreprocessImageNpuInternal` 末尾为 free-safety 已无条件 `runtime->Synchronize()`（释放 AsStrided/Transpose 中间 tensor 前必须等异步算子完成）。调用方 `ForwardWithTiming` 又加了 `if (!SkipTimingSyncs()) Synchronize()` 并注释"capture true NPU preprocess time"——实际是空操作，注释把功劳归错。根因：调用方不知道被调函数内部已 sync。**调一个 NPU 函数后再加 sync，先确认该函数是否已自带 sync（尤其有 free 中间 tensor 的函数必有 free-safety sync）；已 sync 则调用方不要再加，注释说明计时由谁保证。** 附带限制：free-safety sync 是异步瓶颈，要异步需 deferred-free intermediates。— 路径C MINOR-1
+7. **【2026-06-23 路径C MINOR-1 + spike MAJOR-3】NPU 函数的 sync 责任要明确且不重复——wrapper 内别强制 sync 破坏异步流水，调用方别重复 sync**
+    sync 语义的两个正反面陷阱：① **wrapper 内强制 sync 破坏异步流水**（spike MAJOR-3）：`NpuBicubicResize`/`NpuBicubicResizeAA` 每次 Execute 后强制 `aclrtSynchronizeStream`——spike 场景可接受,但若放进 preprocess 热路径,每次 resize 都 sync 会抵消 NPU 加速、且意外等待上游异步 work（与主题 1 第 3 条"H2D/D2H 已自带同步,额外 Synchronize 破坏异步流水"同源）。wrapper 应让调用方管 sync,或文档明确"sync 由本函数负责"。② **调用方重复 sync 是空操作 + 误导**（路径C MINOR-1）：`PreprocessImageNpuInternal` 末尾为 free-safety 已无条件 sync,调用方又加 `if (!SkipTimingSyncs()) Synchronize()` 并注释"capture true NPU time"——空操作,注释把功劳归错。**规则:NPU 函数的 sync 责任在头注释声明清楚(自带 sync / 调用方管);调用方加 sync 前确认被调函数是否已 sync(尤其有 free 中间 tensor 的函数必有 free-safety sync)。** free-safety sync 是异步瓶颈,要异步需 deferred-free intermediates。— spike MAJOR-3 + 路径C MINOR-1
 
 8. **【2026-06-23 路径C Reviewer】所有权转移 API（Detach/erase/release）对未跟踪/已转移对象必须显式告警，不能静默 no-op**
     `TensorAllocator::Detach` 用 `allocations_.erase(key)`，对未跟踪 tensor 返回 0、静默 no-op——可能掩盖 double-Detach 或 Detach 非 allocator tensor 的误用。所有权转移是 double-free 高危区，静默吞掉误用最危险。**所有"从跟踪/管理中移除"语义的 API（Detach/untrack/release），未命中时必须 LOG_WARN 或 debug assert，不能静默。** 正确调用方不受影响（总是操作 tracked 对象），误用时立即暴露。— 路径C MINOR-2
