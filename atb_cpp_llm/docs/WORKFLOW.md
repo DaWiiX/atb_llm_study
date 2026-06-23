@@ -73,6 +73,7 @@
 - Developer 和 Reviewer **必须用不同 agent 实例**（上下文隔离、视角独立）。
 - Reviewer 的 prompt 明确要求"辩证性地挑毛病"，而非"验证正确性"。
 - 每轮审查后，**architect 只负责汇总发现并派发下一轮**，不参与具体修复。
+- **【审查发现归档纪律】Reviewer 探查出的每个 BLOCKER/MAJOR（及有泛化价值的 MINOR）必须归并进 [lessons-learned.md](./lessons-learned.md) 对应主题**——这些是开发中真实遇到的困难/陷阱，不归档就会复发。architect 在 Re-review 闭环、提交前完成归档：同主题已有更强条目则合并/替换，没有则新增。归档触发关键词补进主题的"触发关键词"行。仅当 Reviewer 发现是"针对本次代码的个案、无泛化规律"时可不归档（如某变量名拼写），但边界/所有权/精度/内存类发现一律归档。
 
 ---
 

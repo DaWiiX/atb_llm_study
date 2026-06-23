@@ -138,7 +138,7 @@
 
 ## 主题 7：工作流与流程
 
-**触发关键词**：bug 报告、复现、基线、Developer/Reviewer、已知问题、猜测、配置漂移、知识孤岛、闸口验证、不熟悉的 API、官方文档、插桩试错、生产分辨率、工具耗时、基线直觉、平台支持矩阵、solo 开发、省 token、看起来小、派单门槛、七步前置
+**触发关键词**：bug 报告、复现、基线、Developer/Reviewer、已知问题、猜测、配置漂移、知识孤岛、闸口验证、不熟悉的 API、官方文档、插桩试错、生产分辨率、工具耗时、基线直觉、平台支持矩阵、solo 开发、省 token、看起来小、派单门槛、七步前置、审查发现归档、Reviewer 发现
 
 0. **【最高优先级，已复发两次，2026-06-22 P10-B 再犯】非平凡任务必须派单 Dev→Reviewer→Re-review，禁止 solo 写到底**
    WORKFLOW.md §3 + `dispatch-not-solo-dev` 记忆明文要求：中等及以上任务派 Developer agent 实现、Reviewer agent（独立实例）破坏者审查、Re-review 循环到零问题。**solo 开发跳过破坏者审查，建设者偏见（验证能工作而非找边界）必然让 bug 漏网**。P10-B 全程 solo：写 spike 测试 + 改 CMake + 改 wrapper + debug double-free + 改 gen 脚本，没派任何 agent。结果正是预言的——double-free、退化尺寸测试不覆盖生产场景、盲等 5 分钟慢脚本、盲信旧文档平台结论，**这些有 Reviewer 第一轮就会被挑出来**（"测试为什么没有生产分辨率？""gen 跑 5 分钟正常吗？""double-free 查官方文档了吗？"）。上一轮 Python NPU→CPU fallback 已因 solo 被用户纠错过（见 `dispatch-not-solo-dev` origin），这次是同型复发未闭环。— WORKFLOW §3 / `dispatch-not-solo-dev` 记忆
@@ -184,11 +184,14 @@
 11. **【2026-06-22 P10-B】文档里的平台/能力结论是易过期事实，使用前必须回查权威源**
     roadmap 写"aclnn 仅 910b kernel、无 310P"，当约束用了，设计了"910b 特化"定位。用户发 CANN 文档一看：310P（Atlas 推理系列）也 √ 支持，定位错了。**文档记录的"某算子支持哪些平台/数据类型/格式"是会随 CANN 版本变化的事实，使用前必须回查当前 CANN 版本的官方文档或实测**，不能当不变约束。这把 7.3"搜已知问题"的义务反过来：文档里的能力结论本身也可能是错的，需要核实而非照搬。
 
+12. **【元规则，2026-06-23】Reviewer 探查出的每个 BLOCKER/MAJOR（及有泛化价值的 MINOR）必须归档进本文件对应主题**
+    Reviewer 破坏者审查发现的 bug/陷阱是开发中真实遇到的困难，不归档就会同型复发。architect 在 Re-review 闭环、提交前完成归档：同主题已有更强条目则合并/替换，没有则新增，并补触发关键词。判据：边界/所有权/精度/内存/并发/平台类发现一律归档；纯个案（如某变量名拼写）可不归档。流程定义见 [WORKFLOW.md](./WORKFLOW.md) §3.3「审查发现归档纪律」。本条是元规则——它管"其他教训怎么进来"，不是某个具体坑。
+
 ---
 
 ## 主题 8：代码设计
 
-**触发关键词**：config 字段、debug dump、DEPRECATED、wrapper、死代码、返回值、接口契约、host/device 指针、裸指针契约、数据位置绑死、张量抽象、D2H/H2D 往返
+**触发关键词**：config 字段、debug dump、DEPRECATED、wrapper、死代码、返回值、接口契约、host/device 指针、裸指针契约、数据位置绑死、张量抽象、D2H/H2D 往返、调用方 sync、free-safety sync、所有权转移、Detach 静默、double-free
 
 1. **每个 config 字段必须有消费代码**
    新增字段问"谁读它？怎么验证它确实被读了？"用 `grep -rn "\.field_name"` 验证写→读链路。— `refactor §4.2`
@@ -213,6 +216,12 @@
    **避免模式**：用 host/device 双栖的张量视图做契约（轻量描述符，同时记 `device_ptr`(可空)/`host_ptr`(可空)/shape/dtype + "数据当前在哪侧"状态）。生产方填自己产出的那侧，消费方按需取，需对侧才搬运。类似 PyTorch `Tensor` 可 `.cuda()/.cpu()` 或 ACL `aclTensor` 带 deviceData。
 
    **何时引入（不要过早）**：等真正出现"数据已在 device 却被迫搬回 host 再搬回 device"的可测收益触发点再做。P10-B 当前收益仅几 ms（搬运非瓶颈，bicubic compute 是主体），且 `PreprocessedImage` 是已稳定的对外公共接口（`PREPROCESSED` 模式对外暴露），改它有破坏性。记为长期方向，等 NPU preprocess 接入主路径后若大图卡搬运再引入。**别为一个还没上线路径的搬运优化，提前做跨 6 处的公共契约改造。** — P10-B device tensor 输出评估
+
+7. **【2026-06-23 路径C Reviewer】调用方加 sync 前先确认被调函数是否已 sync，避免空操作 + 误导注释**
+    `PreprocessImageNpuInternal` 末尾为 free-safety 已无条件 `runtime->Synchronize()`（释放 AsStrided/Transpose 中间 tensor 前必须等异步算子完成）。调用方 `ForwardWithTiming` 又加了 `if (!SkipTimingSyncs()) Synchronize()` 并注释"capture true NPU preprocess time"——实际是空操作，注释把功劳归错。根因：调用方不知道被调函数内部已 sync。**调一个 NPU 函数后再加 sync，先确认该函数是否已自带 sync（尤其有 free 中间 tensor 的函数必有 free-safety sync）；已 sync 则调用方不要再加，注释说明计时由谁保证。** 附带限制：free-safety sync 是异步瓶颈，要异步需 deferred-free intermediates。— 路径C MINOR-1
+
+8. **【2026-06-23 路径C Reviewer】所有权转移 API（Detach/erase/release）对未跟踪/已转移对象必须显式告警，不能静默 no-op**
+    `TensorAllocator::Detach` 用 `allocations_.erase(key)`，对未跟踪 tensor 返回 0、静默 no-op——可能掩盖 double-Detach 或 Detach 非 allocator tensor 的误用。所有权转移是 double-free 高危区，静默吞掉误用最危险。**所有"从跟踪/管理中移除"语义的 API（Detach/untrack/release），未命中时必须 LOG_WARN 或 debug assert，不能静默。** 正确调用方不受影响（总是操作 tracked 对象），误用时立即暴露。— 路径C MINOR-2
 
 ---
 
