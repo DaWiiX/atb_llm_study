@@ -63,7 +63,9 @@
 
 **关键发现**：①非 AA（`aclnnUpsampleBicubic2d`，torch a=-0.75 Mitchell 无 antialias）在降采样（1080/1440→832）时严重偏离 PIL，闸口失败；②**AA 版本（`aclnnUpsampleBicubic2dAA`，含抗混叠预滤波）rescues P10-B**，降采样从 0.958 拉回 0.999996。③**AA 仅支持 910B**（CANN 商用版产品表：Atlas 推理系列=310P 为 ×，`@domain aclnn_ops_train`），310P 上 AA 不可用。**P10-B 双路径**：910B → `NpuBicubicResizeAA`（4/4 全部 ≥0.99998）；310P → 非 AA（2/4 通过）+ 降采样 case 降级 P10-A CPU 兜底。
 
-修复 wrapper：非 AA + AA 两版均使用 `ACL_FORMAT_ND` + 显式 strides（官方模式）、Execute 后 `aclrtSynchronizeStream`、**不**手动 `aclDestroyAclOpExecutor`。新增 `test_aclnn_bicubic_spike`（level2，两个 TEST_CASE：非 AA 基线 + AA 闸口）+ gen 脚本生产分辨率 case。审查过程发现并修复 4 BLOCKER（gen 参数错误→闸口翻转 / REFDATA 未登记假阳性 / header 合约不一致 / 死代码）、5 MAJOR（含 sync 热路径声明）、4 MINOR。过程教训 5+1 项（含 solo 开发复发）归并进 `lessons-learned.md` 主题 7 第 0/7–11 条。下一步 P10-B 工程化（实现 `PreprocessImageNpu` + dispatch 双路径 + 性能实测）待启动。
+修复 wrapper：非 AA + AA 两版均使用 `ACL_FORMAT_ND` + 显式 strides（官方模式）、Execute 后 `aclrtSynchronizeStream`、**不**手动 `aclDestroyAclOpExecutor`。新增 `test_aclnn_bicubic_spike`（level2，4 个 TEST_CASE：非 AA 基线 + AA 闸口 + 全管线精度 + 性能实测）+ gen 脚本生产分辨率 case。审查过程发现并修复 4 BLOCKER（gen 参数错误→闸口翻转 / REFDATA 未登记假阳性 / header 合约不一致 / 死代码）、5 MAJOR（含 sync 热路径声明）、4 MINOR。过程教训 5+1 项（含 solo 开发复发）归并进 `lessons-learned.md` 主题 7 第 0/7–11 条。
+
+**P10-B 工程化完成**：`PreprocessImageNpu` 6 步 NPU 管线（SmartResize→H2D→AA/非AA Bicubic→3×Elewise normalize broadcast→D2H→CPU patch），goto-cleanup 内存安全，AA 降采样条件守卫（恒等/上采样走非 AA，避免 AA 平滑破坏精度）。全管线精度测试 cos≥0.999（非降采样/非 AA 路径）。**性能实测 NPU vs P10-A CPU geomean 1.4×**（416×672 1.7× / 720×1280 1.9× / 1080×1920 1.4× / 1440×2560 0.9×）。**P10-B 后续优化待办**（详见 roadmap）：#2 跳过恒等 resize（简单先做）+ #1 Patch extraction NPU 化（消除 D2H 搬运，1440 退化根因；约束：ATB Transpose 限 8 维，patch 9 维 permute 需 squeeze grid_t/tp 分解）。
 
 ---
 

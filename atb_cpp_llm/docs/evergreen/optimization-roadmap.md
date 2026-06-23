@@ -326,10 +326,16 @@
 
 **三阶段计划**：
 - **P10-A（CPU PIL 式重写，零移植风险，确定收益）** ✅：移植 Resample.c 三大手法到 `qwen3vl_preprocess.cpp`——可分离两阶段卷积 + 系数预算表 + normalize 融合进 vertical pass 输出 + patch `f` 帧去重。实测 657→141ms@1080×1920（4.7×），x86/ARM 通用、零新库、数学等价（edge-clamp Catmull-Rom，对齐现有 test_preprocess_cpu 阈值）。**作为后续 ATB 化的 baseline。**
-- **P10-B（aclnn 官方插值，双平台，AA 910B 特化）** 🔬精度闸口已过（Developer→Reviewer→Re-review 闭环）：`aclnnUpsampleBicubic2d`（非 AA）在降采样 1080/1440→832 时 vs PIL 仅 cos=0.987/0.958 ❌，**`aclnnUpsampleBicubic2dAA`（含抗混叠预滤波）rescues P10-B**，降采样从 0.958 拉回 0.999996 ✅。AA 仅支持 910B（CANN 商用版产品表：Atlas 推理系列=310P ×）。**双路径**：910B → `NpuBicubicResizeAA`（4/4 ≥0.99998）；310P → 非 AA（2/4 通过，降采样 case P10-A CPU 兜底）。wrapper `NpuBicubicResize`/`NpuBicubicResizeAA` 已实现（`aclnn_bicubic_resize.cpp`，ND+strides、不手动 destroy executor、Execute 后 sync）。**工程化待做**：实现 `PreprocessImageNpu`（Cast uint8→fp16 H2D → NpuBicubicResizeAA/Resize → normalize elewise → patch extract，全程 NPU）+ dispatch 双路径 + 4 分辨率性能实测 vs P10-A baseline（141ms@1080×1920）。
+- **P10-B（aclnn 官方插值，双平台，AA 910B 特化）** ✅ 精度闸口+工程化+性能实测完成（Developer→Reviewer→Re-review 闭环，多轮）：`aclnnUpsampleBicubic2d`（非 AA）在降采样 1080/1440→832 时 vs PIL 仅 cos=0.987/0.958 ❌，**`aclnnUpsampleBicubic2dAA`（含抗混叠预滤波）rescues P10-B**，降采样从 0.958 拉回 0.999996 ✅。AA 仅支持 910B（CANN 商用版产品表：Atlas 推理系列=310P ×）。**双路径**：910B → `NpuBicubicResizeAA`（4/4 ≥0.99998）；310P → 非 AA（2/4 通过，降采样 case P10-A CPU 兜底）。`PreprocessImageNpu` 6 步管线实现（SmartResize→H2D→AA/非AA Bicubic→3×Elewise normalize→D2H→CPU patch），goto-cleanup 内存安全，AA 降采样条件守卫（恒等/上采样走非 AA）。**性能实测 NPU vs P10-A CPU geomean 1.4×**（416×672 1.7× / 720×1280 1.9× / 1080×1920 1.4× / 1440×2560 0.9×）。
+- **P10-B 后续优化（待启动，按收益/难度排序）**：
+  - **#2 跳过恒等 resize（简单，先做）**：`new_h==height && new_w==width` 时（如 416×672 SmartResize 不改尺寸）直接 skip bicubic，H2D 后立即进 normalize。省一次 aclnn 调用 + 避免 Mitchell 核在恒等下对图像的轻微平滑。预期 416×672 从 14ms 降到 <5ms。
+  - **#1 Patch extraction NPU 化（最大收益，消除 D2H 搬运）**：当前归一化 fp16 tensor D2H 回 CPU 做 patch 重排，是 1440×2560 退化 0.9× 的根因（D2H 搬 7.5MB + 引擎后续 H2D 再搬 7.5MB）。NPU 化后 pixel_values 留 device，引擎下游直接消费，消除往返搬运。
+    - **约束（已查 ATB 源码 `ascend-transformer-boost-v9.0.0`）**：ATB `TransposeOp` 的 `Dims.dimNum ∈ (0,8]`（`types.h:31 MAX_DIM=8`），`transpose_operation.cpp` 仅校验 `perm.size()==dimNum` 不校验上限，但 Tensor 本身硬限 8 维。Patch 的 Python permute 是 **9 维**（`grid_t, tp, C, merged_h, ms, ps, merged_w, ms, ps` → perm `(0,3,6,4,7,2,1,5,8)`），超 8 维限制，**无法单次 Transpose**。
+    - **分解方案**：利用单图约束 squeeze。① `grid_t=1` 可 squeeze 掉 dim0，变 8 维；② `tp` 两帧完全相同（f=0=f=1），可先做一帧再 `Concat`/`Tile` 复制，再省一维。两个简化任取其一即可降到 ≤8 维，用单次 `TransposeOp`（perm 用 `SVector<int32_t>`，`MAX_SVECTOR_SIZE=256` 足够）+ `Reshape` 完成。备选：直接调 aclnnTranspose（`aclCreateIntArray` 动态分配，理论支持 >8 维，但 ATB 层 Tensor 仍受 8 维限制，需绕过 ATB 直接 aclnn——复杂度高，不推荐）。
+    - 验收：patch 输出 cos vs CPU 路径 ≥0.999；4 分辨率性能，1440×2560 从 0.9× 拉到 >1.0×。
 - **P10-C（ATB 基础算子组合 PIL resample）**：aclnn 不可用或需更高精度对齐 PIL boundary 时的备选，用 ATB 基础算子（Elewise/Concat/Transpose/Reshape）组合出 PIL resample 计算图。跨平台。P10-B 精度已达标，P10-C 优先级降低，仅作 long-shot 储备。
 
-**验收**：cosine ≥ 0.99 vs PIL（P10-B spike 已在 4 生产分辨率达标）；4 分辨率性能实测完成（vs P10-A CPU，geomean 1.4×）：416×672 1.7×/720×1280 1.9×/1080×1920 1.4×/1440×2560 0.9×（退化根因 H2D 开销，待后续优化）。全管线精度测试 cos≥0.999（非降采样/非 AA 路径）。
+**验收**：cosine ≥ 0.99 vs PIL（P10-B spike 已在 4 生产分辨率达标）；4 分辨率性能实测完成（vs P10-A CPU，geomean 1.4×）：416×672 1.7×/720×1280 1.9×/1080×1920 1.4×/1440×2560 0.9×（退化根因 H2D 开销，待 P10-B 后续 #1 优化）。全管线精度测试 cos≥0.999（非降采样/非 AA 路径）。
 
 ---
 
