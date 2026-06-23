@@ -330,9 +330,10 @@
 - **P10-B 后续优化（待启动，按收益/难度排序）**：
   - **#2 跳过恒等 resize（已证伪，放弃）**：原假设 `new_h==height && new_w==width` 时跳过 bicubic 可省 aclnn 调用 + 避免 Mitchell 核恒等平滑。**A/B 实测证伪**：bicubic 核（Mitchell/Catmull-Rom）满足 `W(0)=1, W(±1)=0, W(±2)=0`，恒等尺度下源采样映射为整数、核退化为单位冲激，`aclnnUpsampleBicubic2d` 精确返回输入（cos/max_diff 字节相同），无平滑可避免；省的 ~0.1ms aclnn 调用被噪声淹没。**根因**：假设 bicubic 核在恒等下会平滑图像是错的。聚焦 #1。
   - **#1 Patch extraction NPU 化（最大收益，消除 D2H 搬运）**：当前归一化 fp16 tensor D2H 回 CPU 做 patch 重排，是 1440×2560 退化 0.9× 的根因（D2H 搬 7.5MB + 引擎后续 H2D 再搬 7.5MB）。NPU 化后 pixel_values 留 device，引擎下游直接消费，消除往返搬运。
-    - **约束（已查 ATB 源码 `ascend-transformer-boost-v9.0.0`）**：ATB `TransposeOp` 的 `Dims.dimNum ∈ (0,8]`（`types.h:31 MAX_DIM=8`），`transpose_operation.cpp` 仅校验 `perm.size()==dimNum` 不校验上限，但 Tensor 本身硬限 8 维。Patch 的 Python permute 是 **9 维**（`grid_t, tp, C, merged_h, ms, ps, merged_w, ms, ps` → perm `(0,3,6,4,7,2,1,5,8)`），超 8 维限制，**无法单次 Transpose**。
-    - **分解方案**：利用单图约束 squeeze。① `grid_t=1` 可 squeeze 掉 dim0，变 8 维；② `tp` 两帧完全相同（f=0=f=1），可先做一帧再 `Concat`/`Tile` 复制，再省一维。两个简化任取其一即可降到 ≤8 维，用单次 `TransposeOp`（perm 用 `SVector<int32_t>`，`MAX_SVECTOR_SIZE=256` 足够）+ `Reshape` 完成。备选：直接调 aclnnTranspose（`aclCreateIntArray` 动态分配，理论支持 >8 维，但 ATB 层 Tensor 仍受 8 维限制，需绕过 ATB 直接 aclnn——复杂度高，不推荐）。
-    - 验收：patch 输出 cos vs CPU 路径 ≥0.999；4 分辨率性能，1440×2560 从 0.9× 拉到 >1.0×。
+    - **闸口全过（2026-06-23 spike）**：① ATB `TransposeOp` 7 维 permute `[1,4,2,5,0,3,6]` bit-exact；② **8 维 perm `[2,5,3,6,1,0,4,7]`（含 tp 维）bit-exact**，Python 交叉验证等价 9 维 `.permute(0,3,6,4,7,2,1,5,8)`；③ **`AsStridedParam` stride=0 广播 tp 帧确认可用**（`infer_op_params.h:133`，`atb::CreateOperation` 模板创建）；④ 完整 patch 管线 `[C,new_h,new_w] → AsStrided(stride=0 tp) → 8维 Transpose → Reshape` vs CPU **bit-exact（cos=1.0）**，64 assertions PASS。`test_patch_transpose_spike.cpp`。
+    - **NPU 方案确立**：AsStrided(stride=0 广播 tp) + Transpose(8 维 perm `[2,5,3,6,1,0,4,7]`) + Reshape，全程 device 内、零 D2H。
+    - **约束（已查 ATB 源码 `ascend-transformer-boost-v9.0.0`）**：ATB `TransposeOp` 的 `Dims.dimNum ∈ (0,8]`（`types.h:31 MAX_DIM=8`）。Patch 9 维 permute squeeze grid_t=1 后 8 维（含 tp）正好 ≤8 限制。
+    - 验收：patch 输出 cos vs CPU 路径 ≥0.999（spike 已 bit-exact）；4 分辨率性能，1440×2560 从 0.9× 拉到 >1.0×。
 - **P10-C（ATB 基础算子组合 PIL resample）**：aclnn 不可用或需更高精度对齐 PIL boundary 时的备选，用 ATB 基础算子（Elewise/Concat/Transpose/Reshape）组合出 PIL resample 计算图。跨平台。P10-B 精度已达标，P10-C 优先级降低，仅作 long-shot 储备。
 
 **验收**：cosine ≥ 0.99 vs PIL（P10-B spike 已在 4 生产分辨率达标）；4 分辨率性能实测完成（vs P10-A CPU，geomean 1.4×）：416×672 1.7×/720×1280 1.9×/1080×1920 1.4×/1440×2560 0.9×（退化根因 H2D 开销，待 P10-B 后续 #1 优化）。全管线精度测试 cos≥0.999（非降采样/非 AA 路径）。
