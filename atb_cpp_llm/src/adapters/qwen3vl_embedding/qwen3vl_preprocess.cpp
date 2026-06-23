@@ -301,17 +301,23 @@ Status PreprocessImage(const uint8_t* image,
     return STATUS_OK;
 }
 
-Status PreprocessImageNpu(IRuntime* runtime,
-                          const uint8_t* image,
-                          int32_t channels, int32_t height, int32_t width,
-                          const Qwen3VLConfig& config,
-                          uint16_t* pixel_values,
-                          int64_t& num_patches,
-                          int64_t* grid_thw) {
-    if (runtime == nullptr || image == nullptr || pixel_values == nullptr || grid_thw == nullptr) {
-        LOG_ERROR("PreprocessImageNpu: null parameter (runtime=%p, image=%p, pixel_values=%p, grid_thw=%p)",
+// ── Internal: NPU preprocess steps 1-5 (SmartResize → H2D → bicubic →
+// normalize → AsStrided+Transpose). Shared by both PreprocessImageNpu
+// overloads (DRY). Leaves the device-resident patch output in @p transpose_out
+// (allocator-tracked; caller owns — must Free or Detach). All intermediates
+// are freed here; on error transpose_out is freed too. No D2H: the device
+// tensor stays on NPU so path C can feed the vision pipeline directly.
+static Status PreprocessImageNpuInternal(IRuntime* runtime,
+                                         const uint8_t* image,
+                                         int32_t channels, int32_t height, int32_t width,
+                                         const Qwen3VLConfig& config,
+                                         atb::Tensor& transpose_out,
+                                         int64_t& num_patches,
+                                         int64_t* grid_thw) {
+    if (runtime == nullptr || image == nullptr || grid_thw == nullptr) {
+        LOG_ERROR("PreprocessImageNpuInternal: null parameter (runtime=%p, image=%p, grid_thw=%p)",
                   static_cast<const void*>(runtime), static_cast<const void*>(image),
-                  static_cast<const void*>(pixel_values), static_cast<const void*>(grid_thw));
+                  static_cast<const void*>(grid_thw));
         return ERROR_INVALID_PARAM;
     }
 
@@ -333,13 +339,13 @@ Status PreprocessImageNpu(IRuntime* runtime,
 
     // Value-initialize all tensor handles: deviceData starts as nullptr so
     // the cleanup block can distinguish allocated vs unallocated tensors.
+    // transpose_out is the caller-owned out-param (value-initialised by caller).
     atb::Tensor input_tensor{};
     atb::Tensor resized_tensor{};
     atb::Tensor normalize_tmp{};
     atb::Tensor mean_bc{};
     atb::Tensor inv_std_bc{};
     atb::Tensor asstrided_out{};
-    atb::Tensor transpose_out{};
 
     // --- Step 2: H2D -- uint8->fp16 conversion + copy to device ---------
     int64_t in_elems = static_cast<int64_t>(channels) * height * width;
@@ -542,7 +548,6 @@ Status PreprocessImageNpu(IRuntime* runtime,
         grid_thw[0] = grid_t;
         grid_thw[1] = grid_h;
         grid_thw[2] = grid_w;
-        int64_t patch_dim = static_cast<int64_t>(channels) * tp * patch_size * patch_size;
         num_patches = static_cast<int64_t>(grid_t) * grid_h * grid_w;
 
         // 8-D shapes (grid_t=1 squeezed; tp handled by AsStrided broadcast).
@@ -630,35 +635,25 @@ Status PreprocessImageNpu(IRuntime* runtime,
             }
         }
 
-        // ── Step 6: D2H final patch output ──
-        // transpose_out is already laid out as [num_patches, patch_dim] fp16;
-        // a single D2H delivers pixel_values directly (no CPU rearrange).  The
-        // sync ensures the async AsStrided+Transpose complete before the copy.
+        // ── Step 6: free intermediates (no D2H — path C keeps the device tensor) ──
+        // transpose_out is already laid out as [num_patches, patch_dim] fp16.
+        // The sync ensures the async AsStrided+Transpose complete before we free
+        // their inputs (normalize_tmp, asstrided_out); it also makes transpose_out
+        // valid for the caller (D2H in the CPU overload, direct feed in path C).
+        // transpose_out itself is NOT freed here — ownership transfers to the caller.
         ret = runtime->Synchronize();
         if (ret != STATUS_OK) {
-            LOG_ERROR("PreprocessImageNpu: Synchronize before D2H failed");
-            goto cleanup;
-        }
-        ret = alloc->CopyToHost(pixel_values, transpose_out,
-                                num_patches * patch_dim * sizeof(uint16_t));
-        if (ret != STATUS_OK) {
-            LOG_ERROR("PreprocessImageNpu: D2H transpose_out failed");
+            LOG_ERROR("PreprocessImageNpuInternal: Synchronize before freeing intermediates failed");
             goto cleanup;
         }
 
-        // Free patch-pipeline tensors (normalize_tmp was the AsStrided input;
-        // asstrided_out the Transpose input; transpose_out the D2H source).
+        // Free patch-pipeline intermediates (normalize_tmp was the AsStrided
+        // input; asstrided_out the Transpose input). transpose_out is returned.
         alloc->Free(normalize_tmp);
         alloc->Free(asstrided_out);
-        alloc->Free(transpose_out);
-
-        LOG_INFO("PreprocessImageNpu: %dx%d -> %dx%d, grid=(%d,%d,%d), patches=%ld, dim=%ld",
-                 height, width, new_h, new_w,
-                 grid_t, grid_h, grid_w,
-                 static_cast<long>(num_patches), static_cast<long>(patch_dim));
     }
 
-    return STATUS_OK;
+    return STATUS_OK;  // transpose_out valid, caller owns (Free or Detach)
 
 cleanup:
     // Free in reverse allocation order; Free() is idempotent (checks deviceData
@@ -672,6 +667,98 @@ cleanup:
     if (input_tensor.deviceData != nullptr)    { alloc->Free(input_tensor); }
 
     return ret;
+}
+
+// ── CPU-pointer overload: NPU preprocess + D2H into a host buffer. ──
+// Existing public contract (preprocessed pixel_values on host). The device
+// tensor from the internal helper is D2H'd here then freed.
+Status PreprocessImageNpu(IRuntime* runtime,
+                          const uint8_t* image,
+                          int32_t channels, int32_t height, int32_t width,
+                          const Qwen3VLConfig& config,
+                          uint16_t* pixel_values,
+                          int64_t& num_patches,
+                          int64_t* grid_thw) {
+    if (runtime == nullptr || image == nullptr || pixel_values == nullptr || grid_thw == nullptr) {
+        LOG_ERROR("PreprocessImageNpu: null parameter (runtime=%p, image=%p, pixel_values=%p, grid_thw=%p)",
+                  static_cast<const void*>(runtime), static_cast<const void*>(image),
+                  static_cast<const void*>(pixel_values), static_cast<const void*>(grid_thw));
+        return ERROR_INVALID_PARAM;
+    }
+
+    atb::Tensor transpose_out{};
+    Status ret = PreprocessImageNpuInternal(runtime, image, channels, height, width,
+                                            config, transpose_out, num_patches, grid_thw);
+    if (ret != STATUS_OK) return ret;
+
+    // transpose_out is allocator-tracked and already synchronised by the helper
+    // (its free-safety sync also makes the Transpose output valid for D2H), so a
+    // single D2H delivers pixel_values directly — no CPU rearrange, no extra sync.
+    auto* alloc = runtime->GetAllocator();
+    int64_t patch_dim = static_cast<int64_t>(channels) * config.pp_temporal_patch_size *
+                        config.pp_patch_size * config.pp_patch_size;
+    ret = alloc->CopyToHost(pixel_values, transpose_out,
+                            static_cast<size_t>(num_patches) * patch_dim * sizeof(uint16_t));
+    alloc->Free(transpose_out);  // tracked; free regardless of D2H result
+    if (ret != STATUS_OK) {
+        LOG_ERROR("PreprocessImageNpu: D2H transpose_out failed");
+        return ret;
+    }
+
+    int32_t patch_size = config.pp_patch_size;
+    LOG_INFO("PreprocessImageNpu: %dx%d -> %dx%d, grid=(%ld,%ld,%ld), patches=%ld, dim=%ld",
+             height, width,
+             static_cast<long>(grid_thw[1]) * patch_size, static_cast<long>(grid_thw[2]) * patch_size,
+             static_cast<long>(grid_thw[0]), static_cast<long>(grid_thw[1]),
+             static_cast<long>(grid_thw[2]),
+             static_cast<long>(num_patches), static_cast<long>(patch_dim));
+    return STATUS_OK;
+}
+
+// ── Device-tensor overload (path C): no D2H — the device tensor stays on NPU
+// and is handed to the caller (ownership transferred via Detach). The caller
+// wraps it with NpuTensor::Adopt (or aclrtFree's it) and feeds it directly to
+// the vision pipeline, eliminating the D2H (here) → H2D (ForwardWithTiming)
+// round trip of the CPU-pointer overload above. ──
+Status PreprocessImageNpu(IRuntime* runtime,
+                          const uint8_t* image,
+                          int32_t channels, int32_t height, int32_t width,
+                          const Qwen3VLConfig& config,
+                          atb::Tensor& pixel_values_npu,
+                          int64_t& num_patches,
+                          int64_t* grid_thw) {
+    if (runtime == nullptr || image == nullptr || grid_thw == nullptr) {
+        LOG_ERROR("PreprocessImageNpu(device): null parameter (runtime=%p, image=%p, grid_thw=%p)",
+                  static_cast<const void*>(runtime), static_cast<const void*>(image),
+                  static_cast<const void*>(grid_thw));
+        return ERROR_INVALID_PARAM;
+    }
+
+    Status ret = PreprocessImageNpuInternal(runtime, image, channels, height, width,
+                                            config, pixel_values_npu, num_patches, grid_thw);
+    if (ret != STATUS_OK) return ret;
+
+    // Transfer device ownership to the caller: untrack from the allocator so
+    // NpuTensor::Adopt (aclrtFree) won't clash with ~TensorAllocator/FreeAll.
+    runtime->GetAllocator()->Detach(pixel_values_npu);
+
+    // PatchEmbedGraph reads the input's desc.dims[0] to recover N (it assumes a
+    // 1-D flat input of N*patch_dim). The Transpose output is 8-D; reinterpret
+    // it as 1-D {num_patches*patch_dim} (same deviceData/dataSize, row-major).
+    int64_t patch_dim = static_cast<int64_t>(channels) * config.pp_temporal_patch_size *
+                        config.pp_patch_size * config.pp_patch_size;
+    pixel_values_npu.desc.shape.dimNum = 1;
+    pixel_values_npu.desc.shape.dims[0] = num_patches * patch_dim;
+    // dataSize already == num_patches * patch_dim * sizeof(fp16); unchanged.
+
+    int32_t patch_size = config.pp_patch_size;
+    LOG_INFO("PreprocessImageNpu(device): %dx%d -> %dx%d, grid=(%ld,%ld,%ld), patches=%ld, dim=%ld [path C, no D2H]",
+             height, width,
+             static_cast<long>(grid_thw[1]) * patch_size, static_cast<long>(grid_thw[2]) * patch_size,
+             static_cast<long>(grid_thw[0]), static_cast<long>(grid_thw[1]),
+             static_cast<long>(grid_thw[2]),
+             static_cast<long>(num_patches), static_cast<long>(patch_dim));
+    return STATUS_OK;
 }
 
 }  // namespace adapters

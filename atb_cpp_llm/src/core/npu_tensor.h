@@ -37,6 +37,17 @@ public:
     /// True if this NpuTensor owns a non-null device allocation.
     explicit operator bool() const;
 
+    /// Adopt an already-allocated device tensor. Takes ownership: the
+    /// destructor will aclrtFree @p tensor.deviceData. @p tensor is left
+    /// empty (deviceData nulled, dataSize zeroed) after the call.
+    ///
+    /// @warning @p tensor.deviceData MUST be freeable by a single aclrtFree.
+    /// The safe sources are: aclrtMalloc, NpuTensor/AllocNpu*, or a
+    /// TensorAllocator allocation that has been Detach()'d. Adopting a tensor
+    /// still tracked by TensorAllocator causes a double-free (NpuTensor's
+    /// aclrtFree here + TensorAllocator::~TensorAllocator's FreeAll).
+    static NpuTensor Adopt(atb::Tensor& tensor);
+
 private:
     atb::Tensor tensor_{};
     bool owns_ = false;

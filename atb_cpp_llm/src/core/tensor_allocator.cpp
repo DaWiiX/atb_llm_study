@@ -177,6 +177,21 @@ void TensorAllocator::Free(atb::Tensor& tensor) {
     }
 }
 
+void TensorAllocator::Detach(atb::Tensor& tensor) {
+    if (tensor.deviceData) {
+        // Remove from tracking without freeing; caller now owns the device memory.
+        // erase returns 0 when the pointer was never tracked (e.g. a tensor not
+        // allocated through this allocator). Warn rather than stay silent: a
+        // no-op Detach can mask misuse. Correct callers always Detach a tracked
+        // tensor, so this never fires on the happy path.
+        if (allocations_.erase(tensor.deviceData) == 0) {
+            LOG_WARN("Detach: tensor %p not tracked (no-op)",
+                     static_cast<void*>(tensor.deviceData));
+        }
+        // deviceData intentionally left intact for the caller to use/free.
+    }
+}
+
 void TensorAllocator::FreeAll() {
     for (auto it = allocations_.begin(); it != allocations_.end(); ++it) {
         Allocation& alloc = it->second;

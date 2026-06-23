@@ -295,24 +295,83 @@ Status Qwen3VLModel::ForwardWithTiming(const InferRequest& request,
     std::vector<NpuTensor> ds_features;
     std::vector<int64_t> image_token_positions;
     int64_t num_images = 0;
+    // Path selection: raw_image (path C, in-engine NPU preprocess) takes
+    // priority over PREPROCESSED (external CPU preprocess fed via H2D).
+    bool has_raw_image = (request.mode == InputMode::IMAGE_ONLY ||
+                          request.mode == InputMode::IMAGE_AND_TEXT) &&
+                         request.raw_image.data != nullptr;
     bool has_image = (request.mode == InputMode::IMAGE_AND_TEXT ||
                       request.mode == InputMode::PREPROCESSED) &&
                      request.preprocessed.pixel_values != nullptr;
+    if (has_raw_image && has_image) {
+        LOG_WARN("ForwardWithTiming: both raw_image and preprocessed provided; using raw_image (path C)");
+        has_image = false;
+    }
 
-    if (has_image) {
-        const uint16_t* pv = static_cast<const uint16_t*>(
-            request.preprocessed.pixel_values);
-        int64_t np = request.preprocessed.num_patches;
-        const int64_t* gthw = request.preprocessed.grid_thw;
-        if (!gthw && request.preprocessed.metadata) {
-            gthw = static_cast<const int64_t*>(request.preprocessed.metadata);
+    if (has_raw_image || has_image) {
+        // np / grid_thw_host / pixels_npu are populated per path below; the
+        // shared pos_embed + RoPE + vision model code that follows reads them.
+        int64_t np = 0;
+        const uint16_t* pv = nullptr;   // PREPROCESSED only (host pixel_values)
+        NpuTensor pixels_npu;            // vision pixels device tensor (both paths)
+
+        if (has_raw_image) {
+            // Validate raw_image dims — has_raw_image only checked data != nullptr.
+            if (request.raw_image.channels <= 0 || request.raw_image.height <= 0 ||
+                request.raw_image.width <= 0) {
+                LOG_ERROR("ForwardWithTiming: invalid raw_image dims C=%ld H=%ld W=%ld",
+                          request.raw_image.channels, request.raw_image.height,
+                          request.raw_image.width);
+                return ERROR_INVALID_PARAM;
+            }
+            // ── Path C: in-engine NPU preprocess, device tensor stays on NPU ──
+            // No D2H here / no H2D below — the device tensor feeds the vision
+            // pipeline directly, eliminating the round trip of the PREPROCESSED path.
+            auto t_prep_start = std::chrono::high_resolution_clock::now();
+            grid_thw_host.resize(3);
+            atb::Tensor pv_npu;
+            Status ps = PreprocessImageNpu(runtime_,
+                request.raw_image.data,
+                static_cast<int32_t>(request.raw_image.channels),
+                static_cast<int32_t>(request.raw_image.height),
+                static_cast<int32_t>(request.raw_image.width),
+                config_, pv_npu, np, grid_thw_host.data());
+            if (ps != STATUS_OK) {
+                LOG_ERROR("ForwardWithTiming: PreprocessImageNpu (path C) failed: %d",
+                          static_cast<int>(ps));
+                return ps;
+            }
+            num_images = 1;
+            pixels_npu = NpuTensor::Adopt(pv_npu);  // own device tensor; aclrtFree on scope exit
+            // preprocess_ms is captured directly here with no extra sync:
+            // PreprocessImageNpu (device overload) returns only after its
+            // helper's free-safety sync (PreprocessImageNpuInternal syncs
+            // unconditionally before freeing intermediates), so all NPU
+            // preprocess work is already complete and this timestamp reflects
+            // true NPU preprocess time. Limitation: ATB_SKIP_TIMING_SYNCS
+            // cannot make path C preprocess async — that free-safety sync is a
+            // hard correctness requirement (guards freeing the AsStrided/
+            // Transpose inputs); async preprocess would need deferred-free
+            // intermediates.
+            timings.preprocess_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::high_resolution_clock::now() - t_prep_start).count();
+            t_prev = std::chrono::high_resolution_clock::now();
+        } else {
+            // ── PREPROCESSED bypass: external CPU preprocess fed via H2D (unchanged) ──
+            pv = static_cast<const uint16_t*>(request.preprocessed.pixel_values);
+            np = request.preprocessed.num_patches;
+            const int64_t* gthw = request.preprocessed.grid_thw;
+            if (!gthw && request.preprocessed.metadata) {
+                gthw = static_cast<const int64_t*>(request.preprocessed.metadata);
+            }
+            if (!gthw) {
+                LOG_ERROR("ForwardWithTiming: grid_thw and metadata are both null");
+                return ERROR_INVALID_PARAM;
+            }
+            grid_thw_host.assign(gthw, gthw + 3);
+            num_images = 1;
+            timings.preprocess_ms = 0;  // external preprocess, not engine-timed
         }
-        if (!gthw) {
-            LOG_ERROR("ForwardWithTiming: grid_thw and metadata are both null");
-            return ERROR_INVALID_PARAM;
-        }
-        grid_thw_host.assign(gthw, gthw + 3);
-        num_images = 1;
 
         int64_t vis_hs = config_.vis_hidden_size;
         int32_t vis_hd = config_.vis_head_dim();
@@ -372,15 +431,20 @@ Status Qwen3VLModel::ForwardWithTiming(const InferRequest& request,
         // pos_npu, cos_npu, sin_npu were already populated above.
         size_t pixel_bytes = static_cast<size_t>(flat_elements) * sizeof(uint16_t);
 
-        NpuTensor pixels_npu = AllocNpuFloat16({flat_elements});
-        if (!pixels_npu) {
-            LOG_ERROR("ForwardWithTiming: alloc vision pixels NPU tensor failed");
-            return ERROR_NPU_MEMORY;
-        }
-        Status s = alloc->CopyToDevice(*pixels_npu.Get(), pv, pixel_bytes);
-        if (s != STATUS_OK) {
-            LOG_ERROR("ForwardWithTiming: copy vision pixels to device failed");
-            return s;
+        // PREPROCESSED bypass: upload external CPU pixel_values to NPU.
+        // (Path C already populated pixels_npu above — skip alloc + H2D.)
+        if (!has_raw_image) {
+            NpuTensor p = AllocNpuFloat16({flat_elements});
+            if (!p) {
+                LOG_ERROR("ForwardWithTiming: alloc vision pixels NPU tensor failed");
+                return ERROR_NPU_MEMORY;
+            }
+            Status s = alloc->CopyToDevice(*p.Get(), pv, pixel_bytes);
+            if (s != STATUS_OK) {
+                LOG_ERROR("ForwardWithTiming: copy vision pixels to device failed");
+                return s;
+            }
+            pixels_npu = std::move(p);
         }
 
         atb::Tensor vis_seqlen;

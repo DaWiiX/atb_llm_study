@@ -226,6 +226,7 @@ add_atb_test(test_accuracy             tests/level4_e2e/test_accuracy.cpp)
 add_atb_test(test_stage_precision      tests/level4_e2e/test_stage_precision.cpp)
 add_atb_test(test_forward_error_paths  tests/level4_e2e/test_forward_error_paths.cpp)
 add_atb_test(test_sync_safety        tests/level4_e2e/test_sync_safety.cpp)
+add_atb_test(test_path_c_raw_image   tests/level4_e2e/test_path_c_raw_image.cpp)
 add_atb_test(test_vision_stages       tests/level3_integration/test_vision_stages.cpp)
 add_atb_test(test_pos_embed_npu_graph tests/level2_op_precision/test_pos_embed_npu_graph.cpp)
 add_atb_test(test_vis_rope_npu_graph  tests/level2_op_precision/test_vis_rope_npu_graph.cpp)
@@ -361,6 +362,7 @@ set_tests_properties(
     test_stage_precision
     test_forward_error_paths
     test_sync_safety
+    test_path_c_raw_image
     test_vision_stages
     test_benchmark_modes
     PROPERTIES RESOURCE_LOCK "npu_e2e"
