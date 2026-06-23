@@ -21,6 +21,7 @@
 | [STATUS.md](./STATUS.md) | **当前状态单一真相源** —— 做完什么 / 还剩什么。查进度只看这里 |
 | [WORKFLOW.md](./WORKFLOW.md) | **工作方法论** —— architect 编排、Developer→Reviewer→Re-review 循环、审查通过标准、agent briefing 模板 |
 | [lessons-learned.md](./lessons-learned.md) | **踩坑经验集** —— 按主题组织，带触发关键词，做事前检索 |
+| [dev-dispatch-log.md](./dev-dispatch-log.md) | **派单开发历程** —— 每次 Developer/Reviewer 派单的派法 + subagent 结果，复盘传承素材 |
 
 ## evergreen/（常青参考）
 

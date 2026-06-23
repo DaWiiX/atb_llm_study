@@ -114,6 +114,33 @@
 5. **测试要求**：需要运行的具体测试命令。
 6. **上报路径**：遇到不明确的情况 → 汇报给 architect，不要自己猜测。
 
+### 5.1 派单记录纪律（开发历程归档）
+
+**每次派单（Developer / Reviewer / Re-review）都必须记录派法 + 结果**，这是开发历程和经验沉淀，不是可选项。
+
+记录位置：`docs/dev-dispatch-log.md`（根级持续更新文档，单一文件按时间倒序追加，不按批次拆文件——避免孤岛）。
+
+每条记录格式：
+```
+## YYYY-MM-DD HH:MM ｜ <批次/任务名> ｜ <Developer|Reviewer|Re-review>
+**派法**（architect 给 subagent 的 briefing 要点，不是全文）：
+- 角色 + 目标一句话
+- 工作范围（改哪些文件）
+- 关键约束/禁止事项
+- 验收标准
+**结果**（subagent 回复摘要）：
+- 做了什么（改了哪些文件、关键决策）
+- 验收数据（cos/性能/测试通过数等硬数字）
+- 发现的问题（Reviewer 的 BLOCKER/MAJOR 清单，或 Developer 遇到的坑）
+- 遗留/待定项
+```
+
+记录时机：subagent 返回后、architect 汇总时立即追加一条。Reviewer 发现的问题若需归档进 lessons-learned，按 §3.3 审查发现归档纪律同步。
+
+**为什么**：用户 2026-06-23 要求——"每次派单怎么派的、subagent 回复结果是什么，都记录下来，都是经验和开发历程"。派单 briefing 反映"我们怎么拆解问题的"，subagent 结果反映"实际遇到的困难和决策"，两者都是复盘和传承的素材。口语化的派单 prompt 不留档就丢失了思考过程。
+
+**判据**：只要用了 Agent 工具派 subagent（Developer/Reviewer/Re-review/调研），就要记一条。architect 自己 inline 做的 trivial 调查（grep/read）不用记。
+
 ---
 
 ## 6. 核心原则速查
