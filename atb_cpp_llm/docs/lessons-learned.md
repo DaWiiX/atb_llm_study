@@ -81,7 +81,7 @@
 
 ## 主题 4：测试反模式
 
-**触发关键词**：静态审查、运行时测试、测试覆盖、refdata、跳过、阈值、假阳性、参数对齐、引擎真实参数、smart_resize factor、AA 降采样、抗锯齿守卫、恒等尺度
+**触发关键词**：静态审查、运行时测试、测试覆盖、refdata、跳过、阈值、假阳性、参数对齐、引擎真实参数、smart_resize factor、AA 降采样、抗锯齿守卫、恒等尺度、参考链真伪、bit-exact probe、unbound 方法、stand-in、精度 margin、输入分布、worst-case、自然图 vs 噪声
 
 1. **静态审查 ≠ 运行时测试**
    API 行为误解、运行时竞态、性能回归、兼容性、数值精度——这五类只有实际运行才能发现。审查通过 = 静态审查零问题 + 单元测试 PASS + 复现确认问题消失。— `arch §9.4`
@@ -103,6 +103,12 @@
 
 7. **【2026-06-23 P10-B 工程化 BLOCKER-1】AA/抗锯齿算子只在降采样时有益，恒等/上采样时反而破坏精度**
    `aclnnUpsampleBicubic2dAA`（含抗混叠预滤波）在降采样时 vs PIL cos=0.99999（rescues P10-B），但在恒等尺度（416×672→416×672）下 vs CPU cos=0.950——AA 预滤器对不需缩放的图像做了不必要的平滑。**抗锯齿 resize 算子必须加降采样条件守卫**：`downsample = (new_h<height || new_w<width)`，仅降采样时用 AA，恒等/上采样用非 AA。这是 AA 算子的固有语义陷阱：AA 是为降采样防混叠设计的，对非降采样是噪声源。注意：bicubic 核本身在恒等下是单位冲激（见 #2 证伪记录），问题出在 AA 的额外预滤步骤。— P10-B 工程化 BLOCKER-1
+
+8. **【2026-06-24 max_pixels 对齐官方】参考链"看起来对"≠"等于官方"，必须用真实官方类做 bit-exact probe**
+   `gen_official_pixel_values.py` 最初用 `do_resize=True` + processor config 的 1310720（torchvision BICUBIC AA 链），cos 0.9999 过 gate——但这是"processor-config 链"非"官方 Qwen3VLEmbedder 链"，对降采样分辨率 grid 都不一样（4888 vs 6944 patches），虚假宣称 official。Reviewer 用真实 `Qwen3VLEmbedder` 的 unbound 方法（`format_model_input` + `_preprocess_inputs`）+ stand-in（只带必要属性、不加载 2B 权重）对同一输入产出 pixel_values，与参考 bin 对比——**4 分辨率 max_diff=0.0 bit-exact**，才把"看起来对"升级为"证明等于官方"。**可复用范式**：重实现参考链后，用真实官方类的 unbound 方法 + stand-in 做 bit-exact probe，比 cos 阈值更硬。cos 阈值只能证"接近"，bit-exact 才证"等同"。— max_pixels 对齐 Reviewer
+
+9. **【2026-06-24 max_pixels 对齐官方】精度 margin 依赖输入分布，估算勿混用自然图与 worst-case**
+   同一管线（NPU fp16 + bicubic-AA vs 官方 fp32）在自然图 cos≈0.99999，但在 worst-case 随机噪声输入 cos=0.999878（margin 减半）。计划用自然图估的 0.99999 当预期，实测噪声图 0.999878 看着像回归其实不是。**精度闸口的预期值和验收输入必须明确**：用代表性分布还是 worst-case？勿在估算里混用以免误判回归。降采样 bicubic 对高频噪声最敏感，是天然 worst-case。— max_pixels 对齐 Reviewer
 
 ---
 
@@ -150,7 +156,7 @@
 
 ## 主题 7：工作流与流程
 
-**触发关键词**：bug 报告、复现、基线、Developer/Reviewer、已知问题、猜测、配置漂移、知识孤岛、闸口验证、不熟悉的 API、官方文档、插桩试错、生产分辨率、工具耗时、基线直觉、平台支持矩阵、solo 开发、省 token、看起来小、派单门槛、七步前置、审查发现归档、Reviewer 发现
+**触发关键词**：bug 报告、复现、基线、Developer/Reviewer、已知问题、猜测、配置漂移、知识孤岛、闸口验证、不熟悉的 API、官方文档、插桩试错、生产分辨率、工具耗时、基线直觉、平台支持矩阵、solo 开发、省 token、看起来小、派单门槛、七步前置、审查发现归档、Reviewer 发现、对标官方、官方推理运行时、config 默认值 vs embedder 常量、max_pixels 分裂、覆盖守卫、footgun
 
 0. **【最高优先级，已复发两次，2026-06-22 P10-B 再犯】非平凡任务必须派单 Dev→Reviewer→Re-review，禁止 solo 写到底**
    WORKFLOW.md §3 + `dispatch-not-solo-dev` 记忆明文要求：中等及以上任务派 Developer agent 实现、Reviewer agent（独立实例）破坏者审查、Re-review 循环到零问题。**solo 开发跳过破坏者审查，建设者偏见（验证能工作而非找边界）必然让 bug 漏网**。P10-B 全程 solo：写 spike 测试 + 改 CMake + 改 wrapper + debug double-free + 改 gen 脚本，没派任何 agent。结果正是预言的——double-free、退化尺寸测试不覆盖生产场景、盲等 5 分钟慢脚本、盲信旧文档平台结论，**这些有 Reviewer 第一轮就会被挑出来**（"测试为什么没有生产分辨率？""gen 跑 5 分钟正常吗？""double-free 查官方文档了吗？"）。上一轮 Python NPU→CPU fallback 已因 solo 被用户纠错过（见 `dispatch-not-solo-dev` origin），这次是同型复发未闭环。— WORKFLOW §3 / `dispatch-not-solo-dev` 记忆
@@ -198,6 +204,9 @@
 
 12. **【元规则，2026-06-23】Reviewer 探查出的每个 BLOCKER/MAJOR（及有泛化价值的 MINOR）必须归档进本文件对应主题**
     Reviewer 破坏者审查发现的 bug/陷阱是开发中真实遇到的困难，不归档就会同型复发。architect 在 Re-review 闭环、提交前完成归档：同主题已有更强条目则合并/替换，没有则新增，并补触发关键词。判据：边界/所有权/精度/内存/并发/平台类发现一律归档；纯个案（如某变量名拼写）可不归档。流程定义见 [WORKFLOW.md](./WORKFLOW.md) §3.3「审查发现归档纪律」。本条是元规则——它管"其他教训怎么进来"，不是某个具体坑。
+
+13. **【2026-06-24 max_pixels 对齐官方】"对标官方"必须对标官方推理运行时，不是 model card / config 文件的默认值**
+    官方 `Qwen3VLEmbedder` 推理时 `max_pixels=1843200`（`qwen3_vl_embedding.py:28` 硬编码注入 content dict + `do_resize=False`），但模型 `preprocessor_config.json` 写的是 `1310720`（image processor 通用默认，do_resize=False 时不参与 resize）。我们引擎读 config 的 1310720，导致降采样分辨率 grid 与官方不一致（4888 vs 6944 patches），embedding 不在同一序列空间，无法对标官方。**根因**：config 文件是 image processor 通用默认，被上层 embedder 的常量覆盖；"官方推理"看的是 embedder 运行时，不是 config。**教训**：对标官方时先查官方推理入口（`Qwen3VLEmbedder.__init__`/`process`）实际注入的参数，而非 model card / preprocessor_config 默认值——后者是通用基线，常被业务层覆盖。修复用 embedder 常量 `kQwen3VLEmbeddingMaxPixels` 覆盖 config，所见即所做（避免未来 dev 看到 config field=1310720 又"修复"回去，footgun 复发——本条是 7.6"config field 必须有消费代码"的延伸：被覆盖的 config field 要用覆盖守卫证明"故意忽略"而非"读取失败"）。— max_pixels 对齐 BLOCKER（Reviewer MAJOR-1 升级）
 
 ---
 
