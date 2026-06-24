@@ -425,6 +425,22 @@ Interpretation:
   - If text_layer FAIL but weights OK → ATB graph execution issue
 """)
 
+    # Explicit cleanup: this test instantiates an ATB engine PLUS multiple
+    # transformers Qwen3VLModel refs (one fp16 NPU ref in test_text_layer),
+    # and Python GC of those during interpreter shutdown deadlocks against
+    # the torch_npu/ATB runtime teardown — the process hangs after main()
+    # returns. Releasing engine + emptying NPU cache before returning
+    # avoids the hang. Mirrors test_pipeline_trace.py's `del ref +
+    # torch.npu.empty_cache()` pattern.
+    try:
+        engine.close()
+    except Exception:
+        pass
+    try:
+        torch.npu.empty_cache()
+    except Exception:
+        pass
+
     return 0 if all(results.values()) else 1
 
 
