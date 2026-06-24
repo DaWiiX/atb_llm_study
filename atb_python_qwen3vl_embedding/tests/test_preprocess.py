@@ -20,7 +20,7 @@ def compare_preprocess_with_tf(image: Image.Image, proc,
                                 temporal_patch_size: int = 2,
                                 merge_size: int = 2,
                                 min_pixels: int = 4096,
-                                max_pixels: int = 1310720):
+                                max_pixels: int = 1800 * 32 * 32):
     """Run ATB preprocess_image and transformers processor, compare results.
 
     Shared by test_preprocess.py and test_vision_diagnostics.py so that

@@ -62,7 +62,9 @@ Status LoadQwen3VLConfig(const std::string& model_dir, Qwen3VLConfig& config) {
         config.pp_temporal_patch_size = pp.GetInt("temporal_patch_size", 2);
         config.pp_merge_size = pp.GetInt("merge_size", 2);
         config.pp_min_pixels = pp.GetInt("min_pixels", 4096);
-        config.pp_max_pixels = pp.GetInt("max_pixels", 1310720);
+        // max_pixels intentionally NOT read here: the official Qwen3VLEmbedder
+        // fixes it at 1800*32*32 (do_resize=False), so pp_max_pixels keeps the
+        // struct default kQwen3VLEmbeddingMaxPixels regardless of config.
         config.pp_image_mean = pp.GetFloatArray("image_mean");
         config.pp_image_std = pp.GetFloatArray("image_std");
         if (config.pp_image_mean.empty()) config.pp_image_mean = {0.5f, 0.5f, 0.5f};

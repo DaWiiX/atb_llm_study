@@ -368,7 +368,7 @@ def gen_smart_resize():
 
     factor = 32  # patch_size * merge_size = 16 * 2
     min_px = 4096
-    max_px = 1310720
+    max_px = 1843200
 
     # Cases: (name, in_h, in_w)
     cases = [
@@ -577,7 +577,7 @@ def gen_bicubic_preprocess():
         # min_pixels / max_pixels from preprocessor_config.json
         out_h, out_w = smart_resize(in_h, in_w, factor=32,
                                     min_pixels=4096,
-                                    max_pixels=1310720)
+                                    max_pixels=1843200)
         img = (np.random.rand(3, in_h, in_w) * 255.0).astype(np.float32)
         name = f"prod_{in_h}x{in_w}"
         _gen_bicubic_case(name, img, out_h, out_w, pil_only=True)
@@ -597,7 +597,7 @@ def gen_bicubic_preprocess():
             temporal_patch_size=2,
             merge_size=2,
             min_pixels=4096,
-            max_pixels=1310720,
+            max_pixels=1843200,
         )
         # Python returns float32; round-trip through fp16 to match what
         # the C++ pipeline writes (which calls Fp32ToFp16 per patch).
@@ -2230,7 +2230,7 @@ def gen_config_wiring_ref():
         pp.get("temporal_patch_size", 2),
         pp.get("merge_size", 2),
         pp.get("min_pixels", 4096),
-        pp.get("max_pixels", 1310720),
+        1843200,  # embedder constant (1800*32*32), config ignored — mirrors C++
         # Derived fields (computed by Qwen3VLConfig methods)
         vis.get("hidden_size", 1024) // vis.get("num_heads", 16),  # vis_head_dim
         int(np.sqrt(vis.get("num_position_embeddings", 2304))),    # num_grid

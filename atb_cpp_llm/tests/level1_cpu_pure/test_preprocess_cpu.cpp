@@ -211,7 +211,7 @@ static bool TestSmartResizeAgainstPython() {
 
     int32_t factor = 32;
     int32_t min_px = 4096;
-    int32_t max_px = 1310720;
+    int32_t max_px = 1843200;
 
     bool all_ok = true;
     for (size_t i = 0; i < ref.cases.size(); i++) {
@@ -274,7 +274,7 @@ static bool TestSmartResizeBankers() {
 static bool TestSmartResizeBoundary() {
     LOG_INFO("\n=== Test 3: SmartResize — boundary conditions ===");
 
-    int32_t factor = 32, min_px = 4096, max_px = 1310720;
+    int32_t factor = 32, min_px = 4096, max_px = 1843200;
     int32_t nh = 0, nw = 0;
     bool all_ok = true;
 
@@ -443,7 +443,7 @@ static bool TestPreprocessImageVsPython() {
     cfg.pp_temporal_patch_size  = 2;
     cfg.pp_merge_size           = 2;
     cfg.pp_min_pixels           = 4096;
-    cfg.pp_max_pixels           = 1310720;
+    cfg.pp_max_pixels           = 1843200;
 
     bool all_ok = true;
     for (const auto& c : cases) {

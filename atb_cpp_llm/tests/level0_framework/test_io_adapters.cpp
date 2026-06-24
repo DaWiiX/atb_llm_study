@@ -502,7 +502,7 @@ TEST_CASE("Qwen3VLConfig - default values") {
     CHECK(cfg.normalize == true);
     CHECK(cfg.pp_patch_size == 16);
     CHECK(cfg.pp_min_pixels == 4096);
-    CHECK(cfg.pp_max_pixels == 1310720);
+    CHECK(cfg.pp_max_pixels == 1843200);
 }
 
 TEST_CASE("Qwen3VLConfig - derived fields") {
@@ -606,7 +606,9 @@ TEST_CASE("Qwen3VLConfig - LoadQwen3VLConfig full config") {
     CHECK(cfg.pp_temporal_patch_size == 2);
     CHECK(cfg.pp_merge_size == 2);
     CHECK(cfg.pp_min_pixels == 3136);
-    CHECK(cfg.pp_max_pixels == 1000000);
+    // max_pixels is the embedder constant (1800*32*32); the config's
+    // max_pixels=1000000 above is intentionally ignored (do_resize=False).
+    CHECK(cfg.pp_max_pixels == 1843200);
     CHECK(cfg.pp_image_mean.size() == 3);
     CHECK(cfg.pp_image_mean[0] == doctest::Approx(0.485f));
     CHECK(cfg.pp_image_std[2] == doctest::Approx(0.225f));
@@ -685,8 +687,8 @@ TEST_CASE("Qwen3VLConfig - LoadQwen3VLConfig missing config.json") {
 
 TEST_CASE("SmartResize - already aligned, within limits") {
     int32_t new_h, new_w;
-    // factor=32, 64x64 image, area=4096 within [min=4096, max=1310720]
-    atb_llm::adapters::SmartResize(64, 64, 32, 4096, 1310720, new_h, new_w);
+    // factor=32, 64x64 image, area=4096 within [min=4096, max=1843200]
+    atb_llm::adapters::SmartResize(64, 64, 32, 4096, 1843200, new_h, new_w);
     CHECK(new_h == 64);
     CHECK(new_w == 64);
 }
@@ -694,8 +696,8 @@ TEST_CASE("SmartResize - already aligned, within limits") {
 TEST_CASE("SmartResize - rounds to nearest factor") {
     int32_t new_h, new_w;
     // 100x100, factor=32: round(100/32)*32 = round(3.125)*32 = 3*32=96
-    // area = 96*96 = 9216 > min=4096 and < max=1310720
-    atb_llm::adapters::SmartResize(100, 100, 32, 4096, 1310720, new_h, new_w);
+    // area = 96*96 = 9216 > min=4096 and < max=1843200
+    atb_llm::adapters::SmartResize(100, 100, 32, 4096, 1843200, new_h, new_w);
     CHECK(new_h % 32 == 0);
     CHECK(new_w % 32 == 0);
 }
@@ -704,7 +706,7 @@ TEST_CASE("SmartResize - small image upscaled to min_pixels") {
     int32_t new_h, new_w;
     // 16x16, factor=32, min_pixels=4096
     // h_bar=32, w_bar=32, area=1024 < 4096 -> upscale
-    atb_llm::adapters::SmartResize(16, 16, 32, 4096, 1310720, new_h, new_w);
+    atb_llm::adapters::SmartResize(16, 16, 32, 4096, 1843200, new_h, new_w);
     CHECK(new_h >= 32);
     CHECK(new_w >= 32);
     CHECK(new_h % 32 == 0);
@@ -714,17 +716,17 @@ TEST_CASE("SmartResize - small image upscaled to min_pixels") {
 
 TEST_CASE("SmartResize - large image downscaled to max_pixels") {
     int32_t new_h, new_w;
-    // 2000x2000, factor=32, max_pixels=1310720
-    // h_bar=2016, w_bar=2016, area=4064256 > 1310720 -> downscale
-    atb_llm::adapters::SmartResize(2000, 2000, 32, 4096, 1310720, new_h, new_w);
+    // 2000x2000, factor=32, max_pixels=1843200
+    // h_bar=2016, w_bar=2016, area=4064256 > 1843200 -> downscale
+    atb_llm::adapters::SmartResize(2000, 2000, 32, 4096, 1843200, new_h, new_w);
     CHECK(new_h % 32 == 0);
     CHECK(new_w % 32 == 0);
-    CHECK(static_cast<int64_t>(new_h) * new_w <= 1310720);
+    CHECK(static_cast<int64_t>(new_h) * new_w <= 1843200);
 }
 
 TEST_CASE("SmartResize - non-square image") {
     int32_t new_h, new_w;
-    atb_llm::adapters::SmartResize(100, 200, 32, 4096, 1310720, new_h, new_w);
+    atb_llm::adapters::SmartResize(100, 200, 32, 4096, 1843200, new_h, new_w);
     CHECK(new_h % 32 == 0);
     CHECK(new_w % 32 == 0);
     // Aspect ratio should be roughly preserved
@@ -1006,7 +1008,7 @@ TEST_CASE("PreprocessImage - gradient image vs Python ref") {
 
     atb_llm::adapters::Qwen3VLConfig cfg;
     // Defaults: patch_size=16, temporal_patch_size=2, merge_size=2,
-    // min_pixels=4096, max_pixels=1310720. 64x64 stays 64x64.
+    // min_pixels=4096, max_pixels=1843200. 64x64 stays 64x64.
 
     int32_t new_h, new_w;
     atb_llm::adapters::SmartResize(

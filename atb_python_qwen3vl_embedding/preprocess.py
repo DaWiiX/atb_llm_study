@@ -49,7 +49,7 @@ def preprocess_image(image: torch.Tensor,
                      temporal_patch_size: int = 2,
                      merge_size: int = 2,
                      min_pixels: int = 4096,
-                     max_pixels: int = 1310720) -> tuple[torch.Tensor, torch.Tensor]:
+                     max_pixels: int = 1800 * 32 * 32) -> tuple[torch.Tensor, torch.Tensor]:
     """Preprocess a single image into Qwen3VL VisionModel input format.
 
     Defaults match Qwen3-VL-Embedding-2B:

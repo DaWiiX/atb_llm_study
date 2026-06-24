@@ -75,6 +75,7 @@ REFDATA_SENTINELS=(
     /tmp/stage_final_text_only.bin
     /tmp/posembed_npu_case_tiny_4x4.bin
     /tmp/visrope_npu_case_tiny_4x4.bin
+    /tmp/official_pv_prod_416x672.bin
 )
 
 # ── CLI arg parsing ─────────────────────────────────────────────────

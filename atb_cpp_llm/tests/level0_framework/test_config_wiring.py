@@ -89,7 +89,7 @@ def load_python_config(model_dir):
     cfg["pp_temporal_patch_size"] = pp.get("temporal_patch_size", 2)
     cfg["pp_merge_size"] = pp.get("merge_size", 2)
     cfg["pp_min_pixels"] = pp.get("min_pixels", 4096)
-    cfg["pp_max_pixels"] = pp.get("max_pixels", 1310720)
+    cfg["pp_max_pixels"] = 1843200  # embedder constant (1800*32*32), config ignored (mirrors C++)
 
     # ── Derived ──────────────────────────────────────────────
     cfg["vis_head_dim"] = cfg["vis_hidden_size"] // cfg["vis_num_heads"]

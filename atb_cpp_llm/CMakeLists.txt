@@ -369,7 +369,7 @@ set_tests_properties(
 )
 
 # ── Reference-data dependency labels ──────────────────────
-# Tests that fopen() /tmp/{cpu_,preprocess_,stage_,posembed_npu_,visrope_npu_,bicubic_}*.bin
+# Tests that fopen() /tmp/{cpu_,preprocess_,stage_,posembed_npu_,visrope_npu_,bicubic_,official_pv_}*.bin
 # files produced by tests/python_reference/gen_all.py. When those .bin
 # files are absent, every test listed below correctly returns a non-zero exit code
 # (true failure), so ctest will report them as FAIL — not PASS.
@@ -382,7 +382,7 @@ set_tests_properties(
 # noisy, expected failures that would distract from real regressions.
 #
 # Maintenance contract: when a new test reads a /tmp/*.bin file, list it
-# here. Discovered via: grep -lE '/tmp/(cpu_|preprocess_|stage_|posembed_npu_|bicubic_|visrope_npu_)' \
+# here. Discovered via: grep -lE '/tmp/(cpu_|preprocess_|stage_|posembed_npu_|bicubic_|official_pv_|visrope_npu_)' \
 #                          tests/level*/*.cpp | grep -v test_config_wiring
 set(REFDATA_DEPENDENT_TESTS
     # Level 0 framework tests

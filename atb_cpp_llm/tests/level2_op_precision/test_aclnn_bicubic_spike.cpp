@@ -75,6 +75,25 @@ struct LoadedArrayF32 {
     }
 };
 
+/// Load an official_pv .bin written by gen_official_pixel_values.py.
+/// Format: [count: int32][data: float32 * count] (flat pixel_values).
+/// Returns false on any read error; *out_count receives `count` when non-null.
+bool LoadOfficialPv(const std::string& path, std::vector<float>& out,
+                    int32_t* out_count = nullptr) {
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) return false;
+    int32_t count = 0;
+    if (fread(&count, sizeof(int32_t), 1, f) != 1) { fclose(f); return false; }
+    if (count < 0) { fclose(f); return false; }
+    out.resize(static_cast<size_t>(count));
+    if (fread(out.data(), sizeof(float), count, f) != static_cast<size_t>(count)) {
+        fclose(f); return false;
+    }
+    fclose(f);
+    if (out_count) *out_count = count;
+    return true;
+}
+
 double CosineSim(const float* a, const float* b, int64_t n) {
     if (n <= 0) return 0.0;
     double dot = 0, na = 0, nb = 0;
@@ -233,6 +252,17 @@ TEST_CASE("aclnn-bicubic-spike-AA: measure AA variant on all 4 production resolu
     // interpolation. This should match PIL's antialiased Catmull-Rom at all
     // production resolutions — not just the worst-case downsample.
 
+    // AA variant is 910B-only: CANN product matrix lists Atlas Inference
+    // Series (310P) as unsupported (aclnnStatus=561103 / op absent). On 310P
+    // the downsample path falls back to non-AA + CPU P10-A. Skip here rather
+    // than crashing the test with GetWorkspaceSize failure.
+    if (!atb_llm::Is910B()) {
+        LOG_INFO("[AA SPIKE] skipped on 310P — aclnnUpsampleBicubic2dAA "
+                 "unsupported (CANN Atlas Inference Series ×). "
+                 "Downsample path uses non-AA + P10-A CPU fallback.");
+        return;
+    }
+
     auto runtime = atb_llm::CreateRuntime(0, 1LL * 1024 * 1024 * 1024);
     REQUIRE(runtime);
 
@@ -283,7 +313,7 @@ TEST_CASE("PreprocessImageNpu vs PreprocessImage CPU full-pipeline precision") {
     cfg.pp_temporal_patch_size = 2;
     cfg.pp_merge_size = 2;
     cfg.pp_min_pixels = 4096;
-    cfg.pp_max_pixels = 1310720;
+    cfg.pp_max_pixels = 1843200;
 
     struct {
         const char* name;
@@ -382,6 +412,153 @@ TEST_CASE("PreprocessImageNpu vs PreprocessImage CPU full-pipeline precision") {
     LOG_INFO("================================================================");
 }
 
+TEST_CASE("PreprocessImageNpu vs official transformers reference") {
+    // Hard precision gate: the 910B NPU full preprocess pipeline vs the
+    // *official* Qwen3VL transformers preprocessor at all 4 production
+    // resolutions. Unlike TEST_CASE 3 above (NPU vs our own CPU pipeline),
+    // the reference here is the genuine transformers output produced by
+    // gen_official_pixel_values.py, which mirrors the official Qwen3VLEmbedder
+    // chain: Qwen3VLProcessor.from_pretrained(padding_side='right') +
+    // process_vision_info(image_patch_size=16, max_pixels=1843200) +
+    // processor(do_resize=False), mean=std=0.5. The embedder fixes max_pixels=
+    // 1800*32*32 (do_resize=False ignores preprocessor_config's 1310720); the
+    // C++ Qwen3VLConfig mirrors that constant.
+    //
+    // Input-image sharing (life line): both this test and the Python
+    // generator consume the SAME /tmp/bicubic_prod_<H>x<W>_input.bin (fixed
+    // np.random.seed(2026), written by gen_cpu_reference.py). The generator
+    // reads that bin to build the official pixel_values; this test reads it to
+    // feed PreprocessImageNpu. Byte-exact shared input makes the cosine
+    // meaningful.
+    //
+    // 310P: skipped entirely. The AA downsample path (aclnnUpsampleBicubic2dAA)
+    // is unsupported on 310P, and 310P's non-AA downsample vs the official AA
+    // reference breaks 0.99 by design — a known 310P limitation, not a gate.
+
+    if (!atb_llm::Is910B()) {
+        LOG_INFO("[OFFICIAL GATE] skipped on 310P — AA downsample path "
+                 "unavailable; non-AA vs official AA breaks 0.99 by design "
+                 "(known 310P limitation, not a gate).");
+        return;
+    }
+
+    auto runtime = atb_llm::CreateRuntime(0, 1LL * 1024 * 1024 * 1024);
+    REQUIRE(runtime);
+
+    atb_llm::adapters::Qwen3VLConfig cfg{};
+    cfg.pp_patch_size = 16;
+    cfg.pp_temporal_patch_size = 2;
+    cfg.pp_merge_size = 2;
+    cfg.pp_min_pixels = 4096;
+    cfg.pp_max_pixels = 1843200;
+    // image_mean/std default to {0.5,0.5,0.5} — matches preprocessor_config.json
+    // (the model config overrides the library's CLIP default).
+
+    struct { const char* name; int32_t h, w; } cases[] = {
+        {"prod_416x672",    416,  672},
+        {"prod_720x1280",   720,  1280},
+        {"prod_1080x1920",  1080, 1920},
+        {"prod_1440x2560",  1440, 2560},
+    };
+
+    const int32_t channels  = 3;
+    const int32_t factor    = cfg.pp_patch_size * cfg.pp_merge_size;          // 32
+    const int32_t patch_dim = channels * cfg.pp_temporal_patch_size
+                              * cfg.pp_patch_size * cfg.pp_patch_size;        // 1536
+
+    for (const auto& c : cases) {
+        // ── Read shared input image (byte-exact with the Python generator) ──
+        // /tmp/bicubic_prod_<H>x<W>_input.bin: [ndim][shape (3,H,W)][f32],
+        // values are whole 0..255 (quantized uint8 stored as f32).
+        LoadedArrayF32 in_ref;
+        std::string in_path = "/tmp/bicubic_" + std::string(c.name) + "_input.bin";
+        if (!in_ref.Load(in_path) || in_ref.shape.size() != 3 ||
+            static_cast<int32_t>(in_ref.shape[0]) != channels ||
+            static_cast<int32_t>(in_ref.shape[1]) != c.h ||
+            static_cast<int32_t>(in_ref.shape[2]) != c.w) {
+            LOG_ERROR("  [MISSING] %s: input bin missing/malformed — run "
+                      "gen_cpu_reference.py (produces bicubic_prod_*_input.bin)",
+                      c.name);
+            CHECK(false);  // fail so the needs_refdata exclusion can kick in
+            continue;
+        }
+
+        // ── Official reference ──
+        std::vector<float> official;
+        int32_t official_count = 0;
+        std::string pv_path = "/tmp/official_pv_" + std::string(c.name) + ".bin";
+        if (!LoadOfficialPv(pv_path, official, &official_count)) {
+            LOG_ERROR("  [MISSING] %s: official_pv bin missing — run "
+                      "gen_official_pixel_values.py", c.name);
+            CHECK(false);
+            continue;
+        }
+
+        // Cast shared input f32 -> uint8 (clip+round, matching the Python
+        // generator's np.clip(np.round(...)).astype(uint8)).
+        std::vector<uint8_t> image(in_ref.data.size());
+        for (size_t i = 0; i < in_ref.data.size(); i++) {
+            float v = std::round(in_ref.data[i]);
+            v = std::min(255.0f, std::max(0.0f, v));
+            image[i] = static_cast<uint8_t>(v);
+        }
+
+        // SmartResize (shared CPU step; deterministic, matches official
+        // smart_resize). Output dims + grid must match the official reference.
+        int32_t new_h, new_w;
+        atb_llm::adapters::SmartResize(c.h, c.w, factor,
+            cfg.pp_min_pixels, cfg.pp_max_pixels, new_h, new_w);
+        int64_t grid_h = new_h / cfg.pp_patch_size;
+        int64_t grid_w = new_w / cfg.pp_patch_size;
+        int64_t num_patches_exp = grid_h * grid_w;
+        int64_t total_elems = num_patches_exp * patch_dim;
+
+        // official_pv count must equal num_patches * patch_dim — confirms the
+        // grid (and thus SmartResize) matches the official reference exactly.
+        CHECK(static_cast<int64_t>(official_count) == total_elems);
+
+        // ── NPU full pipeline ──
+        std::vector<uint16_t> npu_out(total_elems);
+        int64_t num_patches_npu = 0;
+        int64_t grid_thw_npu[3] = {0, 0, 0};
+        auto s = atb_llm::adapters::PreprocessImageNpu(
+            runtime.get(), image.data(), channels, c.h, c.w, cfg,
+            npu_out.data(), num_patches_npu, grid_thw_npu);
+        REQUIRE(s == atb_llm::STATUS_OK);
+
+        CHECK(grid_thw_npu[0] == 1);
+        CHECK(grid_thw_npu[1] == grid_h);
+        CHECK(grid_thw_npu[2] == grid_w);
+        CHECK(num_patches_npu == num_patches_exp);
+
+        // Convert NPU fp16 -> f32 and cosine vs official fp32. This is the
+        // honest end-to-end comparison (includes the NPU's fp16 quantization).
+        std::vector<float> npu_f32(total_elems);
+        for (int64_t i = 0; i < total_elems; i++) {
+            npu_f32[i] = atb_llm::Fp16ToF32(npu_out[i]);
+        }
+        double cos = CosineSim(npu_f32.data(), official.data(), total_elems);
+        float  max_d = MaxAbsDiff(npu_f32.data(), official.data(), total_elems);
+
+        bool downsample = (new_h < c.h || new_w < c.w);
+        LOG_INFO("  [%s] %dx%d -> %dx%d grid=(1,%ld,%ld) patches=%ld "
+                 "cos=%.6f max_diff=%.4e%s",
+                 c.name, c.h, c.w, new_h, new_w,
+                 static_cast<long>(grid_h), static_cast<long>(grid_w),
+                 static_cast<long>(num_patches_npu), cos, max_d,
+                 downsample ? "  [NPU AA vs official BICUBIC AA]"
+                           : "  [identity]");
+
+        CHECK(cos >= 0.99);
+    }
+
+    LOG_INFO("================================================================");
+    LOG_INFO("[OFFICIAL GATE] PreprocessImageNpu vs official transformers: cos >= 0.99");
+    LOG_INFO("  reference: official Qwen3VLEmbedder chain: process_vision_info +");
+    LOG_INFO("             processor(do_resize=False), max_pixels=1843200 (embedder constant)");
+    LOG_INFO("================================================================");
+}
+
 TEST_CASE("aclnn-bicubic-spike-perf: PreprocessImageNpu vs PreprocessImage CPU latency") {
     // Measure end-to-end PreprocessImageNpu (NPU) vs PreprocessImage (CPU P10-A)
     // at 4 production resolutions.  Warmup 3 rounds, time 5 rounds, report median.
@@ -394,7 +571,7 @@ TEST_CASE("aclnn-bicubic-spike-perf: PreprocessImageNpu vs PreprocessImage CPU l
     cfg.pp_merge_size = 2;
     cfg.pp_temporal_patch_size = 2;
     cfg.pp_min_pixels = 4096;
-    cfg.pp_max_pixels = 1310720;
+    cfg.pp_max_pixels = 1843200;
     cfg.pp_image_mean = {0.5f, 0.5f, 0.5f};
     cfg.pp_image_std  = {0.5f, 0.5f, 0.5f};
 
