@@ -20,7 +20,7 @@ def compare_preprocess_with_tf(image: Image.Image, proc,
                                 temporal_patch_size: int = 2,
                                 merge_size: int = 2,
                                 min_pixels: int = 4096,
-                                max_pixels: int = 1310720):
+                                max_pixels: int = 1800 * 32 * 32):
     """Run ATB preprocess_image and transformers processor, compare results.
 
     Shared by test_preprocess.py and test_vision_diagnostics.py so that
@@ -108,9 +108,9 @@ def test_preprocess():
         print("    PASS" if result['passed'] else "    FAIL")
         all_ok &= result['passed']
 
-    return all_ok
+    assert all_ok, ("preprocess_image vs transformers Processor mismatch "
+                    "(cosine < 0.999 or grid_thw differs; see per-case output above)")
 
 
 if __name__ == "__main__":
-    ok = test_preprocess()
-    exit(0 if ok else 1)
+    test_preprocess()

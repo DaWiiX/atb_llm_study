@@ -1,6 +1,6 @@
 /**
  * Sync safety test: validates that the sync env-var controls
- * (ATB_DISABLE_PER_OP_SYNC, ATB_SKIP_TIMING_SYNCS) can be toggled
+ * (ATB_ENABLE_PER_OP_SYNC, ATB_SKIP_TIMING_SYNCS) can be toggled
  * without crashing and without producing NaN / all-zero outputs.
  *
  * This is the C++ companion to test_sync_safety.py which runs the
@@ -124,8 +124,8 @@ TEST_CASE("Per-op sync toggle: output consistency and no NaN") {
         151645              // <|im_end|>
     };
 
-    // ── Run A: with per-op sync (default) ───────────────────
-    unsetenv("ATB_DISABLE_PER_OP_SYNC");
+    // ── Run A: with per-op sync (opt-in) ───────────────────
+    setenv("ATB_ENABLE_PER_OP_SYNC", "1", 1);
     unsetenv("ATB_SKIP_TIMING_SYNCS");
     MESSAGE("Running with per-op sync ENABLED...");
     auto out_sync = RunInference(model_dir, input_ids);
@@ -133,8 +133,8 @@ TEST_CASE("Per-op sync toggle: output consistency and no NaN") {
     REQUIRE(!HasNaN(reinterpret_cast<const uint16_t*>(
         out_sync.data()), out_sync.size()));
 
-    // ── Run B: without per-op sync ──────────────────────────
-    setenv("ATB_DISABLE_PER_OP_SYNC", "1", 1);
+    // ── Run B: without per-op sync (default) ───────────────
+    unsetenv("ATB_ENABLE_PER_OP_SYNC");
     MESSAGE("Running with per-op sync DISABLED...");
     auto out_nosync = RunInference(model_dir, input_ids);
     REQUIRE(!out_nosync.empty());
@@ -161,7 +161,7 @@ TEST_CASE("Per-op sync toggle: output consistency and no NaN") {
     CHECK(norm_nosync > 0.0);
 
     // Clean up env
-    unsetenv("ATB_DISABLE_PER_OP_SYNC");
+    unsetenv("ATB_ENABLE_PER_OP_SYNC");
 }
 
 // ═════════════════════════════════════════════════════════════════════
@@ -186,7 +186,7 @@ TEST_CASE("Timing syncs toggle: output consistency") {
 
     // ── Run A: timing syncs enabled ─────────────────────────
     unsetenv("ATB_SKIP_TIMING_SYNCS");
-    unsetenv("ATB_DISABLE_PER_OP_SYNC");
+    unsetenv("ATB_ENABLE_PER_OP_SYNC");
     MESSAGE("Running with timing syncs ENABLED...");
     auto out_timing = RunInference(model_dir, input_ids);
     REQUIRE(!out_timing.empty());
@@ -230,15 +230,15 @@ TEST_CASE("Minimal sync: no per-op + no timing — still correct") {
         151645
     };
 
-    // ── Baseline: full sync ─────────────────────────────────
-    unsetenv("ATB_DISABLE_PER_OP_SYNC");
+    // ── Baseline: full sync (per-op opt-in + timing on) ────
+    setenv("ATB_ENABLE_PER_OP_SYNC", "1", 1);
     unsetenv("ATB_SKIP_TIMING_SYNCS");
     MESSAGE("Running baseline (full sync)...");
     auto baseline = RunInference(model_dir, input_ids);
     REQUIRE(!baseline.empty());
 
-    // ── Minimal sync ────────────────────────────────────────
-    setenv("ATB_DISABLE_PER_OP_SYNC", "1", 1);
+    // ── Minimal sync (per-op off by default + timing off) ──
+    unsetenv("ATB_ENABLE_PER_OP_SYNC");
     setenv("ATB_SKIP_TIMING_SYNCS", "1", 1);
     MESSAGE("Running minimal sync...");
     auto minimal = RunInference(model_dir, input_ids);
@@ -254,7 +254,7 @@ TEST_CASE("Minimal sync: no per-op + no timing — still correct") {
     CHECK(cos >= 0.999);
 
     // Clean up
-    unsetenv("ATB_DISABLE_PER_OP_SYNC");
+    unsetenv("ATB_ENABLE_PER_OP_SYNC");
     unsetenv("ATB_SKIP_TIMING_SYNCS");
 }
 
@@ -308,8 +308,8 @@ TEST_CASE("ASCEND_LAUNCH_BLOCKING: output consistency with minimal sync") {
         151645
     };
 
-    // Use minimal sync config (toughest test)
-    setenv("ATB_DISABLE_PER_OP_SYNC", "1", 1);
+    // Use minimal sync config (toughest test): per-op off (default) + timing off
+    unsetenv("ATB_ENABLE_PER_OP_SYNC");
     setenv("ATB_SKIP_TIMING_SYNCS", "1", 1);
 
     MESSAGE("Running minimal sync (per-op=off, timing=off)...");
@@ -337,6 +337,6 @@ TEST_CASE("ASCEND_LAUNCH_BLOCKING: output consistency with minimal sync") {
     }
 
     // Clean up
-    unsetenv("ATB_DISABLE_PER_OP_SYNC");
+    unsetenv("ATB_ENABLE_PER_OP_SYNC");
     unsetenv("ATB_SKIP_TIMING_SYNCS");
 }

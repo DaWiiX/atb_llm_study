@@ -17,6 +17,9 @@
  * Run: ./test_vision_stages
  */
 
+#define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+#include "doctest.h"
+
 #include "atb_llm/types.h"
 #include "atb_llm/runtime.h"
 #include "adapters/qwen3vl_embedding/qwen3vl_preprocess.h"
@@ -256,6 +259,7 @@ static bool TestL0_Preprocessing(int& passed, int& failed) {
         return true;
     } else {
         LOG_ERROR("  [FAIL] L0: Preprocessing pixel_values diverge (cos=%.6f)", cos);
+        CHECK(cos > 0.999f);
         failed++;
         return false;
     }
@@ -450,6 +454,7 @@ static bool TestL1_PatchEmbed(int& passed, int& failed,
         return true;
     } else {
         LOG_ERROR("  [FAIL] L1: Patch Embedding diverge (cos=%.6f)", cos);
+        CHECK(cos > 0.999f);
         failed++;
         return false;
     }
@@ -536,6 +541,7 @@ static bool TestL2_PositionEmbedding(int& passed, int& failed,
             passed++;
         } else {
             LOG_ERROR("  [FAIL] L2a: C++ CPU vs Python NPU pos_embed diverge (cos=%.6f)", cos);
+            CHECK(cos > 0.99f);
             failed++;
         }
     } else {
@@ -563,6 +569,7 @@ static bool TestL2_PositionEmbedding(int& passed, int& failed,
             passed++;
         } else {
             LOG_ERROR("  [FAIL] L2b: C++ CPU vs Python CPU pos_embed diverge (cos=%.6f)", cos);
+            CHECK(cos > 0.999f);
             failed++;
         }
     } else {
@@ -654,6 +661,7 @@ static bool TestL3_VisionRoPE(int& passed, int& failed) {
             passed++;
         } else {
             LOG_ERROR("  [FAIL] L3a: Vision RoPE cos diverge (cos=%.6f)", cos_sim);
+            CHECK(cos_sim > 0.99f);
             failed++;
         }
     } else {
@@ -684,6 +692,7 @@ static bool TestL3_VisionRoPE(int& passed, int& failed) {
             passed++;
         } else {
             LOG_ERROR("  [FAIL] L3b: Vision RoPE sin diverge (cos=%.6f)", cos_sim);
+            CHECK(cos_sim > 0.99f);
             failed++;
         }
     } else {
@@ -702,7 +711,7 @@ static bool TestL3_VisionRoPE(int& passed, int& failed) {
 // ═══════════════════════════════════════════════════════════════════════
 // Main
 // ═══════════════════════════════════════════════════════════════════════
-int main() {
+static int RunVisionStages() {
     if (MODEL_DIR.empty()) {
         std::fprintf(stderr,
             "QWEN3VL_EMB_MODEL_DIR is not set. "
@@ -757,4 +766,8 @@ int main() {
     }
 
     return failed > 0 ? 1 : 0;
+}
+
+TEST_CASE("Vision pipeline stage precision") {
+    CHECK(RunVisionStages() == 0);
 }

@@ -113,6 +113,15 @@ TEST_RESOURCE_GROUPS = {
 
 TEST_TIMEOUT = 600  # 10 minutes per test
 
+# Per-test timeout overrides (seconds). Tests that legitimately exceed the
+# default — e.g. test_text_diagnostics loads a full transformers Qwen3VLModel
+# to NPU fp16 in Test 5 (~590s) — get a higher ceiling here instead of being
+# killed mid-computation. Keep this list small and annotated; a runaway here
+# masks real hangs.
+TEST_TIMEOUTS = {
+    "test_text_diagnostics": 900,  # NPU fp16 model load in Test 5 ≈ 590s
+}
+
 
 def get_current_platform() -> str | None:
     """Read ASCEND_PLATFORM from the package env module.
@@ -160,12 +169,13 @@ def run_one_test(
                 running_pids[name] = proc.pid
 
         try:
-            stdout, stderr = proc.communicate(timeout=TEST_TIMEOUT)
+            timeout = TEST_TIMEOUTS.get(name, TEST_TIMEOUT)
+            stdout, stderr = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
             proc.kill()
             stdout, stderr = proc.communicate()
             elapsed = time.monotonic() - start
-            output = f"[TIMEOUT after {TEST_TIMEOUT}s]"
+            output = f"[TIMEOUT after {timeout}s]"
             if stdout:
                 output += "\n[STDOUT]\n" + stdout
             if stderr:

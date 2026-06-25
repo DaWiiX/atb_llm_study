@@ -502,7 +502,7 @@ TEST_CASE("Qwen3VLConfig - default values") {
     CHECK(cfg.normalize == true);
     CHECK(cfg.pp_patch_size == 16);
     CHECK(cfg.pp_min_pixels == 4096);
-    CHECK(cfg.pp_max_pixels == 1310720);
+    CHECK(cfg.pp_max_pixels == 1843200);
 }
 
 TEST_CASE("Qwen3VLConfig - derived fields") {
@@ -606,7 +606,9 @@ TEST_CASE("Qwen3VLConfig - LoadQwen3VLConfig full config") {
     CHECK(cfg.pp_temporal_patch_size == 2);
     CHECK(cfg.pp_merge_size == 2);
     CHECK(cfg.pp_min_pixels == 3136);
-    CHECK(cfg.pp_max_pixels == 1000000);
+    // max_pixels is the embedder constant (1800*32*32); the config's
+    // max_pixels=1000000 above is intentionally ignored (do_resize=False).
+    CHECK(cfg.pp_max_pixels == 1843200);
     CHECK(cfg.pp_image_mean.size() == 3);
     CHECK(cfg.pp_image_mean[0] == doctest::Approx(0.485f));
     CHECK(cfg.pp_image_std[2] == doctest::Approx(0.225f));
@@ -685,8 +687,8 @@ TEST_CASE("Qwen3VLConfig - LoadQwen3VLConfig missing config.json") {
 
 TEST_CASE("SmartResize - already aligned, within limits") {
     int32_t new_h, new_w;
-    // factor=32, 64x64 image, area=4096 within [min=4096, max=1310720]
-    atb_llm::adapters::SmartResize(64, 64, 32, 4096, 1310720, new_h, new_w);
+    // factor=32, 64x64 image, area=4096 within [min=4096, max=1843200]
+    atb_llm::adapters::SmartResize(64, 64, 32, 4096, 1843200, new_h, new_w);
     CHECK(new_h == 64);
     CHECK(new_w == 64);
 }
@@ -694,8 +696,8 @@ TEST_CASE("SmartResize - already aligned, within limits") {
 TEST_CASE("SmartResize - rounds to nearest factor") {
     int32_t new_h, new_w;
     // 100x100, factor=32: round(100/32)*32 = round(3.125)*32 = 3*32=96
-    // area = 96*96 = 9216 > min=4096 and < max=1310720
-    atb_llm::adapters::SmartResize(100, 100, 32, 4096, 1310720, new_h, new_w);
+    // area = 96*96 = 9216 > min=4096 and < max=1843200
+    atb_llm::adapters::SmartResize(100, 100, 32, 4096, 1843200, new_h, new_w);
     CHECK(new_h % 32 == 0);
     CHECK(new_w % 32 == 0);
 }
@@ -704,7 +706,7 @@ TEST_CASE("SmartResize - small image upscaled to min_pixels") {
     int32_t new_h, new_w;
     // 16x16, factor=32, min_pixels=4096
     // h_bar=32, w_bar=32, area=1024 < 4096 -> upscale
-    atb_llm::adapters::SmartResize(16, 16, 32, 4096, 1310720, new_h, new_w);
+    atb_llm::adapters::SmartResize(16, 16, 32, 4096, 1843200, new_h, new_w);
     CHECK(new_h >= 32);
     CHECK(new_w >= 32);
     CHECK(new_h % 32 == 0);
@@ -714,17 +716,17 @@ TEST_CASE("SmartResize - small image upscaled to min_pixels") {
 
 TEST_CASE("SmartResize - large image downscaled to max_pixels") {
     int32_t new_h, new_w;
-    // 2000x2000, factor=32, max_pixels=1310720
-    // h_bar=2016, w_bar=2016, area=4064256 > 1310720 -> downscale
-    atb_llm::adapters::SmartResize(2000, 2000, 32, 4096, 1310720, new_h, new_w);
+    // 2000x2000, factor=32, max_pixels=1843200
+    // h_bar=2016, w_bar=2016, area=4064256 > 1843200 -> downscale
+    atb_llm::adapters::SmartResize(2000, 2000, 32, 4096, 1843200, new_h, new_w);
     CHECK(new_h % 32 == 0);
     CHECK(new_w % 32 == 0);
-    CHECK(static_cast<int64_t>(new_h) * new_w <= 1310720);
+    CHECK(static_cast<int64_t>(new_h) * new_w <= 1843200);
 }
 
 TEST_CASE("SmartResize - non-square image") {
     int32_t new_h, new_w;
-    atb_llm::adapters::SmartResize(100, 200, 32, 4096, 1310720, new_h, new_w);
+    atb_llm::adapters::SmartResize(100, 200, 32, 4096, 1843200, new_h, new_w);
     CHECK(new_h % 32 == 0);
     CHECK(new_w % 32 == 0);
     // Aspect ratio should be roughly preserved
@@ -746,46 +748,33 @@ TEST_CASE("BicubicResize - identity (same size)") {
 }
 
 TEST_CASE("BicubicResize - 2x2 to 4x4 (integer upscale)") {
-    // Expected values are the output of qwen3vl_preprocess.cpp::BicubicResize
-    // itself — a Catmull-Rom cubic kernel (a = -0.5) with align_corners=False
-    // source mapping `src = (dst + 0.5) * in/out - 0.5` and EDGE-CLAMP
-    // boundary handling on the 4x4 neighbourhood.
+    // The C++ CPU BicubicResize is a fixed-point port of Pillow's 8bpc
+    // antialias BICUBIC resample (Batch A, bit-exact vs real PIL). Expected
+    // values below are the genuine PIL.Image.fromarray(u8).resize((4,4),
+    // BICUBIC) output for the {0,255,255,0} checkerboard — whole uint8 values
+    // (PIL clamps + rounds to [0,255]).
     //
-    // Reproduced in Python (NOT torch.nn.functional.interpolate — that
-    // uses a different boundary convention and yields -59.46/+314.46 here):
-    //   def cubic(x, a=-0.5):
-    //       ax = abs(x)
-    //       return ((a+2)*ax**3 - (a+3)*ax**2 + 1) if ax<=1 else
-    //              (a*ax**3 - 5*a*ax**2 + 8*a*ax - 4*a) if ax<2 else 0
-    //   # for each output pixel:
-    //   src = (out + 0.5) * in_dim / out_dim - 0.5
-    //   sum_over m,n in [-1..2]: cubic(d-m)*cubic(d-n) *
-    //                            input[clamp(s+m,0,in-1), clamp(s+n,0,in-1)]
-    //
-    // For the 2x2 checkerboard the bicubic kernel overshoots — the all-zero
-    // corners drop to -38.38 and the all-255 corners climb to 293.38. The
-    // interior sample [5] (row 1, col 1; src coord ≈0.125 in 2x2 space)
-    // resolves to 82.55.
-    //
-    // The Python reproduction lives in
-    //   tests/python_reference/gen_cpu_reference.py::_cpp_bicubic_resize
-    // and is end-to-end validated by
+    // Cross-checked against the PIL reference bin used by
     //   tests/level1_cpu_pure/test_preprocess_cpu.cpp::TestBicubicVsPython
-    //   (case "2x2_to_4x4").
+    //   (case "2x2_to_4x4", /tmp/bicubic_2x2_to_4x4_pil_output.bin):
+    //   row0 [  0,  40, 215, 255]
+    //   row1 [ 53,  84, 171, 202]
+    //   row2 [202, 171,  84,  53]
+    //   row3 [255, 215,  40,   0]
     // Checkerboard pattern
     uint8_t input[4] = {0, 255, 255, 0};
     float output[16] = {};
 
     atb_llm::adapters::BicubicResize(input, 2, 2, 1, 4, 4, output);
 
-    // Bicubic (align_corners=False) overshoots: negative at all-0 corners, >255 at all-255 corners
-    CHECK(output[0] == doctest::Approx(-38.3807f));    // top-left (was 0)
-    CHECK(output[3] == doctest::Approx(293.3807f));    // top-right (was 255)
-    CHECK(output[12] == doctest::Approx(293.3807f));   // bottom-left (was 255)
-    CHECK(output[15] == doctest::Approx(-38.3807f));   // bottom-right (was 0)
+    // PIL 8bpc BICUBIC corners (clamped to [0,255]).
+    CHECK(output[0] == doctest::Approx(0.0f));      // top-left (was 0)
+    CHECK(output[3] == doctest::Approx(255.0f));    // top-right (was 255)
+    CHECK(output[12] == doctest::Approx(255.0f));   // bottom-left (was 255)
+    CHECK(output[15] == doctest::Approx(0.0f));     // bottom-right (was 0)
 
     // Center interpolation
-    CHECK(output[5] == doctest::Approx(82.5513f));
+    CHECK(output[5] == doctest::Approx(84.0f));
 }
 
 TEST_CASE("BicubicResize - 3-channel") {
@@ -823,16 +812,13 @@ TEST_CASE("BicubicResize - 3-channel") {
 }
 
 TEST_CASE("BicubicResize - downscale 4x4 to 2x2") {
-    // Expected values are the output of qwen3vl_preprocess.cpp::BicubicResize
-    // itself — a Catmull-Rom cubic kernel (a = -0.5) with align_corners=False
-    // source mapping and edge-clamp boundary handling (NOT PyTorch's
-    // F.interpolate, which uses different boundary weights). For this
-    // linear gradient the 16-tap kernel resolves to 31.875 / 53.125 /
-    // 116.875 / 138.125 — values reproduced by
-    //   tests/python_reference/gen_cpu_reference.py::_cpp_bicubic_resize
-    // and end-to-end validated in
+    // The C++ CPU BicubicResize is the PIL 8bpc fixed-point BICUBIC resample
+    // (with antialias on downscale). Expected values are the genuine
+    // PIL.Image.fromarray(u8).resize((2,2), BICUBIC) output for the 10..160
+    // linear gradient — whole uint8 values. Cross-checked against the PIL
+    // reference bin (/tmp/bicubic_4x4_to_2x2_pil_output.bin) used by
     //   tests/level1_cpu_pure/test_preprocess_cpu.cpp::TestBicubicVsPython
-    //   (case "4x4_to_2x2").
+    //   (case "4x4_to_2x2"): [39, 57, 113, 131].
     uint8_t input[16] = {
         10, 20, 30, 40,
         50, 60, 70, 80,
@@ -842,11 +828,11 @@ TEST_CASE("BicubicResize - downscale 4x4 to 2x2") {
 
     atb_llm::adapters::BicubicResize(input, 4, 4, 1, 2, 2, output);
 
-    // Bicubic 16-neighbour interpolation (align_corners=False)
-    CHECK(output[0] == doctest::Approx(31.875f));
-    CHECK(output[1] == doctest::Approx(53.125f));
-    CHECK(output[2] == doctest::Approx(116.875f));
-    CHECK(output[3] == doctest::Approx(138.125f));
+    // PIL 8bpc antialias BICUBIC downscale.
+    CHECK(output[0] == doctest::Approx(39.0f));
+    CHECK(output[1] == doctest::Approx(57.0f));
+    CHECK(output[2] == doctest::Approx(113.0f));
+    CHECK(output[3] == doctest::Approx(131.0f));
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -1006,7 +992,7 @@ TEST_CASE("PreprocessImage - gradient image vs Python ref") {
 
     atb_llm::adapters::Qwen3VLConfig cfg;
     // Defaults: patch_size=16, temporal_patch_size=2, merge_size=2,
-    // min_pixels=4096, max_pixels=1310720. 64x64 stays 64x64.
+    // min_pixels=4096, max_pixels=1843200. 64x64 stays 64x64.
 
     int32_t new_h, new_w;
     atb_llm::adapters::SmartResize(

@@ -4,7 +4,14 @@
 #include <cstdint>
 #include <vector>
 
+namespace atb {
+struct Tensor;  // forward declaration for the device-tensor overload below
+}
+
 namespace atb_llm {
+
+class IRuntime;
+
 namespace adapters {
 
 /// Qwen3VL image preprocessor (CPU-side).
@@ -50,6 +57,59 @@ Status PreprocessImage(const uint8_t* image,
                        uint16_t* pixel_values,
                        int64_t& num_patches,
                        int64_t* grid_thw);
+
+/// Full image preprocessing on NPU (P10-B pipeline).
+///
+/// Pipeline:
+///   1. SmartResize (CPU)
+///   2. H2D: uint8→fp16 + CopyToDevice
+///   3. NpuBicubicResizeAA (910B) / NpuBicubicResize (310P) on NPU
+///   4. Normalize on NPU via 3 ATB ElewiseOps:
+///      a. MULS(1/255)        — rescale to [0,1]
+///      b. ADD(-mean broadcast per channel via (1,C,1,1)) — subtract mean
+///      c. MUL(1/std broadcast per channel via (1,C,1,1)) — divide by std
+///   5. AsStrided + 8-D Transpose patch extraction on NPU
+///   6. Compute grid_thw, num_patches
+///
+/// @param runtime       NPU runtime (provides allocator, context, stream)
+/// @param image         (C, H, W) uint8, pixel values in [0, 255]
+/// @param channels      Number of channels (typically 3)
+/// @param height        Image height
+/// @param width         Image width
+/// @param config        Qwen3VL config (preprocessor params)
+/// @param pixel_values  Output: (N, patch_dim) float16, pre-allocated
+/// @param num_patches   Output: N (number of patches)
+/// @param grid_thw      Output: (3,) [grid_t, grid_h, grid_w]
+Status PreprocessImageNpu(IRuntime* runtime,
+                          const uint8_t* image,
+                          int32_t channels, int32_t height, int32_t width,
+                          const Qwen3VLConfig& config,
+                          uint16_t* pixel_values,
+                          int64_t& num_patches,
+                          int64_t* grid_thw);
+
+/// NPU preprocess returning a device tensor (no D2H). Path C: the device
+/// tensor stays in-engine and feeds the vision pipeline directly, eliminating
+/// the D2H (here) → H2D (ForwardWithTiming) round trip of the CPU-pointer
+/// overload above.
+///
+/// Same NPU pipeline as the CPU-pointer overload, but stops after step 5
+/// (Transpose): @p pixel_values_npu receives the device-resident patch output
+/// directly. The tensor is aclrtMalloc'd and Detach()'d from the allocator, so
+/// the caller owns it — free via NpuTensor::Adopt (recommended) or aclrtFree.
+///
+/// @param pixel_values_npu  OUT: device tensor, desc reshaped to 1-D
+///                          {num_patches * patch_dim} fp16 (matches the
+///                          FirstLayer PatchEmbed input contract). Caller owns.
+/// @param num_patches       OUT: N (number of patches)
+/// @param grid_thw          OUT: (3,) [grid_t, grid_h, grid_w]
+Status PreprocessImageNpu(IRuntime* runtime,
+                          const uint8_t* image,
+                          int32_t channels, int32_t height, int32_t width,
+                          const Qwen3VLConfig& config,
+                          atb::Tensor& pixel_values_npu,
+                          int64_t& num_patches,
+                          int64_t* grid_thw);
 
 } // namespace adapters
 } // namespace atb_llm

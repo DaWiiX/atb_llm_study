@@ -103,7 +103,10 @@ class Qwen3VLEngine:
         self.patch_size = pp["patch_size"]
         self.tp = pp["temporal_patch_size"]
         self.pp_min_px = pp["min_pixels"]
-        self.pp_max_px = pp["max_pixels"]
+        # max_pixels is the fixed Qwen3VLEmbedder constant (1800*32*32),
+        # NOT read from preprocessor_config.json — mirrors the C++ struct
+        # default kQwen3VLEmbeddingMaxPixels (do_resize=False official chain).
+        self.pp_max_px = 1800 * 32 * 32
 
         # ── Cached weights (NPU-resident float16) ────────────────────
         try:

@@ -96,9 +96,9 @@ def get_env(name: str, default: Optional[str] = None,
 #: Local Qwen3-VL-Embedding-2B checkpoint directory.
 QWEN3VL_EMB_MODEL_DIR: str = get_env("QWEN3VL_EMB_MODEL_DIR", required=True)
 
-#: Path to a checked-out copy of the Qwen3-VL-Embedding reference repo
-#: (the `src/` directory). Optional — only diagnostics that compare against
-#: the reference Python impl read it. Returns None when not set.
+#: Path to a checked-out copy of the Qwen3-VL-Embedding reference repo root.
+#: Official-reference generators append `/src` before importing the official
+#: `models.*` package. Optional — only official-reference generators need it.
 QWEN3VL_EMB_SRC: Optional[str] = get_env("QWEN3VL_EMB_SRC")
 
 #: Path to a checked-out huggingface/transformers (the `src/` dir).
@@ -109,6 +109,11 @@ QWEN3VL_EMB_TRANSFORMERS_SRC: Optional[str] = get_env("QWEN3VL_EMB_TRANSFORMERS_
 #: Ascend NPU platform identifier. Valid values: "910B" (Atlas A2), "310P" (Atlas推理系列).
 #: Controls which ATB operator paths are used where platform support differs.
 ASCEND_PLATFORM: str = get_env("ASCEND_PLATFORM", default="910B")
+
+#: Resolutions for the official embedding gate (path C).
+#: Comma-separated HxW pairs. Users may add/remove via .env or shell env.
+OFFICIAL_EMBED_CASES: str = get_env("OFFICIAL_EMBED_CASES",
+                                    default="416x672,720x1280,1080x1920,1440x2560")
 
 #: Repository root, derived from this file's location. Useful for tests
 #: that need to add the repo to sys.path without hard-coding the path.

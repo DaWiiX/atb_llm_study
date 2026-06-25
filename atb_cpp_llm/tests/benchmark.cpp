@@ -525,7 +525,6 @@ int RunMultimodalBenchmark(atb_llm::LLMEngine* engine,
     // First, compute how many patches we'll get to size the output buffer
     int32_t factor = config.pp_patch_size * config.pp_temporal_patch_size;
     int32_t new_h, new_w;
-    auto pre_start = std::chrono::high_resolution_clock::now();
     atb_llm::adapters::SmartResize(img_h, img_w, factor,
                                     config.pp_min_pixels, config.pp_max_pixels,
                                     new_h, new_w);
@@ -537,18 +536,11 @@ int RunMultimodalBenchmark(atb_llm::LLMEngine* engine,
                         config.vis_temporal_patch_size *
                         config.vis_patch_size * config.vis_patch_size;
 
-    std::vector<uint16_t> pixel_values(num_patches * patch_dim);
-    int64_t actual_patches = 0;
-    int64_t grid_thw[3] = {};
-    s = atb_llm::adapters::PreprocessImage(
-        image.data(), 3, img_h, img_w, config,
-        pixel_values.data(), actual_patches, grid_thw);
-    if (s != atb_llm::STATUS_OK) {
-        LOG_ERROR("PreprocessImage failed");
-        return 1;
-    }
-    auto pre_end = std::chrono::high_resolution_clock::now();
-
+    // Engine (PreprocessImage / PreprocessImageNpu) uses grid_t=1 for single
+    // images (temporal frames fold into patch_dim, not patch count), so the
+    // actual patch count is grid_h*grid_w — not num_patches (grid_t=2, buffer
+    // sizing only). vis_tokens must match the engine.
+    int64_t actual_patches = grid_h * grid_w;
     int64_t vis_tokens = actual_patches / (config.vis_spatial_merge_size * config.vis_spatial_merge_size);
     int64_t image_token_id = config.image_token_id;
 
@@ -565,17 +557,59 @@ int RunMultimodalBenchmark(atb_llm::LLMEngine* engine,
     }
     input_ids[seq_len - 1] = 151645;
 
-    // Setup request
+    // Setup request. cmp_mode: CPU PreprocessImage + PREPROCESSED (host
+    // pixel_values for Python comparison). !cmp_mode: path C — raw_image feeds
+    // in-engine NPU preprocess (PreprocessImageNpu); the device tensor stays on
+    // NPU with no D2H→H2D round trip.
     atb_llm::InferRequest request;
-    request.mode = atb_llm::InputMode::PREPROCESSED;
     request.text.input_ids = input_ids.data();
     request.text.batch_size = 1;
     request.text.seq_length = seq_len;
-    request.preprocessed.pixel_values = pixel_values.data();
-    request.preprocessed.num_patches = actual_patches;
-    request.preprocessed.patch_dim = patch_dim;
-    request.preprocessed.grid_thw = grid_thw;
-    request.preprocessed.dtype = ACL_FLOAT16;
+
+    // pre_ms caliber:
+    //  - cmp_mode: warm single-shot of PreprocessImage only. SmartResize /
+    //    input_ids / request setup are one-time host orchestration, excluded —
+    //    matching path C where StageTimings.preprocess_ms covers only the
+    //    in-engine preprocess. A warmup call first absorbs cold first-call
+    //    overhead so the timed call is warm, matching path C's warm mean.
+    //  - path C (!cmp_mode): warm per-iter mean from StageTimings.preprocess_ms.
+    double pre_ms = 0.0;
+    std::vector<uint16_t> pixel_values;  // cmp_mode only
+    int64_t grid_thw[3] = {};
+    if (cmp_mode) {
+        // Warmup (untimed, throwaway buffer) — eliminates cold first-call cost.
+        {
+            std::vector<uint16_t> warmup_pv(num_patches * patch_dim);
+            int64_t warmup_patches = 0;
+            int64_t warmup_grid[3] = {};
+            atb_llm::adapters::PreprocessImage(
+                image.data(), 3, img_h, img_w, config,
+                warmup_pv.data(), warmup_patches, warmup_grid);
+        }
+        pixel_values.resize(num_patches * patch_dim);
+        auto pre_start = std::chrono::high_resolution_clock::now();
+        s = atb_llm::adapters::PreprocessImage(
+            image.data(), 3, img_h, img_w, config,
+            pixel_values.data(), actual_patches, grid_thw);
+        auto pre_end = std::chrono::high_resolution_clock::now();
+        if (s != atb_llm::STATUS_OK) {
+            LOG_ERROR("PreprocessImage failed");
+            return 1;
+        }
+        pre_ms = std::chrono::duration<double, std::milli>(pre_end - pre_start).count();
+        request.mode = atb_llm::InputMode::PREPROCESSED;
+        request.preprocessed.pixel_values = pixel_values.data();
+        request.preprocessed.num_patches = actual_patches;
+        request.preprocessed.patch_dim = patch_dim;
+        request.preprocessed.grid_thw = grid_thw;
+        request.preprocessed.dtype = ACL_FLOAT16;
+    } else {
+        request.mode = atb_llm::InputMode::IMAGE_AND_TEXT;
+        request.raw_image.data = image.data();
+        request.raw_image.channels = 3;
+        request.raw_image.height = img_h;
+        request.raw_image.width = img_w;
+    }
 
     char resolution[32];
     std::snprintf(resolution, sizeof(resolution), "%dx%d", img_w, img_h);
@@ -594,7 +628,11 @@ int RunMultimodalBenchmark(atb_llm::LLMEngine* engine,
     auto results = RunBenchmark(engine, request, num_warmup, num_iter, !cmp_mode,
                                 nullptr, cold);
     if (results.empty()) return 1;
-    double pre_ms = std::chrono::duration<double, std::milli>(pre_end - pre_start).count();
+    // cmp_mode pre_ms was captured during preprocess (warm single-shot, after a
+    // warmup call). Path C takes the warm per-iter mean from StageTimings.
+    if (!cmp_mode) {
+        pre_ms = MeanStage(results, [](const atb_llm::StageTimings& t) { return t.preprocess_ms; });
+    }
 
     std::vector<double> e2e_times;
     for (auto& r : results) e2e_times.push_back(r.e2e_ms);
@@ -653,7 +691,6 @@ int RunImageOnlyBenchmark(atb_llm::LLMEngine* engine,
     // Preprocess image
     int32_t factor = config.pp_patch_size * config.pp_temporal_patch_size;
     int32_t new_h, new_w;
-    auto pre_start = std::chrono::high_resolution_clock::now();
     atb_llm::adapters::SmartResize(img_h, img_w, factor,
                                     config.pp_min_pixels, config.pp_max_pixels,
                                     new_h, new_w);
@@ -665,18 +702,10 @@ int RunImageOnlyBenchmark(atb_llm::LLMEngine* engine,
                         config.vis_temporal_patch_size *
                         config.vis_patch_size * config.vis_patch_size;
 
-    std::vector<uint16_t> pixel_values(num_patches * patch_dim);
-    int64_t actual_patches = 0;
-    int64_t grid_thw[3] = {};
-    s = atb_llm::adapters::PreprocessImage(
-        image.data(), 3, img_h, img_w, config,
-        pixel_values.data(), actual_patches, grid_thw);
-    if (s != atb_llm::STATUS_OK) {
-        LOG_ERROR("PreprocessImage failed");
-        return 1;
-    }
-    auto pre_end = std::chrono::high_resolution_clock::now();
-
+    // Engine uses grid_t=1 for single images (temporal frames fold into
+    // patch_dim); actual patch count is grid_h*grid_w, not num_patches (grid_t=2,
+    // buffer sizing only). vis_tokens must match the engine.
+    int64_t actual_patches = grid_h * grid_w;
     int64_t vis_tokens = actual_patches / (config.vis_spatial_merge_size * config.vis_spatial_merge_size);
     int64_t image_token_id = config.image_token_id;
 
@@ -697,17 +726,57 @@ int RunImageOnlyBenchmark(atb_llm::LLMEngine* engine,
     }
     int64_t seq_len = static_cast<int64_t>(input_ids.size());
 
-    // Setup request
+    // Setup request. cmp_mode: CPU PreprocessImage + PREPROCESSED. !cmp_mode:
+    // path C — raw_image feeds in-engine NPU preprocess (no D2H→H2D).
     atb_llm::InferRequest request;
-    request.mode = atb_llm::InputMode::PREPROCESSED;
     request.text.input_ids = input_ids.data();
     request.text.batch_size = 1;
     request.text.seq_length = seq_len;
-    request.preprocessed.pixel_values = pixel_values.data();
-    request.preprocessed.num_patches = actual_patches;
-    request.preprocessed.patch_dim = patch_dim;
-    request.preprocessed.grid_thw = grid_thw;
-    request.preprocessed.dtype = ACL_FLOAT16;
+
+    // pre_ms caliber:
+    //  - cmp_mode: warm single-shot of PreprocessImage only. SmartResize /
+    //    LoadTokenIds / request setup are one-time host orchestration, excluded
+    //    — matching path C where StageTimings.preprocess_ms covers only the
+    //    in-engine preprocess. A warmup call first absorbs cold first-call
+    //    overhead so the timed call is warm, matching path C's warm mean.
+    //  - path C (!cmp_mode): warm per-iter mean from StageTimings.preprocess_ms.
+    double pre_ms = 0.0;
+    std::vector<uint16_t> pixel_values;  // cmp_mode only
+    int64_t grid_thw[3] = {};
+    if (cmp_mode) {
+        // Warmup (untimed, throwaway buffer) — eliminates cold first-call cost.
+        {
+            std::vector<uint16_t> warmup_pv(num_patches * patch_dim);
+            int64_t warmup_patches = 0;
+            int64_t warmup_grid[3] = {};
+            atb_llm::adapters::PreprocessImage(
+                image.data(), 3, img_h, img_w, config,
+                warmup_pv.data(), warmup_patches, warmup_grid);
+        }
+        pixel_values.resize(num_patches * patch_dim);
+        auto pre_start = std::chrono::high_resolution_clock::now();
+        s = atb_llm::adapters::PreprocessImage(
+            image.data(), 3, img_h, img_w, config,
+            pixel_values.data(), actual_patches, grid_thw);
+        auto pre_end = std::chrono::high_resolution_clock::now();
+        if (s != atb_llm::STATUS_OK) {
+            LOG_ERROR("PreprocessImage failed");
+            return 1;
+        }
+        pre_ms = std::chrono::duration<double, std::milli>(pre_end - pre_start).count();
+        request.mode = atb_llm::InputMode::PREPROCESSED;
+        request.preprocessed.pixel_values = pixel_values.data();
+        request.preprocessed.num_patches = actual_patches;
+        request.preprocessed.patch_dim = patch_dim;
+        request.preprocessed.grid_thw = grid_thw;
+        request.preprocessed.dtype = ACL_FLOAT16;
+    } else {
+        request.mode = atb_llm::InputMode::IMAGE_ONLY;
+        request.raw_image.data = image.data();
+        request.raw_image.channels = 3;
+        request.raw_image.height = img_h;
+        request.raw_image.width = img_w;
+    }
 
     char resolution[32];
     std::snprintf(resolution, sizeof(resolution), "%dx%d", img_w, img_h);
@@ -726,7 +795,11 @@ int RunImageOnlyBenchmark(atb_llm::LLMEngine* engine,
     auto results = RunBenchmark(engine, request, num_warmup, num_iter, !cmp_mode,
                                 nullptr, cold);
     if (results.empty()) return 1;
-    double pre_ms = std::chrono::duration<double, std::milli>(pre_end - pre_start).count();
+    // cmp_mode pre_ms was captured during preprocess (warm single-shot, after a
+    // warmup call). Path C takes the warm per-iter mean from StageTimings.
+    if (!cmp_mode) {
+        pre_ms = MeanStage(results, [](const atb_llm::StageTimings& t) { return t.preprocess_ms; });
+    }
 
     std::vector<double> e2e_times;
     for (auto& r : results) e2e_times.push_back(r.e2e_ms);

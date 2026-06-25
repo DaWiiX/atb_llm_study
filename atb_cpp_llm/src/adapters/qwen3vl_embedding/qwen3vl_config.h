@@ -47,11 +47,17 @@ struct Qwen3VLConfig {
     bool normalize = true;  // L2-normalize output embedding (Python default)
 
     // ── Preprocessor config ────────────────────────────────
+    // max_pixels is NOT read from preprocessor_config.json: the official
+    // Qwen3VLEmbedder fixes it at 1800*32*32 (MAX_PIXELS in
+    // qwen3_vl_embedding.py, with do_resize=False so the processor does not
+    // re-resize). The engine mirrors that constant instead of the processor's
+    // 1310720 default.
+    static constexpr int32_t kQwen3VLEmbeddingMaxPixels = 1800 * 32 * 32;
     int32_t pp_patch_size = 16;
     int32_t pp_temporal_patch_size = 2;
     int32_t pp_merge_size = 2;
     int32_t pp_min_pixels = 4096;
-    int32_t pp_max_pixels = 1310720;
+    int32_t pp_max_pixels = kQwen3VLEmbeddingMaxPixels;
     std::vector<float> pp_image_mean = {0.5f, 0.5f, 0.5f};
     std::vector<float> pp_image_std = {0.5f, 0.5f, 0.5f};
 

@@ -28,6 +28,11 @@ Status DumpNpuFp16(IRuntime* rt, const atb::Tensor& npu_tensor,
     if (!VisionDumpEnabled()) return STATUS_OK;
     if (!rt || count <= 0 || !path) return ERROR_INVALID_PARAM;
 
+    // Synchronize BEFORE the D2H copy: ATB runs on its own stream, so a
+    // synchronous aclrtMemcpy D2H does not wait for in-flight ATB work. With
+    // per-op sync off by default (H1), dumping without this sync reads stale
+    // data and misleads debugging. (Debug-only path; gated by ATB_DEBUG_VISION.)
+    rt->Synchronize();
     std::vector<uint16_t> host(count);
     Status s = rt->GetAllocator()->CopyToHost(
         host.data(), npu_tensor, count * sizeof(uint16_t));
@@ -35,7 +40,6 @@ Status DumpNpuFp16(IRuntime* rt, const atb::Tensor& npu_tensor,
         LOG_WARN("debug::DumpNpuFp16: CopyToHost failed for %s", path);
         return s;
     }
-    rt->Synchronize();
     WriteCountedBlob(path, count, host.data(), count * sizeof(uint16_t));
     return STATUS_OK;
 }

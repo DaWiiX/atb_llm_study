@@ -73,6 +73,7 @@
 - Developer 和 Reviewer **必须用不同 agent 实例**（上下文隔离、视角独立）。
 - Reviewer 的 prompt 明确要求"辩证性地挑毛病"，而非"验证正确性"。
 - 每轮审查后，**architect 只负责汇总发现并派发下一轮**，不参与具体修复。
+- **【审查发现归档纪律】Reviewer 探查出的每个 BLOCKER/MAJOR（及有泛化价值的 MINOR）必须归并进 [lessons-learned.md](./lessons-learned.md) 对应主题**——这些是开发中真实遇到的困难/陷阱，不归档就会复发。architect 在 Re-review 闭环、提交前完成归档：同主题已有更强条目则合并/替换，没有则新增。归档触发关键词补进主题的"触发关键词"行。仅当 Reviewer 发现是"针对本次代码的个案、无泛化规律"时可不归档（如某变量名拼写），但边界/所有权/精度/内存类发现一律归档。
 
 ---
 
@@ -100,6 +101,15 @@
 | 兼容性 | torch_npu 版本差异、ATB 图编译失败，只有实际运行才能发现 |
 | 数值精度 | 修改后余弦相似度是否仍 ≥ 0.99，必须用真实模型推理 |
 
+### 4.2 测试覆盖矩阵纪律
+
+新增或修改测试时，必须说明它覆盖哪个 `(平台 × 分辨率 × 路径 × 参考)` 四元组，并明确是否 **vs official**。
+
+- 覆盖矩阵和测试语义分类见 [evergreen/testing-architecture.md](./evergreen/testing-architecture.md)。
+- 开发者必跑命令和 Reviewer checklist 见 [evergreen/testing-guide-dev.md](./evergreen/testing-guide-dev.md)。
+- `test_engine_vs_official` / official pixel_values gate 才能证明对齐官方；`benchmark --mode compare`、`test_accuracy`、path C 自比对只能证明跨语言或路径一致性。
+- 310P skip 必须写清平台限制；不得把未覆盖 official gate 写成已通过。
+
 ---
 
 ## 5. Agent 派发 briefing 模板
@@ -112,6 +122,33 @@
 4. **禁止事项**：明确列出不允许的操作（如"不要修改其他函数"）。
 5. **测试要求**：需要运行的具体测试命令。
 6. **上报路径**：遇到不明确的情况 → 汇报给 architect，不要自己猜测。
+
+### 5.1 派单记录纪律（开发历程归档）
+
+**每次派单（Developer / Reviewer / Re-review）都必须记录派法 + 结果**，这是开发历程和经验沉淀，不是可选项。
+
+记录位置：`docs/dev-dispatch-log.md`（根级持续更新文档，单一文件按时间倒序追加，不按批次拆文件——避免孤岛）。
+
+每条记录格式：
+```
+## YYYY-MM-DD HH:MM ｜ <批次/任务名> ｜ <Developer|Reviewer|Re-review>
+**派法**（architect 给 subagent 的 briefing 要点，不是全文）：
+- 角色 + 目标一句话
+- 工作范围（改哪些文件）
+- 关键约束/禁止事项
+- 验收标准
+**结果**（subagent 回复摘要）：
+- 做了什么（改了哪些文件、关键决策）
+- 验收数据（cos/性能/测试通过数等硬数字）
+- 发现的问题（Reviewer 的 BLOCKER/MAJOR 清单，或 Developer 遇到的坑）
+- 遗留/待定项
+```
+
+记录时机：subagent 返回后、architect 汇总时立即追加一条。Reviewer 发现的问题若需归档进 lessons-learned，按 §3.3 审查发现归档纪律同步。
+
+**为什么**：用户 2026-06-23 要求——"每次派单怎么派的、subagent 回复结果是什么，都记录下来，都是经验和开发历程"。派单 briefing 反映"我们怎么拆解问题的"，subagent 结果反映"实际遇到的困难和决策"，两者都是复盘和传承的素材。口语化的派单 prompt 不留档就丢失了思考过程。
+
+**判据**：只要用了 Agent 工具派 subagent（Developer/Reviewer/Re-review/调研），就要记一条。architect 自己 inline 做的 trivial 调查（grep/read）不用记。
 
 ---
 

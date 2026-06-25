@@ -273,9 +273,9 @@ def test_text_layer(proc, engine, model_dir):
     # Use TF position_ids (known correct from test 2)
     with torch.no_grad():
         tf_pid, _ = ref.get_rope_index(input_ids, None, None, None)
-        # TF RoPE — all inputs must be on NPU
-        dummy = torch.zeros(1, S, engine.hidden_t, device='npu')
-        tf_cos, tf_sin = ref.language_model.rotary_emb(dummy, tf_pid.float().npu())
+        # TF RoPE — inputs on ref device
+        dummy = torch.zeros(1, S, engine.hidden_t, device=ref.device, dtype=ref.dtype)
+        tf_cos, tf_sin = ref.language_model.rotary_emb(dummy, tf_pid.float().to(ref.device))
 
     # ATB RoPE (with same position_ids) — ATB expects (B*S, head_dim)
     atb_cos, atb_sin = engine.text_rope(tf_pid)
@@ -283,8 +283,8 @@ def test_text_layer(proc, engine, model_dir):
     sin_npu = atb_sin.reshape(-1, engine.hd_t).half().npu()
 
     # TF RoPE — keep (batch, seq_len, head_dim) shape for TF layer
-    tf_cos_npu = tf_cos.half().npu()  # (1, S, head_dim)
-    tf_sin_npu = tf_sin.half().npu()  # (1, S, head_dim)
+    tf_cos_npu = tf_cos.to(ref.device, ref.dtype)  # (1, S, head_dim)
+    tf_sin_npu = tf_sin.to(ref.device, ref.dtype)  # (1, S, head_dim)
 
     # ATB text layer graph
     engine._ensure_text_graph(S)
@@ -293,6 +293,8 @@ def test_text_layer(proc, engine, model_dir):
         causal_mask_atb = make_causal_mask_nz_npu(S)
     else:
         causal_mask_atb = causal_mask
+    # TF attention mask follows ref's device/dtype (causal_mask itself is ATB-only, NPU).
+    causal_mask_tf = make_causal_mask(S).to(ref.device, ref.dtype).unsqueeze(0).unsqueeze(0)
 
     # Run first text layer only — ATB
     hidden_atb = inputs_embeds.half().npu()
@@ -304,12 +306,12 @@ def test_text_layer(proc, engine, model_dir):
         causal_mask=causal_mask_atb).cpu().float()
 
     # Run first text layer only — TF (same inputs_embeds, same position_embeddings)
-    hidden_tf = inputs_embeds.half().npu()
+    hidden_tf = inputs_embeds.to(ref.device, ref.dtype)
     with torch.no_grad():
         tf_layer_out = ref.language_model.layers[0](
             hidden_tf,
             position_embeddings=(tf_cos_npu, tf_sin_npu),
-            attention_mask=causal_mask.unsqueeze(0).unsqueeze(0).float())
+            attention_mask=causal_mask_tf)
     tf_out = tf_layer_out.cpu().float()
 
     cs = cosine(atb_out, tf_out)
@@ -422,6 +424,22 @@ Interpretation:
   - If text_layer FAIL with weight mismatch → check safetensors key audit
   - If text_layer FAIL but weights OK → ATB graph execution issue
 """)
+
+    # Explicit cleanup: this test instantiates an ATB engine PLUS multiple
+    # transformers Qwen3VLModel refs (one fp16 NPU ref in test_text_layer),
+    # and Python GC of those during interpreter shutdown deadlocks against
+    # the torch_npu/ATB runtime teardown — the process hangs after main()
+    # returns. Releasing engine + emptying NPU cache before returning
+    # avoids the hang. Mirrors test_pipeline_trace.py's `del ref +
+    # torch.npu.empty_cache()` pattern.
+    try:
+        engine.close()
+    except Exception:
+        pass
+    try:
+        torch.npu.empty_cache()
+    except Exception:
+        pass
 
     return 0 if all(results.values()) else 1
 

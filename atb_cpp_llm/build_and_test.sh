@@ -171,6 +171,18 @@ else
     log "No .env file found (repo root or $SCRIPT_DIR). Tests will use defaults."
 fi
 
+# Expand OFFICIAL_EMBED_CASES into reference-data sentinels.
+# These check that gen_official_embedding.py has been run before C++ tests
+# that read /tmp/official_embed_mm_*.bin and /tmp/official_tokens_mm_*.bin.
+OFFICIAL_CASES="${OFFICIAL_EMBED_CASES:-416x672,720x1280,1080x1920,1440x2560}"
+IFS=',' read -ra _OC_TOKENS <<< "$OFFICIAL_CASES"
+for _oc in "${_OC_TOKENS[@]}"; do
+    _oc_trimmed="$(echo "$_oc" | tr -d ' ')"
+    [ -z "$_oc_trimmed" ] && continue
+    REFDATA_SENTINELS+=("/tmp/official_embed_mm_${_oc_trimmed}.bin")
+    REFDATA_SENTINELS+=("/tmp/official_tokens_mm_${_oc_trimmed}.bin")
+done
+
 # ── 2. Source Ascend env scripts when available ─────────────────────
 # Probe two common install roots in order:
 #   1. ~/Ascend/        — non-root install (recommended)

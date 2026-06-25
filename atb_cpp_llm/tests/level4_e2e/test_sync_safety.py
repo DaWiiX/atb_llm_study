@@ -3,12 +3,14 @@
 Runs the C++ benchmark --mode compare under multiple sync configurations,
 each repeated N trials to account for non-deterministic NPU behavior.
 
-Sync configurations tested:
-  A: Full sync (baseline)        PER_OP=off  TIMING=off  LAUNCH_BLOCKING=0
-  B: No per-op sync              PER_OP=on   TIMING=off  LAUNCH_BLOCKING=0
-  C: No timing syncs             PER_OP=off  TIMING=on   LAUNCH_BLOCKING=0
-  D: Minimal sync                PER_OP=on   TIMING=on   LAUNCH_BLOCKING=0
-  E: CANN launch blocking        PER_OP=on   TIMING=on   LAUNCH_BLOCKING=1
+Sync configurations tested (per-op sync is OFF by default; ATB_ENABLE_PER_OP_SYNC=1
+opts back in. PER_OP=on => per-op Synchronize on; TIMING=on => stage-boundary
+timing syncs on, i.e. ATB_SKIP_TIMING_SYNCS unset):
+  A: Full sync (baseline)        PER_OP=on   TIMING=on   LAUNCH_BLOCKING=0
+  B: No per-op sync              PER_OP=off  TIMING=on   LAUNCH_BLOCKING=0
+  C: No timing syncs             PER_OP=on   TIMING=off  LAUNCH_BLOCKING=0
+  D: Minimal sync                PER_OP=off  TIMING=off  LAUNCH_BLOCKING=0
+  E: CANN launch blocking        PER_OP=off  TIMING=off  LAUNCH_BLOCKING=1
 
 For each config × trial, the C++ benchmark runs --mode compare (13 combos).
 Each C++ output .bin is compared against the Python ATB reference via cosine.
@@ -49,13 +51,12 @@ BIN_DIR = "/tmp"
 # ── Sync configurations ──────────────────────────────────────
 # Each is (label, env_override_dict)
 SYNC_CONFIGS = [
-    ("A: full sync (baseline)",     {}),
-    ("B: no per-op sync",           {"ATB_DISABLE_PER_OP_SYNC": "1"}),
-    ("C: no timing syncs",          {"ATB_SKIP_TIMING_SYNCS": "1"}),
-    ("D: minimal sync",             {"ATB_DISABLE_PER_OP_SYNC": "1",
+    ("A: full sync (baseline)",     {"ATB_ENABLE_PER_OP_SYNC": "1"}),
+    ("B: no per-op sync",           {}),  # per-op off by default
+    ("C: no timing syncs",          {"ATB_ENABLE_PER_OP_SYNC": "1",
                                       "ATB_SKIP_TIMING_SYNCS": "1"}),
-    ("E: CANN launch blocking",     {"ATB_DISABLE_PER_OP_SYNC": "1",
-                                      "ATB_SKIP_TIMING_SYNCS": "1",
+    ("D: minimal sync",             {"ATB_SKIP_TIMING_SYNCS": "1"}),
+    ("E: CANN launch blocking",     {"ATB_SKIP_TIMING_SYNCS": "1",
                                       "ASCEND_LAUNCH_BLOCKING": "1"}),
 ]
 

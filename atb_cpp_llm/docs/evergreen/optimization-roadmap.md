@@ -244,6 +244,11 @@
 - **经验教训**: 见 [lessons-learned.md 主题1第3条](../lessons-learned.md#主题-1精度调试)（NPU sync 不是"加了更安全"）
 - **相关测试**: ✅ G5 `test_sync_safety.{cpp,py}`（2026-06-09）— per-op sync 和 timing sync 均可安全移除（cosine=1.000 bit-exact），deepstack 和 D2H sync 必须保留
 
+> **后续演进（Batch 1, 2026-06-21）**：上述结论已部分超越。
+> - **H1**：per-op sync 默认从 ON 翻转为 **OFF**。env 名从 opt-out `ATB_DISABLE_PER_OP_SYNC` 改为 opt-in `ATB_ENABLE_PER_OP_SYNC`（旧名不再读取）。A/B 实测默认 async 拿到 12–13% e2e 收益（text 65.5→57.1ms，io/mm 115.7→100.6ms，stddev 0.71→0.04）。
+> - **H4**：deepstack `InjectFeatures` 的 `sync=true` **已移除**——IndexAdd 与其生产者同在单 ATB stream，FIFO 排序保证输入就绪，forward 末尾 FinalNorm sync 兜底正确性。结论中「deepstack per-op sync 必须保留」不再成立。
+> - **D2H sync 仍必须保留**且强化：ATB 跑在独立 stream，同步 `aclrtMemcpy` D2H **不**等待 ATB 待决 work，故 vision merger / text FinalNorm 的 `CopyToHost` 前必须有显式 `Synchronize()`（否则 IMAGE_ONLY cos 崩至 ~0.19）。`RunVision` 同步补齐；`debug::DumpNpuFp16` 的 sync 移到 D2H 之前修复 debug 保真度。
+
 ---
 
 ### ⏳ 候选未来项（按优先级排序）
@@ -291,6 +296,47 @@
 - **数据**: vocab=151936 × hs=2048 × 2B = **622 MB**（**比所有其他权重加起来还大**）
 - **结论**: ❌ 不可行（NPU 内存太宝贵，不值得占用）
 - **保持现状**: CPU lookup 然后 H2D。当前已经只 H2D 一次。
+
+#### 🟡 P10: Preprocess 加速（Batch 2，2026-06-22 启动）
+
+**权威基准源**（任何预处理改动对齐这个，不要自己定语义）：
+- 官方实现 `/mnt/workspace/gitCode/Qwen3-VL-Embedding`（模型权重/推理脚本）调 transformers + qwen_vl_utils。
+- 图像 resize 权威链路在 `/mnt/workspace/gitCode/Qwen3-VL/qwen-vl-utils/src/qwen_vl_utils/vision_process.py:140`：`Image.open → to_rgb → smart_resize → image.resize((w,h))`，**`image.resize` 不传 resample 参数 → PIL 默认 `Image.BICUBIC`**。这就是官方预处理 resize 的真值来源。
+- transformers Qwen3VL `image_processing_qwen3_vl` / `video_processing_qwen3_vl` 同样 `resample = PILImageResampling.BICUBIC`。
+- Python 参考侧 `atb_python_qwen3vl_embedding/preprocess.py` 用 torch `F.interpolate(mode='bicubic', align_corners=False)`，与 PIL 在 boundary handling 上有可观察差异（自然图像上 cosine 仍 ≥0.999）。**PIL（`vision_process.py:140`）是最权威基准**。
+- PIL resize 内部实现参考：`docs/archive/Resample.c`（PIL 官方 libImaging/Resample.c）。
+
+**当前瓶颈**（910B 实测，1080×1920）：
+| 阶段 | 耗时 | 占比 |
+|---|---|---|
+| bicubic | 516ms | 78.5% |
+| patch extraction | 116ms | 17.6% |
+| normalize | 25ms | 3.8% |
+| smartresize | ~0 | 0% |
+| **total** | **657ms** | |
+
+根因：当前 `qwen3vl_preprocess.cpp:BicubicResize` 不可分离（4×4=16 tap/像素）+ 每像素 16 次浮点 `CubicWeight`（含 fabs/floor/分支）+ 运行时 clamp 分支。PIL Resample.c 的优化正好是反面：两阶段可分离（16→8 tap）+ 系数预算表（运行时零三角函数）+ 8bpc 定点整数 + clip8 查找表。
+
+**数据搬运不是瓶颈**：当前 H2D fp16 pixel_values 最大 14MiB（<1ms），ATB 流程 H2D uint8 原图更小（1.36–4×减少）。657ms 是 CPU compute，不是搬运。
+
+**ATB 化方向约束**（重要，勿走偏）：
+- ATB 层（`atb/infer_op_params.h`）**无 resize/interpolate 算子**。
+- aclnn 有 `aclnnUpsampleBicubic2d`（语义=torch，a=-0.75 Mitchell、无 antialias、align_corners=False）和 `aclnnResize`。**【2026-06-22 纠正】** 早先记录"仅 910b kernel、无 310P"是错的——回查 CANN 9.0.0 官方文档产品支持表：Atlas 训练系列（910B）√ **与** Atlas 推理系列（310P）√ **都支持**。aclnn 路径跨平台可用，不再是移植性硬阻塞。（教训见 lessons-learned 主题 7 第 11 条：文档里的平台/能力结论是易过期事实，使用前回查权威源。）
+- **ATB 版预处理应优先用 ATB 基础算子组合计算图**（reshape/transpose/concat/elewise 等，引擎 `src/ops/` 已封装），而非直接调 aclnn——这是项目既有方向。aclnn 作为跨平台加速候选（P10-B 已验证精度可用）。
+
+**三阶段计划**：
+- **P10-A（CPU PIL 式重写，零移植风险，确定收益）** ✅：移植 Resample.c 三大手法到 `qwen3vl_preprocess.cpp`——可分离两阶段卷积 + 系数预算表 + normalize 融合进 vertical pass 输出 + patch `f` 帧去重。实测 657→141ms@1080×1920（4.7×），x86/ARM 通用、零新库、数学等价（edge-clamp Catmull-Rom，对齐现有 test_preprocess_cpu 阈值）。**作为后续 ATB 化的 baseline。**
+- **P10-B（aclnn 官方插值，双平台，AA 910B 特化）** ✅ 精度闸口+工程化+性能实测完成（Developer→Reviewer→Re-review 闭环，多轮）：`aclnnUpsampleBicubic2d`（非 AA）在降采样 1080/1440→832 时 vs PIL 仅 cos=0.987/0.958 ❌，**`aclnnUpsampleBicubic2dAA`（含抗混叠预滤波）rescues P10-B**，降采样从 0.958 拉回 0.999996 ✅。AA 仅支持 910B（CANN 商用版产品表：Atlas 推理系列=310P ×）。**双路径**：910B → `NpuBicubicResizeAA`（4/4 ≥0.99998）；310P → 非 AA（2/4 通过，降采样 case P10-A CPU 兜底）。`PreprocessImageNpu` 6 步管线实现（SmartResize→H2D→AA/非AA Bicubic→3×Elewise normalize→D2H→CPU patch），goto-cleanup 内存安全，AA 降采样条件守卫（恒等/上采样走非 AA）。**性能实测 NPU vs P10-A CPU geomean 1.4×**（416×672 1.7× / 720×1280 1.9× / 1080×1920 1.4× / 1440×2560 0.9×）。
+- **P10-B 后续优化（待启动，按收益/难度排序）**：
+  - **#2 跳过恒等 resize（已证伪，放弃）**：原假设 `new_h==height && new_w==width` 时跳过 bicubic 可省 aclnn 调用 + 避免 Mitchell 核恒等平滑。**A/B 实测证伪**：bicubic 核（Mitchell/Catmull-Rom）满足 `W(0)=1, W(±1)=0, W(±2)=0`，恒等尺度下源采样映射为整数、核退化为单位冲激，`aclnnUpsampleBicubic2d` 精确返回输入（cos/max_diff 字节相同），无平滑可避免；省的 ~0.1ms aclnn 调用被噪声淹没。**根因**：假设 bicubic 核在恒等下会平滑图像是错的。聚焦 #1。
+  - **#1 Patch extraction NPU 化（最大收益，消除 D2H 搬运）**：当前归一化 fp16 tensor D2H 回 CPU 做 patch 重排，是 1440×2560 退化 0.9× 的根因（D2H 搬 7.5MB + 引擎后续 H2D 再搬 7.5MB）。NPU 化后 pixel_values 留 device，引擎下游直接消费，消除往返搬运。
+    - **闸口全过（2026-06-23 spike）**：① ATB `TransposeOp` 7 维 permute `[1,4,2,5,0,3,6]` bit-exact；② **8 维 perm `[2,5,3,6,1,0,4,7]`（含 tp 维）bit-exact**，Python 交叉验证等价 9 维 `.permute(0,3,6,4,7,2,1,5,8)`；③ **`AsStridedParam` stride=0 广播 tp 帧确认可用**（`infer_op_params.h:133`，`atb::CreateOperation` 模板创建）；④ 完整 patch 管线 `[C,new_h,new_w] → AsStrided(stride=0 tp) → 8维 Transpose → Reshape` vs CPU **bit-exact（cos=1.0）**，64 assertions PASS。`test_patch_transpose_spike.cpp`。
+    - **NPU 方案确立**：AsStrided(stride=0 广播 tp) + Transpose(8 维 perm `[2,5,3,6,1,0,4,7]`) + Reshape，全程 device 内、零 D2H。
+    - **约束（已查 ATB 源码 `ascend-transformer-boost-v9.0.0`）**：ATB `TransposeOp` 的 `Dims.dimNum ∈ (0,8]`（`types.h:31 MAX_DIM=8`）。Patch 9 维 permute squeeze grid_t=1 后 8 维（含 tp）正好 ≤8 限制。
+    - 验收：patch 输出 cos vs CPU 路径 ≥0.999（spike 已 bit-exact）；4 分辨率性能，1440×2560 从 0.9× 拉到 >1.0×。
+- **P10-C（ATB 基础算子组合 PIL resample）**：aclnn 不可用或需更高精度对齐 PIL boundary 时的备选，用 ATB 基础算子（Elewise/Concat/Transpose/Reshape）组合出 PIL resample 计算图。跨平台。P10-B 精度已达标，P10-C 优先级降低，仅作 long-shot 储备。
+
+**验收**：cosine ≥ 0.99 vs PIL（P10-B spike 已在 4 生产分辨率达标）；4 分辨率性能实测完成（vs P10-A CPU，geomean 1.4×）：416×672 1.7×/720×1280 1.9×/1080×1920 1.4×/1440×2560 0.9×（退化根因 H2D 开销，待 P10-B 后续 #1 优化）。全管线精度测试 cos≥0.999（非降采样/非 AA 路径）。
 
 ---
 

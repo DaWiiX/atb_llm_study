@@ -15,8 +15,10 @@ Output files (in /tmp/):
     cpu_mrope_cos_sin.bin          — MRoPE::Compute: cos/sin for position_ids [3, 1, 8]
     cpu_vision_rope_cos_sin.bin    — VisionRotaryEmbedding: cos/sin for grid [1, 4, 6]
     cpu_smart_resize.bin           — SmartResize: height, width pairs (in/out)
-    bicubic_*_input/output.bin     — BicubicResize: C++-kernel-equivalent reference
+    bicubic_*_input/pil_output.bin — BicubicResize: PIL BICUBIC reference
+                                     (_output.bin is a legacy alias of _pil_output.bin)
     preprocess_*_input/output/grid — PreprocessImage: Python end-to-end pipeline ref
+                                     (_pil_output.bin is the PIL end-to-end reference)
 """
 
 import os
@@ -368,7 +370,7 @@ def gen_smart_resize():
 
     factor = 32  # patch_size * merge_size = 16 * 2
     min_px = 4096
-    max_px = 1310720
+    max_px = 1843200
 
     # Cases: (name, in_h, in_w)
     cases = [
@@ -394,68 +396,21 @@ def gen_smart_resize():
 # ═══════════════════════════════════════════════════════════════════
 # Stage: BicubicResize + PreprocessImage — end-to-end pipeline reference
 #
-# BicubicResize ref: we reproduce the C++ algorithm in Python (Catmull-Rom
-# a=-0.5 cubic kernel with **edge-clamp boundary handling**) — NOT
-# `F.interpolate(mode='bicubic')`. The PyTorch implementation uses
-# different boundary handling (effectively reflective/extended kernel
-# weights at edges) and produces noticeably different values for small
-# images (e.g. corner of a 2x2→4x4 checkerboard is -59.46 in PyTorch vs
-# -38.38 with edge-clamping). The C++ code intentionally uses edge-clamp
-# because that's the common OpenCV/standard CV implementation and is
-# numerically stable. This Python reference therefore validates the C++
-# kernel against itself (regression test), not against PyTorch. The C++
-# kernel matches PIL's CATMULL-ROM-style algorithm at interior pixels
-# but they differ at boundaries too — there is no "canonical" bicubic.
+# BicubicResize ref: `_pil_bicubic_resize` runs `PIL.Image.resize(BICUBIC)`
+# per channel on uint8 input. This is the bit-exact ground truth for the
+# C++ CPU `BicubicResize` / `PreprocessImage`, which were rewritten (Batch A)
+# as a fixed-point port of Pillow's 8bpc antialias resample and verified
+# zero-diff against real PIL. The earlier non-AA Catmull-Rom self-reference
+# is gone — the C++ now targets PIL, so PIL is the only reference.
 #
-# PreprocessImage ref uses the in-repo `preprocess.preprocess_image`
-# (which calls `F.interpolate(mode='bicubic', align_corners=False)` and
-# then normalizes with mean=std=0.5). Because the bicubic boundary
-# handling differs between C++ (edge-clamp) and PyTorch (extended
-# kernel), the C++ output will not match Python bit-for-bit — but on
-# natural images the difference is concentrated in a thin border, so
-# cosine similarity ≥ 0.999 still passes. If a tighter bar is needed
-# in future, swap `preprocess_image` to use an edge-clamp bicubic
-# implementation on both sides.
+# PreprocessImage ref: `_pil_preprocess_image` replicates the full C++ CPU
+# chain (smart_resize → per-channel PIL BICUBIC → (x/255 - mean)/std with
+# mean=std=0.5 → patchify → fp16). Because both sides quantize the same fp32
+# values to fp16, the PIL reference is expected to be bit-exact (fp16 bit
+# equality) with the C++ output. (The legacy `preprocess.preprocess_image`
+# F.interpolate output is still emitted as `preprocess_*_output.bin` for the
+# pre-migration C++ tests; the PIL output is emitted as `*_pil_output.bin`.)
 # ═══════════════════════════════════════════════════════════════════
-
-
-def _cpp_bicubic_resize(arr_chw: np.ndarray, out_h: int, out_w: int) -> np.ndarray:
-    """Pure-numpy reproduction of qwen3vl_preprocess.cpp::BicubicResize.
-
-    Catmull-Rom kernel a=-0.5 + align_corners=False source mapping
-    + edge-clamp on neighbour indices. Returns fp32 array shaped
-    (C, out_h, out_w).
-    """
-    def cubic(x, a=-0.5):
-        ax = np.abs(x)
-        w = np.where(ax <= 1,
-                     (a + 2) * ax**3 - (a + 3) * ax**2 + 1,
-                     np.where(ax < 2,
-                              a * ax**3 - 5 * a * ax**2 + 8 * a * ax - 4 * a,
-                              0.0))
-        return w
-
-    c, in_h, in_w = arr_chw.shape
-    out = np.zeros((c, out_h, out_w), dtype=np.float32)
-    for ch in range(c):
-        for oh in range(out_h):
-            src_h = (oh + 0.5) * in_h / out_h - 0.5
-            sh = int(np.floor(src_h))
-            dh = src_h - sh
-            for ow in range(out_w):
-                src_w = (ow + 0.5) * in_w / out_w - 0.5
-                sw = int(np.floor(src_w))
-                dw = src_w - sw
-                s = 0.0
-                for m in range(-1, 3):
-                    wh = cubic(dh - m)
-                    ih = max(0, min(in_h - 1, sh + m))
-                    for n in range(-1, 3):
-                        ww = cubic(dw - n)
-                        iw = max(0, min(in_w - 1, sw + n))
-                        s += arr_chw[ch, ih, iw] * wh * ww
-                out[ch, oh, ow] = s
-    return out
 
 
 def _pil_bicubic_resize(arr_chw: np.ndarray, out_h: int, out_w: int) -> np.ndarray:
@@ -491,31 +446,105 @@ def _pil_bicubic_resize(arr_chw: np.ndarray, out_h: int, out_w: int) -> np.ndarr
     return out
 
 
+def _pil_preprocess_image(image_u8: np.ndarray,
+                          patch_size: int = 16,
+                          temporal_patch_size: int = 2,
+                          merge_size: int = 2,
+                          min_pixels: int = 4096,
+                          max_pixels: int = 1843200):
+    """Pure numpy/PIL replication of the C++ CPU `PreprocessImage` chain.
+
+    Mirrors qwen3vl_preprocess.cpp::PreprocessImage step-for-step:
+      1. smart_resize (banker's rounding — reuse the package implementation,
+         do NOT reimplement).
+      2. Per-channel PIL BICUBIC resize → uint8 (bit-exact vs the C++ 8bpc
+         fixed-point AA resample; see _pil_bicubic_resize).
+      3. Rescale + per-channel normalize in float32: (u8/255 - mean) / std,
+         mean=std=0.5 (preprocessor_config.json image_mean/image_std).
+      4. Patchify with the SAME reshape/permute as preprocess.preprocess_image
+         and the C++ patch loop:
+            reshape(grid_t, tp, C, gh//ms, ms, ps, gw//ms, ms, ps)
+            .permute(0, 3, 6, 4, 7, 2, 1, 5, 8)
+            .reshape(N, C*tp*ps*ps)
+         For a single image the tp frames are identical (frame duplicated),
+         matching the C++ f=0 → f=1..tp-1 memcpy.
+      5. fp16 (numpy RNE == C++ Fp32ToFp16 RNE).
+
+    Args:
+        image_u8: (C, H, W) uint8 array.
+
+    Returns:
+        (pixel_values_fp16, grid_thw_np):
+          pixel_values_fp16: (N, C*tp*ps*ps) float16.
+          grid_thw_np:        (1, 3) int64 [grid_t, grid_h, grid_w].
+    """
+    from atb_python_qwen3vl_embedding.preprocess import smart_resize
+
+    assert image_u8.dtype == np.uint8 and image_u8.ndim == 3
+    C, H, W = image_u8.shape
+    factor = patch_size * merge_size
+
+    # 1. smart_resize (package implementation — banker's rounding).
+    new_h, new_w = smart_resize(H, W, factor=factor,
+                                min_pixels=min_pixels, max_pixels=max_pixels)
+
+    # 2. Per-channel PIL BICUBIC (bit-exact vs C++ ResampleCore8bpc) → uint8(f32).
+    resized = _pil_bicubic_resize(image_u8.astype(np.float32), new_h, new_w)
+
+    # 3. Rescale + normalize in float32 (matches C++ (x/255 - mean)/std order).
+    mean = np.array([0.5, 0.5, 0.5], dtype=np.float32).reshape(3, 1, 1)
+    std = np.array([0.5, 0.5, 0.5], dtype=np.float32).reshape(3, 1, 1)
+    normalized = (resized.astype(np.float32) / np.float32(255.0) - mean) / std
+    normalized = normalized.astype(np.float32)
+
+    # 4. Patchify (identical reshape/permute to preprocess_image / C++ loop).
+    grid_t = 1
+    grid_h = new_h // patch_size
+    grid_w = new_w // patch_size
+    # Single image → tp identical frames (frame duplicated across temporal dim).
+    frames = np.stack([normalized] * temporal_patch_size, axis=0)  # (tp, C, h, w)
+    patches = frames.reshape(
+        grid_t, temporal_patch_size, C,
+        grid_h // merge_size, merge_size, patch_size,
+        grid_w // merge_size, merge_size, patch_size,
+    )
+    patches = np.transpose(patches, (0, 3, 6, 4, 7, 2, 1, 5, 8))
+    flat = patches.reshape(
+        grid_t * grid_h * grid_w,
+        C * temporal_patch_size * patch_size * patch_size,
+    )
+
+    # 5. fp16 quantization (RNE — same as C++ Fp32ToFp16).
+    pv_fp16 = np.ascontiguousarray(flat).astype(np.float16)
+    grid_thw = np.array([[grid_t, grid_h, grid_w]], dtype=np.int64)
+    return pv_fp16, grid_thw
+
+
 def _gen_bicubic_case(name: str, input_np: np.ndarray, out_h: int, out_w: int):
-    """Run the C++-equivalent bicubic on `input_np` (C,H,W float32) and
-    dump input + output as f32 bins. The reference exactly mirrors the
-    C++ algorithm (Catmull-Rom a=-0.5 + edge clamp), so the C++ test
-    validates the implementation against a Python-side reproduction.
+    """Quantize `input_np` (C,H,W float32) to uint8 and dump the input plus
+    a PIL BICUBIC reference output as f32 bins.
 
-    Additionally writes a PIL BICUBIC reference as an INDEPENDENT ground
-    truth (see _pil_bicubic_resize). The PIL reference uses symmetric
-    boundary handling which differs from C++ edge-clamp at boundary pixels.
+    `_pil_bicubic_resize` (real PIL.Image.resize) is the bit-exact ground
+    truth for the C++ CPU BicubicResize, which was rewritten as a fixed-point
+    port of Pillow's 8bpc antialias resample (Batch A, zero-diff vs PIL).
 
-    NOTE: the C++ BicubicResize signature accepts uint8 input. To make
-    the reference bit-for-bit comparable, we round-and-clip the input
-    to uint8 BEFORE computing the reference. The bin we dump is the
-    quantized float32 values, so the C++ test gets exactly the values
-    the Python ref consumed (after its own uint8 cast).
+    NOTE: the C++ BicubicResize signature accepts uint8 input. To make the
+    reference bit-for-bit comparable, we round-and-clip the input to uint8
+    BEFORE computing the reference. The bin we dump is the quantized float32
+    values, so the C++ test gets exactly the values the Python ref consumed.
     """
     assert input_np.dtype == np.float32 and input_np.ndim == 3
     input_u8 = np.clip(np.round(input_np), 0.0, 255.0).astype(np.uint8)
     input_q = input_u8.astype(np.float32)
-    y_np = _cpp_bicubic_resize(input_q, out_h, out_w).astype(np.float32)
-    y_pil = _pil_bicubic_resize(input_q, out_h, out_w).astype(np.float32)
     write_f32(f"{OUTPUT_DIR}/bicubic_{name}_input.bin", input_q)
-    write_f32(f"{OUTPUT_DIR}/bicubic_{name}_output.bin", y_np)
+    y_pil = _pil_bicubic_resize(input_q, out_h, out_w).astype(np.float32)
     write_f32(f"{OUTPUT_DIR}/bicubic_{name}_pil_output.bin", y_pil)
-    print(f"  → bicubic_{name}: in{input_np.shape} -> out{y_np.shape} (+ PIL ref)")
+    # Legacy alias: the C++ CPU BicubicResize is now PIL 8bpc, so the old
+    # `_output.bin` reference is just the PIL result. Keep emitting it (= y_pil)
+    # so the pre-migration Test4 (test_preprocess_cpu.cpp:359, reads _output.bin)
+    # stays green; Batch C migrates Test4 to _pil_output.bin and drops this alias.
+    write_f32(f"{OUTPUT_DIR}/bicubic_{name}_output.bin", y_pil)
+    print(f"  → bicubic_{name}: in{input_np.shape} -> out{(0, out_h, out_w)} (PIL ref)")
 
 
 def gen_bicubic_preprocess():
@@ -557,6 +586,25 @@ def gen_bicubic_preprocess():
     rand_rgb = (np.random.rand(3, 8, 8) * 255.0).astype(np.float32)
     _gen_bicubic_case("random_8x8_to_16x16_3ch", rand_rgb, 16, 16)
 
+    # ── Production-resolution cases [P10-B spike] ───────────────
+    # Cover the actual image sizes the engine sees (1080×1920 etc.).
+    # Output dims come from the real smart_resize so the spike validates the
+    # genuine engine resize path, not an arbitrary target. Random RGB input
+    # (fixed seed for reproducibility). These exercise aclnnUpsampleBicubic2d
+    # at scale where the interior dominates — the regime that matters in prod.
+    from atb_python_qwen3vl_embedding.preprocess import smart_resize
+    np.random.seed(2026)
+    for in_h, in_w in [(416, 672), (720, 1280), (1080, 1920), (1440, 2560)]:
+        # factor = patch_size * merge_size = 16 * 2 = 32 (from preprocessor_config.json)
+        # min_pixels / max_pixels from preprocessor_config.json
+        out_h, out_w = smart_resize(in_h, in_w, factor=32,
+                                    min_pixels=4096,
+                                    max_pixels=1843200)
+        img = (np.random.rand(3, in_h, in_w) * 255.0).astype(np.float32)
+        name = f"prod_{in_h}x{in_w}"
+        _gen_bicubic_case(name, img, out_h, out_w)
+
+
     # ── PreprocessImage cases ───────────────────────────────────
     # Load the in-repo Python reference (matches engine.preprocess_image).
     from atb_python_qwen3vl_embedding.preprocess import preprocess_image
@@ -571,7 +619,7 @@ def gen_bicubic_preprocess():
             temporal_patch_size=2,
             merge_size=2,
             min_pixels=4096,
-            max_pixels=1310720,
+            max_pixels=1843200,
         )
         # Python returns float32; round-trip through fp16 to match what
         # the C++ pipeline writes (which calls Fp32ToFp16 per patch).
@@ -582,8 +630,16 @@ def gen_bicubic_preprocess():
         write_fp16(f"{OUTPUT_DIR}/preprocess_{name}_output.bin", pv_fp16)
         write_i64(f"{OUTPUT_DIR}/preprocess_{name}_grid.bin",
                   grid_thw.numpy())
+
+        # PIL end-to-end reference (matches the C++ CPU PreprocessImage bit-for-bit;
+        # both quantize the same fp32 values to fp16). Grid is identical to the
+        # F.interpolate path above (resize method does not change the grid).
+        pv_pil_fp16, grid_pil = _pil_preprocess_image(image_u8)
+        assert np.array_equal(grid_pil, grid_thw.numpy()), \
+            f"PIL grid {grid_pil.tolist()} != ref grid {grid_thw.tolist()}"
+        write_fp16(f"{OUTPUT_DIR}/preprocess_{name}_pil_output.bin", pv_pil_fp16)
         print(f"  → preprocess_{name}: in({c},{h},{w}) "
-              f"-> pv{tuple(pv_fp16.shape)} grid={grid_thw.tolist()}")
+              f"-> pv{tuple(pv_fp16.shape)} grid={grid_thw.tolist()} (+ PIL ref)")
 
     # Case A: 64x64 gradient RGB (R: 0..255 horizontal,
     #                             G: 0..255 vertical,
@@ -603,6 +659,15 @@ def gen_bicubic_preprocess():
     np.random.seed(123)
     rand_img = (np.random.rand(3, 96, 96) * 255.0).astype(np.uint8)
     _gen_preprocess_case("random_96x96", rand_img)
+
+    # Case C: 144x272 fixed-seed random RGB — smart_resize → 128x256, a genuine
+    # DOWNSAMPLE on both axes (banker's rounding 144→128, 272→256). The 64x64 /
+    # 96x96 cases above are smart_resize identities and never exercise the AA
+    # (antialias) filter; this case forces the downsample path so the PIL 8bpc
+    # AA resample is covered end-to-end.
+    np.random.seed(456)
+    down_img = (np.random.rand(3, 144, 272) * 255.0).astype(np.uint8)
+    _gen_preprocess_case("down_144x272", down_img)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -2204,7 +2269,7 @@ def gen_config_wiring_ref():
         pp.get("temporal_patch_size", 2),
         pp.get("merge_size", 2),
         pp.get("min_pixels", 4096),
-        pp.get("max_pixels", 1310720),
+        1843200,  # embedder constant (1800*32*32), config ignored — mirrors C++
         # Derived fields (computed by Qwen3VLConfig methods)
         vis.get("hidden_size", 1024) // vis.get("num_heads", 16),  # vis_head_dim
         int(np.sqrt(vis.get("num_position_embeddings", 2304))),    # num_grid

@@ -21,12 +21,15 @@
 | [STATUS.md](./STATUS.md) | **当前状态单一真相源** —— 做完什么 / 还剩什么。查进度只看这里 |
 | [WORKFLOW.md](./WORKFLOW.md) | **工作方法论** —— architect 编排、Developer→Reviewer→Re-review 循环、审查通过标准、agent briefing 模板 |
 | [lessons-learned.md](./lessons-learned.md) | **踩坑经验集** —— 按主题组织，带触发关键词，做事前检索 |
+| [dev-dispatch-log.md](./dev-dispatch-log.md) | **派单开发历程** —— 每次 Developer/Reviewer 派单的派法 + subagent 结果，复盘传承素材 |
 
 ## evergreen/（常青参考）
 
 | 文件 | 描述 |
 |------|------|
 | [design.md](./evergreen/design.md) | 核心架构设计 v2 — 分层架构、IModel 接口、组件图、多模型适配 |
+| [testing-architecture.md](./evergreen/testing-architecture.md) | 测试体系架构 — 分层、official 真相源、覆盖矩阵、refdata discipline |
+| [testing-guide-dev.md](./evergreen/testing-guide-dev.md) | 开发者测试手册 — 修改类型必跑矩阵、official gates、benchmark/310P 注意事项 |
 | [platform-310p.md](./evergreen/platform-310p.md) | 310P 平台适配 — NZ mask 策略、兼容性矩阵、运维指南、实测经验 |
 | [deployment-checklist.md](./evergreen/deployment-checklist.md) | 生产部署逐项核查清单 + 一键诊断脚本 + ATB 错误码速查 |
 | [optimization-roadmap.md](./evergreen/optimization-roadmap.md) | NPU 性能优化长期路线 — P0 到 P8 逐阶段收益、冷热缓存分析 |
@@ -53,6 +56,8 @@
 ## 阅读路线
 
 - **第一次了解项目** → [evergreen/design.md](./evergreen/design.md)
+- **查测试体系/覆盖语义** → [evergreen/testing-architecture.md](./evergreen/testing-architecture.md)
+- **开发时确认必跑测试** → [evergreen/testing-guide-dev.md](./evergreen/testing-guide-dev.md)
 - **查当前进度/待办** → [STATUS.md](./STATUS.md)
 - **要派发/审查工作** → [WORKFLOW.md](./WORKFLOW.md)（方法论 + agent briefing 模板）
 - **遇到坑/做事前** → [lessons-learned.md](./lessons-learned.md)（按主题 + 触发关键词）

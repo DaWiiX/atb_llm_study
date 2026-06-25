@@ -85,6 +85,16 @@ NpuTensor::operator bool() const {
     return owns_ && tensor_.deviceData != nullptr;
 }
 
+NpuTensor NpuTensor::Adopt(atb::Tensor& tensor) {
+    NpuTensor t;
+    t.tensor_ = tensor;                       // shallow copy: desc + deviceData + dataSize
+    t.owns_ = (tensor.deviceData != nullptr); // empty input -> stays non-owning
+    // Transfer ownership: source no longer holds the device pointer.
+    tensor.deviceData = nullptr;
+    tensor.dataSize = 0;
+    return t;  // move-constructed on return
+}
+
 void NpuTensor::FreeIfOwned() {
     if (owns_ && tensor_.deviceData) {
         aclrtFree(tensor_.deviceData);

@@ -32,6 +32,7 @@ from atb_python_qwen3vl_embedding.engine import Qwen3VLEngine
 from atb_python_qwen3vl_embedding.env import QWEN3VL_EMB_MODEL_DIR
 from atb_python_qwen3vl_embedding.tests.data_utils import (
     cosine,
+    empty_npu_cache_safe,
     load_tf_ref,
     pool_and_normalize,
 )
@@ -104,7 +105,7 @@ def run_tf_embed(model_dir: str, processor, cases) -> dict:
     """Run TF model + pool_and_normalize for each case."""
     print("\n[TF] Loading transformers reference ...")
     model = load_tf_ref(model_dir)
-    print("[TF] Loaded")
+    print(f"[TF] Loaded on {model.device} dtype={model.dtype}")
 
     results = {}
     for name, img, txt in cases:
@@ -120,13 +121,13 @@ def run_tf_embed(model_dir: str, processor, cases) -> dict:
         tf_in = processor.apply_chat_template(
             msgs, tokenize=True, return_dict=True, return_tensors='pt',
             add_generation_prompt=True)
-        ids_t = tf_in['input_ids'].npu()
-        mask_t = tf_in.get('attention_mask', torch.ones_like(ids_t)).npu()
+        ids_t = tf_in['input_ids'].to(model.device)
+        mask_t = tf_in.get('attention_mask', torch.ones_like(ids_t)).to(model.device)
 
         kwargs = dict(use_cache=False, input_ids=ids_t, attention_mask=mask_t)
         if img is not None:
-            kwargs["pixel_values"] = tf_in.get('pixel_values').half().npu()
-            kwargs["image_grid_thw"] = tf_in.get('image_grid_thw').npu()
+            kwargs["pixel_values"] = model.place(tf_in.get('pixel_values'))
+            kwargs["image_grid_thw"] = tf_in.get('image_grid_thw').to(model.device)
 
         with torch.no_grad():
             out = model(**kwargs)
@@ -135,7 +136,7 @@ def run_tf_embed(model_dir: str, processor, cases) -> dict:
         print(f"[TF]  {name:<12} → {tuple(emb.shape)}")
 
     del model
-    torch.npu.empty_cache()
+    empty_npu_cache_safe()
     return results
 
 

@@ -14,6 +14,7 @@ public:
     Status EncodeWithTiming(const InferRequest& request,
                              InferResult& result,
                              StageTimings& timings);
+
     ~LLMEngine();
 
 private:

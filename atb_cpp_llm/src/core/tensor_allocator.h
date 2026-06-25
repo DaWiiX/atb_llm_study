@@ -53,6 +53,14 @@ public:
     /// Release NPU memory for a single tensor
     void Free(atb::Tensor& tensor);
 
+    /// Transfer ownership of @p tensor's device memory to the caller WITHOUT
+    /// freeing. Removes @p tensor from tracking so ~TensorAllocator/FreeAll
+    /// will not free it; the caller becomes responsible for aclrtFree'ing
+    /// deviceData (e.g. via NpuTensor::Adopt). deviceData is left intact.
+    /// Intended for path C: an in-engine NPU preprocess hands its device
+    /// tensor to the caller so it can stay on-device (no D2H).
+    void Detach(atb::Tensor& tensor);
+
     /// Release all tracked tensors (called on model destruction)
     void FreeAll();
 

@@ -10,7 +10,7 @@
 
 🟡 **有条件可部署**（功能 + 精度 + benchmark 线已完成；代码质量加固剩 43 项非阻塞）
 
-- **性能**：✅ ATB 比 Transformers 快 3.0–3.6×，余弦相似度 ≥ 0.999（13/13 组合）
+- **性能**：✅ ATB 比 Transformers 快 4.1–4.8×（Batch 1 异步优化后），余弦相似度 ≥ 0.999（13/13 组合）。Batch 1 异步流水恢复净赚 12–13% e2e（text 65.5→57.1ms, io/mm 115.7→100.6ms），stddev 0.71→0.04
 - **C++ 端**：✅ RAII 正确、错误传播完整、61 项审计 100% 修复
 - **Python 端**：🟡 P0/P1-HIGH 已修复；P1-MEDIUM(23) + P2(20) 待办
 - **Benchmark**：✅ B1–B7 + F1–F3 + M4/M5/M6 完成；310P 闭环已复验通过
@@ -41,19 +41,44 @@
 | 运行时验证 | 910B 全量测试 PASS | ✅ |
 | 平台检测根治 | `Is310P()`/`Is910B()` 改读 `.env`（抽 `src/utils/dotenv.h` 共享头，消除生产代码依赖 test 头）+ benchmark 启动期 `aclrtGetSocName()` 硬件探针自检（不匹配 `LOG_ERROR` 提醒，不 abort）。修裸启动 `./benchmark` 读不到 `ASCEND_PLATFORM` 静默走 910B ND mask 致 310P Transdata 崩溃 | ✅ |
 | Benchmark 输出修复 | `ReportStages`/`ReportColdStart`/`ReportThroughput` 的 `LOG_INFO`→`printf`(stdout)，修复默认 WARN log level 吞掉 human-readable 报告（只剩 `BENCH_RESULT` machine 行） | ✅ |
+| Python 测试参考 fallback | `load_tf_ref` 加 NPU→CPU eager probing + 薄代理（`_TFRef`），310P 上 transformers 参考撞不支持算子时自动退 CPU float32，对齐 C++ 参考生成器设计。910B 回归 7 文件全 PASS | ✅ (910B) / ⏳ 310P 待复验 |
+| max_pixels 对齐官方 | `kQwen3VLEmbeddingMaxPixels=1800*32*32` embedder 常量（对齐 `qwen3vl_embedding.py:28`），`qwen3vl_config.cpp` 删除 max_pixels 读取（do_resize=False 时 config 1310720 不参与 resize）。修 1080/1440 降采样 grid 与官方一致（6944 patches）。新增 `test_aclnn_bicubic_spike` TEST_CASE 4 "vs official transformers"硬性 gate，4 分辨率 cos≥0.99，gen_official 经 unbound 方法 bit-exact probe 证=官方 | ✅ (910B) / 310P skip |
+| official full embedding gate | 新增 `gen_official_embedding.py` + `test_engine_vs_official`，910B path C raw_image 全 engine embedding vs 官方 `Qwen3VLEmbedder.process(..., normalize=True)` pooled embedding，4 生产分辨率硬性 `cos>=0.99` gate；tokens 从同一次官方 `_preprocess_inputs` 捕获，public vs captured chain `max_diff=0`；310P skip（AA 不可用）。实测 cos=0.999882/0.999235/0.999469/0.999690 | ✅ (910B) / 310P skip |
 
 ### 2.5 平台适配
 910B + 310P 双平台。310P NZ mask 策略、GQA 原生支持（cos=1.0）、平台检测 API（`is_310p()`/`Is310P()`）均完成。详见 `evergreen/platform-310p.md`。
+
+### 2.6 性能优化 Batch 1（异步流水恢复）
+全部 ✅（2026-06-21）。翻转 per-op sync 默认 OFF（env 名 opt-out→opt-in `ATB_ENABLE_PER_OP_SYNC`）、移除 deepstack `InjectFeatures` 硬编码 sync + idx/alpha 缓存复用、补齐 async 模式 D2H 前置 sync、修复 debug dump 保真度。验收：构建零 warning、op 9/9 + e2e 6/6 全过（含 test_sync_safety 5 配置 cos≥0.999）、12–13% e2e 收益（text 65.5→57.1ms / io 115.7→102.6ms / mm 115.7→100.6ms，stddev 0.71→0.04）、100-iter 无 HBM 泄漏、compare 13/13 裸跑正常。M1（ws_size 缓存 + GRAPH_LAUNCH_MODE）暂缓为后续批次。详见 `evergreen/optimization-roadmap.md` P4 后续演进注记。
+
+### 2.7 性能优化 Batch 2-A（CPU 预处理 PIL 式重写）
+全部 ✅（2026-06-22）。`qwen3vl_preprocess.cpp` 移植 PIL `Resample.c` 三大手法：可分离两阶段卷积（16→8 tap）+ 系数预算表（`PrecomputeCoeffs`，运行时零 `CubicWeight` 重算）+ normalize 融合进 vertical pass + patch `f` 帧去重。验收：构建零 warning；`test_preprocess_cpu` 6/6（TestBicubicVsPython/TestPreprocessImageVsPython cos=1.000000）+ `test_io_adapters` magic number 不变 + e2e/accuracy/patch_embed 全过；preprocess 4 分辨率 4.3–5.0× 加速（416×672 129→27ms、720×1280 460→92ms、1080×1920 657→141ms、1440×2560 657→154ms）；compare 13/13 正常。数学等价（edge-clamp Catmull-Rom 语义不变，double 累加精度更高）。Reviewer 零阻塞 bug，独立非二进制维度验证 max_diff≤9.2e-5。详见 `evergreen/optimization-roadmap.md` P10。
+
+### 2.8 P10-B 精度 spike（aclnnUpsampleBicubic2d / AA 闸口验证）
+✅ P10-B 闸口通过（2026-06-22，Developer→Reviewer→Re-review 闭环）。验证 aclnn 与 PIL BICUBIC 在 **引擎真实 smart_resize 参数**（factor=32/min_pixels=4096/max_pixels=1310720）下的 cosine：
+
+| 分辨率 | 引擎输出 | 非 AA cos | AA cos (仅910B) |
+|--------|----------|-----------|-----------------|
+| 416×672 | 416×672 | 1.000000 ✅ | 1.000000 ✅ |
+| 720×1280 | 704×1280 | 0.999680 ✅ | 0.999984 ✅ |
+| 1080×1920 | 832×1504 | 0.986983 ❌ | **0.999993** ✅ |
+| 1440×2560 | 832×1504 | 0.958426 ❌ | **0.999996** ✅ |
+
+**关键发现**：①非 AA（`aclnnUpsampleBicubic2d`，torch a=-0.75 Mitchell 无 antialias）在降采样（1080/1440→832）时严重偏离 PIL，闸口失败；②**AA 版本（`aclnnUpsampleBicubic2dAA`，含抗混叠预滤波）rescues P10-B**，降采样从 0.958 拉回 0.999996。③**AA 仅支持 910B**（CANN 商用版产品表：Atlas 推理系列=310P 为 ×，`@domain aclnn_ops_train`），310P 上 AA 不可用。**P10-B 双路径**：910B → `NpuBicubicResizeAA`（4/4 全部 ≥0.99998）；310P → 非 AA（2/4 通过）+ 降采样 case 降级 P10-A CPU 兜底。
+
+修复 wrapper：非 AA + AA 两版均使用 `ACL_FORMAT_ND` + 显式 strides（官方模式）、Execute 后 `aclrtSynchronizeStream`、**不**手动 `aclDestroyAclOpExecutor`。新增 `test_aclnn_bicubic_spike`（level2，4 个 TEST_CASE：非 AA 基线 + AA 闸口 + 全管线精度 + 性能实测）+ gen 脚本生产分辨率 case。审查过程发现并修复 4 BLOCKER（gen 参数错误→闸口翻转 / REFDATA 未登记假阳性 / header 合约不一致 / 死代码）、5 MAJOR（含 sync 热路径声明）、4 MINOR。过程教训 5+1 项（含 solo 开发复发）归并进 `lessons-learned.md` 主题 7 第 0/7–11 条。
+
+**P10-B 工程化完成**：`PreprocessImageNpu` 全 NPU 管线（SmartResize→H2D→AA/非AA Bicubic→3×Elewise normalize broadcast→AsStrided+8维Transpose patch→D2H），goto-cleanup 内存安全，AA 降采样条件守卫（恒等/上采样走非 AA，避免 AA 平滑破坏精度）。全管线精度 bit-exact vs CPU（cos/max_diff 6 位小数一致）。**性能实测 NPU vs P10-A CPU geomean 1.7×**（416×672 2.1× / 720×1280 2.3× / 1080×1920 1.6× / 1440×2560 1.0×）。**Patch NPU 化**（#1，AsStrided stride=0 广播 tp + 8 维 Transpose perm `[2,5,3,6,1,0,4,7]`，全程 device 内零 D2H 往返）使 geomean 从 1.4×→1.7×，1440×2560 从 0.9×→1.0×。#2 跳过恒等 resize 经 A/B 实测证伪放弃（bicubic 核恒等下为单位冲激无平滑）。后续可优化：device tensor 输出 API 彻底消除 D2H（#1 已把 D2H 降到 15MB 一次，但 pixel_values 仍需回 CPU 给调用方）。
 
 ---
 
 ## 3. 待办（按优先级）
 
-### 3.1 ✅ 310P 硬件闭环验证（已通过）
-310P 全量 + benchmark compare 已在真实 310P 复验通过（2026-06-20）：C++ 全量过、裸启动 `./benchmark --mode compare` 不再崩 Transdata（平台检测根治后读 `.env` 的 `ASCEND_PLATFORM=310P`）、human 表正常输出。310P 机器的回归复验步骤：
+### 3.1 🟡 310P 硬件闭环验证（C++ 已通过 / Python fallback 待复验）
+310P C++ 全量 + benchmark compare 已在真实 310P 复验通过（2026-06-20）：C++ 全量过、裸启动 `./benchmark --mode compare` 不再崩 Transdata（平台检测根治后读 `.env` 的 `ASCEND_PLATFORM=310P`）、human 表正常输出。**Python 参考侧 fallback（§2.4 末行）910B 回归通过,但原本在 310P FAIL 的 `test_e2e`/`test_embedder_e2e`/`test_deepstack_integration`/`test_pipeline_trace` 待在 310P 上复验转 PASS**。310P 机器的回归复验步骤：
 1. `git pull` → `grep ASCEND_PLATFORM .env` 为 `310P`
 2. `bash atb_cpp_llm/build_and_test.sh`（全量）
-3. `python atb_python_qwen3vl_embedding/tests/run_all.py`（Python 全量，fallback 生效）
+3. `python atb_python_qwen3vl_embedding/tests/run_all.py`（Python 全量，确认 fallback 生效、cosine ≥ 0.99）
 4. `./atb_cpp_llm/build/benchmark --mode compare`（裸启动即可，自动读 `.env`）
 5. `python atb_cpp_llm/tests/compare_py_cpp.py`（cosine ≥ 0.99）
 
@@ -92,4 +117,19 @@ C++ ATB 全面最快：geomean 领先 Python ATB **1.39×**、领先 Transformer
 | 日期 | 内容 |
 |------|------|
 | 2026-06-18 | 建立本文件作为单一真相源，归并自 architect-assessment §11.1 + audit-fix-plan + test-fix-plan + refactoring-plan §1 |
-| 2026-06-20 | 平台检测根治：`Is310P()`/`Is910B()` 改读 `.env`（抽 `src/utils/dotenv.h`），消除裸启动 benchmark 读不到 `ASCEND_PLATFORM` 静默走 910B 致 310P Transdata 崩溃；加 `aclrtGetSocName()` 启动期自检提醒。benchmark human 表修复：报告函数 `LOG_INFO`→`printf`。310P 真机复验通过（全量 + compare），§3.1 降级为已通过 |
+| 2026-06-18 | 310P 全量结果：C++ 50/50 全过；Python 参考侧撞 ArgMaxWithValue/Conv3d FAIL。根因：transformers 参考在 310P NPU 跑撞不支持算子，C++ 端有 fallback 而 Python `load_tf_ref` 无。修复：`load_tf_ref` 加 NPU→CPU eager probing + `_TFRef` 薄代理，910B 回归 7 文件全 PASS，310P 待复验 |
+| 2026-06-20 | 平台检测根治 + benchmark human 表修复 + 310P 真机复验通过 |
+| 2026-06-21 | 性能优化 Batch 1：异步流水恢复（H1 per-op sync 默认 OFF + H4 deepstack sync 移除 + idx/alpha 缓存 + async D2H sync 补齐）。12–13% e2e 收益，精度无损，Dev→Reviewer→Re-review 闭环 |
+| 2026-06-22 | 性能优化 Batch 2-A：CPU 预处理 PIL 式重写（可分离两阶段卷积 + 系数预算表 + normalize 融合 + patch f 帧去重）。preprocess 4.3–5.0× 加速（657→141ms@1080×1920），cos=1.0 精度无损，Dev→Reviewer→Re-review 闭环 |
+| 2026-06-22 | P10-B 精度 spike：非 AA 降采样 1080/1440→832 vs PIL cos=0.987/0.958 闸口失败 → **aclnnUpsampleBicubic2dAA rescues P10-B**，降采样从 0.958 拉回 0.999996。AA 仅 910B（310P ×）。双路径确立。全程 Developer→Reviewer→Re-review 闭环：4 BLOCKER 修复 + 5 项过程失误归并 lessons（含 solo 复发主题 7 第 0 条）|
+| 2026-06-22 | P10-B 工程化：`PreprocessImageNpu`（6 步 NPU 管线：SmartResize→H2D→AA/非AA Bicubic→3×Elewise normalize→D2H→CPU patch）实现，goto-cleanup 内存安全，AA 降采样条件守卫。全管线精度测试 cos≥0.999（非降采样/非 AA）。性能实测 NPU vs CPU geomean 1.4×（1.7×/1.9×/1.4×/0.9×），1440×2560 退化根因 H2D 开销 |
+| 2026-06-23 | P10-B #1 Patch extraction NPU化：AsStrided(stride=0广播tp)+8维Transpose perm[2,5,3,6,1,0,4,7]+Reshape，全程device内零D2H往返。vs CPU bit-exact。geomean 1.4×→1.7×，1440×2560 0.9×→1.0×。#2 跳过恒等resize A/B实测证伪放弃(bicubic核恒等下单位冲激)。Dev→Reviewer→Re-review闭环 |
+| 2026-06-23 | 路径C：NPU preprocess接入引擎dispatch。PreprocessImageNpu加device tensor重载(跳过D2H)+Internal重构DRY；NpuTensor::Adopt+TensorAllocator::Detach所有权转移原语；ForwardWithTiming激活raw_image分支(device tensor直喂pixels_npu,无H2D)；PREPROCESSED旁路不动(公共契约不变)；StageTimings.preprocess_ms引擎内回填。e2e测试raw_image vs PREPROCESSED embedding cos=0.999956。零BLOCKER/零MAJOR,4 MINOR修复 |
+| 2026-06-23 | 流程纪律：Reviewer探查的BLOCKER/MAJOR必须归档lessons-learned(用户要求)。WORKFLOW §3.3加「审查发现归档纪律」+ lessons主题7第12条元规则 + 路径C Reviewer两条泛化发现归主题8第7/8条(调用方sync空操作/Detach静默no-op) |
+| 2026-06-23 | benchmark 接入路径C:bench模式改 raw_image(引擎内NPU preprocess),compare保留CPU。staged_sum 公平对比 4 分辨率路径C全更优(416 38→54/720 104→161/1080 181→235/1440 247→256ms),preprocess_ms CPU→NPU 降 3.7-59%。e2e 口径迁移(路径C含preprocess、PREPROCESSED不含)经 Reviewer 确认公平。MAJOR(pre_ms cold口径)修+warmup,1440翻转证cold假象。grid_t隐式领域事实归 lessons 主题1第6条 |
+| 2026-06-24 | Python 测试参考 NPU→CPU fallback 合入(cherry-pick fix/python-ref-fallback): `load_tf_ref` 加 eager probing + `_TFRef` 薄代理 + 7 个测试文件 device 透传改写 + bf16 权重 CPU float32 dtype 修复。910B 回归全 PASS,310P 待复验 |
+| 2026-06-24 | max_pixels 对齐官方 Qwen3VLEmbedder(1310720→1843200):embedder 常量 `kQwen3VLEmbeddingMaxPixels=1800*32*32` 覆盖 processor config,`qwen3vl_config.cpp` 删除 max_pixels 读取(do_resize=False 时 config 1310720 不参与 resize)。修 1080/1440 降采样 grid 与官方一致(6944 patches)。新增 `test_aclnn_bicubic_spike` TEST_CASE 4 "PreprocessImageNpu vs official transformers" 硬性 gate,910B 4 分辨率 cos=1.0/0.999924/0.999878/0.999951 全过 0.99。`gen_official_pixel_values.py` 重写为官方真实链(do_resize=False + process_vision_info + per-item 1843200),Reviewer 用真实 `Qwen3VLEmbedder` unbound 方法 + stand-in 做 bit-exact probe 证 4 分辨率 max_diff=0.0(MAJOR-1 解决)。Dev→Reviewer→Re-review 闭环,3 条新教训归 lessons-learned 主题 4/7 |
+| 2026-06-24 | test_text_diagnostics 进程退出 hang 修复:显式 engine.close() + torch.npu.empty_cache() 绕开 NPU teardown 死锁(单跑 598s exit 0,run_all 通过);`run_all.py` 加 TEST_TIMEOUTS per-test 覆盖表给此测试放宽到 900s(它 Test 5 加载完整 transformers fp16 NPU 模型真实需 ~590s) |
+| 2026-06-25 | 测试体系整顿阶段2:新增 `gen_official_embedding.py` + `test_engine_vs_official` official full embedding gate。生成器调用真实 `Qwen3VLEmbedder.process(inputs, normalize=True)`，默认 prompt 不覆盖(`Represent the user's input.`)，tokens 从同一次 `_preprocess_inputs` 捕获，public vs captured chain `max_diff=0`。C++ 侧 910B `IMAGE_AND_TEXT + raw_image` path C 全 engine embedding vs 官方 pooled embedding，4 生产分辨率 cos=0.999882/0.999235/0.999469/0.999690，全过 0.99；310P skip。补齐此前 TC4 只验到 pixel_values 出口的空白 |
+| 2026-06-25 | 测试体系整顿阶段3：新增 `evergreen/testing-architecture.md` + `evergreen/testing-guide-dev.md`，沉淀测试分层、official 真相源、覆盖矩阵、修改类型必跑测试、Reviewer checklist、假阳性自检与 310P limitation；WORKFLOW 增加“测试覆盖矩阵纪律”，强调新增测试必须声明 `(平台 × 分辨率 × 路径 × 参考)` 且区分 `test_engine_vs_official` official gate 与 benchmark compare 自一致性 |
+

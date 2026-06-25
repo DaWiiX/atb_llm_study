@@ -4,7 +4,7 @@ namespace atb_llm {
 
 // ── Per-stage timing breakdown (milliseconds) ─────────────
 struct StageTimings {
-    double preprocess_ms = 0;    // Image preprocessing (CPU)
+    double preprocess_ms = 0;    // Image preprocessing (NPU path C, or 0 if external PREPROCESSED)
     double vision_pos_ms = 0;    // Vision pos_embed + RoPE (CPU + NPU)
     double vision_model_ms = 0;  // Vision model: first_layer + blocks + merger (NPU)
     double text_embed_ms = 0;    // Text embedding lookup + vision injection (CPU)

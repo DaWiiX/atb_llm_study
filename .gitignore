@@ -50,6 +50,10 @@ Thumbs.db
 # Data dumps
 extra-info/data-dump/
 
+# Dev tooling artifacts (local-only, not source)
+fusion_result.json
+pull_req.sh
+
 # Local env (machine-specific paths; copy .env.example to .env to bootstrap)
 .env
 .claude

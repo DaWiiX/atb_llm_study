@@ -136,46 +136,63 @@ void DeepstackFusion::InjectFeatures(NpuTensor& hidden_npu,
     }
 
     auto* alloc = runtime->GetAllocator();
-
     int64_t n = static_cast<int64_t>(positions.size());
 
-    // ── Upload positions as int32 indices ──
-    // (positions upload is left as a future optimization; not in this patch.)
-    std::vector<int32_t> idx_i32(n);
-    for (int64_t i = 0; i < n; i++) {
-        idx_i32[i] = static_cast<int32_t>(positions[i]);
+    // ── alpha=1.0 (4th input to ATB IndexAdd: scalar multiplier on updates) ──
+    // Constant across all injections; upload once and reuse for the lifetime
+    // of this fusion object.
+    if (!alpha_npu_) {
+        alpha_npu_ = AllocNpuFloat16({1});
+        if (!alpha_npu_) {
+            LOG_ERROR("InjectFeatures: alloc alpha_npu failed");
+            return;
+        }
+        uint16_t alpha_fp16 = atb_llm::Fp32ToFp16(1.0f);
+        alloc->CopyToDevice(*alpha_npu_.Get(), &alpha_fp16, sizeof(uint16_t));
     }
-    NpuTensor idx_npu = AllocNpuInt32({n});
-    if (!idx_npu) {
-        LOG_ERROR("InjectFeatures: alloc idx_npu failed");
-        return;
-    }
-    alloc->CopyToDevice(*idx_npu.Get(), idx_i32.data(),
-                        n * sizeof(int32_t));
 
-    // ── Upload alpha=1.0 (4th input to ATB IndexAdd: scalar multiplier on updates) ──
-    NpuTensor alpha_npu = AllocNpuFloat16({1});
-    if (!alpha_npu) {
-        LOG_ERROR("InjectFeatures: alloc alpha_npu failed");
-        return;
+    // ── Upload positions as int32 indices (cached per positions) ──
+    // The 3 injections in a forward share the same image_token_positions, so
+    // upload once and reuse; re-upload only when positions actually change
+    // (e.g. different image size / prompt). Compared by value, not pointer,
+    // so distinct prompts with equal-length but different positions re-upload.
+    if (positions != cached_positions_ || !cached_idx_npu_) {
+        std::vector<int32_t> idx_i32(n);
+        for (int64_t i = 0; i < n; i++) {
+            idx_i32[i] = static_cast<int32_t>(positions[i]);
+        }
+        cached_idx_npu_ = AllocNpuInt32({n});
+        if (!cached_idx_npu_) {
+            LOG_ERROR("InjectFeatures: alloc idx_npu failed");
+            return;
+        }
+        alloc->CopyToDevice(*cached_idx_npu_.Get(), idx_i32.data(),
+                            n * sizeof(int32_t));
+        cached_positions_ = positions;
     }
-    uint16_t alpha_fp16 = atb_llm::Fp32ToFp16(1.0f);
-    alloc->CopyToDevice(*alpha_npu.Get(), &alpha_fp16, sizeof(uint16_t));
 
-    // ── Run IndexAdd ─────────────────────────────────────────
+    // ── Run IndexAdd (async) ────────────────────────────────
     // hidden_npu is both input (var) and output. ATB IndexAdd writes the
     // result back into the SAME buffer as inTensor0, so we list
     // hidden_npu in both inTensors[0] and outTensors[0].
     // ds_feat is already an NPU-resident tensor (produced by the deepstack
     // merger graph in ExtractFeatures), so it is consumed directly without
     // any host→device copy.
+    //
+    // sync=false: IndexAdd runs on the same single ATB stream as the text-layer
+    // graph (producer of hidden_npu) and the merger graph (producer of ds_feat),
+    // so FIFO ordering guarantees both inputs are ready before IndexAdd reads
+    // them. A per-injection sync would drain the stream 3x per forward (layers
+    // 5/11/17) and break the async pipeline (H4); the unconditional sync before
+    // the text FinalNorm D2H covers correctness.
     atb::VariantPack vp;
-    vp.inTensors  = {*hidden_npu.Get(), *idx_npu.Get(), *ds_feat.Get(), *alpha_npu.Get()};
+    vp.inTensors  = {*hidden_npu.Get(), *cached_idx_npu_.Get(),
+                     *ds_feat.Get(), *alpha_npu_.Get()};
     vp.outTensors = {*hidden_npu.Get()};
 
     uint64_t ws_size = 0;
     Status st = ExecuteOperation(inject_op_.get(), vp, runtime, ws_size,
-                                 /*sync=*/true);
+                                 /*sync=*/false);
     if (st != STATUS_OK) {
         LOG_ERROR("InjectFeatures: IndexAdd failed: status %d",
                   static_cast<int>(st));

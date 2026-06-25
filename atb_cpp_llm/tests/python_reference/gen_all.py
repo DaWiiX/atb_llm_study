@@ -26,7 +26,29 @@ HERE = Path(__file__).resolve().parent
 REPO_ROOT = HERE.parent.parent.parent
 
 sys.path.insert(0, str(HERE.parent))
-from _tests_env import ASCEND_PLATFORM  # noqa: E402
+from _tests_env import ASCEND_PLATFORM, OFFICIAL_EMBED_CASES  # noqa: E402
+
+
+def _parse_cases(spec: str):
+    """Parse "416x672,720x1280" -> [(416, 672), (720, 1280)]."""
+    out = []
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        h_str, _, w_str = part.partition("x")
+        if not h_str or not w_str:
+            raise ValueError(f"Invalid resolution spec: {part!r}")
+        out.append((int(h_str), int(w_str)))
+    return out
+
+
+_OFFICIAL_CASES = _parse_cases(OFFICIAL_EMBED_CASES)
+# Sentinel: first resolution's embedding output is the representative file.
+_OFFICIAL_SENTINELS = []
+if _OFFICIAL_CASES:
+    _h0, _w0 = _OFFICIAL_CASES[0]
+    _OFFICIAL_SENTINELS.append(f"/tmp/official_embed_mm_{_h0}x{_w0}.bin")
 
 # Generator → list of sentinel files it produces (used by --skip-fresh).
 # We only check one or two representative paths per generator; if those are
@@ -34,10 +56,12 @@ from _tests_env import ASCEND_PLATFORM  # noqa: E402
 # rebuild from scratch.
 GENERATORS = [
     ("gen_cpu_reference.py",          ["/tmp/cpu_op_rms_norm_medium_input.bin", "/tmp/cpu_vision_merger_main_x.bin"]),
+    ("gen_official_pixel_values.py",  ["/tmp/official_pv_prod_416x672.bin"]),
     ("gen_stage_reference.py",        ["/tmp/stage_L0_pixel_values.bin", "/tmp/stage_L3_rope_sin.bin"]),
     ("test_stage_reference.py",       ["/tmp/stage_pixels.bin", "/tmp/stage_final_text_only.bin"]),
     ("gen_pos_embed_npu_reference.py", ["/tmp/posembed_npu_case_tiny_4x4.bin"]),
     ("gen_vis_rope_npu_reference.py",  ["/tmp/visrope_npu_case_tiny_4x4.bin"]),
+    ("gen_official_embedding.py",      _OFFICIAL_SENTINELS),
 ]
 
 
