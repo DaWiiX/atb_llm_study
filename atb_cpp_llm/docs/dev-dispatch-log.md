@@ -4,7 +4,52 @@
 >
 > 记录纪律见 [WORKFLOW.md](./WORKFLOW.md) §5.1。Reviewer 发现归档进 [lessons-learned.md](./lessons-learned.md)（§3.3 审查发现归档纪律）。
 
----
+## 2026-06-25 ｜ OFFICIAL_EMBED_CASES 统一 official embedding case 选择 ｜ Developer
+
+**派法**：
+- 角色：Developer。在 `.env` 新增 `OFFICIAL_EMBED_CASES` 配置项，统一 generator / C++ gate / gen_all sentinels / build_and_test sentinels 的 case 选择。
+- 工作范围：`.env.example`、`atb_python_qwen3vl_embedding/env.py`、`atb_cpp_llm/tests/_tests_env.py`、`gen_official_embedding.py`、`test_engine_vs_official.cpp`、`gen_all.py`、`build_and_test.sh`。
+- 关键约束：不引入 small/auto/profile —— 用户直接编辑 `.env` 里的逗号列表；`test_engine_vs_official` 不再整测 skip 310P；不降阈值。
+- 验收：python -m py_compile 全通过、build_and_test C++ test_engine_vs_official 编译通过、git diff --check 通过。
+
+**结果**：
+- `.env.example`：新增 `OFFICIAL_EMBED_CASES=416x672,720x1280,1080x1920,1440x2560`；修 `QWEN3VL_EMB_SRC` 模板语义为 repo root。
+- `env.py`：新增 `OFFICIAL_EMBED_CASES` 默认四个；修 `QWEN3VL_EMB_SRC` 注释。
+- `_tests_env.py`：re-export `OFFICIAL_EMBED_CASES`。
+- `gen_official_embedding.py`：新增 `parse_cases()` 解析逗号分隔 HxW；`main()` 按 `OFFICIAL_EMBED_CASES` 控制 case；保留 NPU first/CPU fallback；保留 `resolve_official_src()` 兼容 root/src。
+- `test_engine_vs_official.cpp`：删除 `if (!Is910B()) return 0;`；改用 `GetEnv("OFFICIAL_EMBED_CASES", ...)` + `std::istringstream` 动态 case；编译通过。
+- `gen_all.py`：`--skip-fresh` 的 official embedding sentinel 按 `OFFICIAL_EMBED_CASES` 展开首个 case；新增 `_parse_cases()`。
+- `build_and_test.sh`：官方 embedding/token sentinel 按 `${OFFICIAL_EMBED_CASES}` 展开。
+- 已有改动保留：`data_utils.empty_npu_cache_safe()`、test_e2e/test_embedder_e2e safe cleanup、test_stage_reference TEXT_ONLY fallback、visrope 注释、docs。
+- 全 16 文件 diff，py_compile 全通过，git diff --check 通过，C++ 编译通过。
+- 遗留：需 910B/310P 真机复测确认 `OFFICIAL_EMBED_CASES=416x672,720x1280` 行为。
+
+## 2026-06-25 ｜ OFFICIAL_EMBED_CASES Reviewer 修复 ｜ Re-review
+
+**结果**：全部修复通过，闭环。
+
+- BLOCKER-1 ✅ `test_engine_vs_official.cpp`: 增加 `if (cases.empty()) { LOG_ERROR; return 1; }` 守卫空 case 列表假阳性。
+- MAJOR-1 ✅ `gen_official_embedding.py:parse_cases()`: 移除 bracket 剥离 `strip('[]')`，统一为纯 `HxW,HxW` 格式。docstring 同步移除 bracket 示例。
+- MAJOR-3 ✅ `test_engine_vs_official.cpp`: 无效 token 改为 `LOG_WARN` + skip，不再静默丢弃。
+- MAJOR-4 ✅ `testing-guide-dev.md`: "CPU fallback 只生成 416/720" 改为 "CPU fallback 也按 OFFICIAL_EMBED_CASES 生成；310P 用户应自行在 .env 中只保留 416x672,720x1280"。
+- py_compile 通过、git diff --check 通过。
+- 遗留：C++ 构建需在 NPU 环境验证（当前环境无 CANN 工具链）。
+- lessons-learned 追加 #15 空 case 守卫、#16 跨语言解析一致两条教训。
+
+
+## 2026-06-25 ｜ 310P official reference fallback + 配置模板修复 ｜ Developer
+
+**派法**：
+- 角色：Developer。修 310P 上 `gen_official_embedding.py` 的 official reference 生成失败：先修 `.env` 模板 root/src 误导，再给官方 `Qwen3VLEmbedder` NPU→CPU fallback，顺手同步核心 transformers reference cleanup 和测试语义文档。
+- 工作范围：`.env.example`、`atb_python_qwen3vl_embedding/env.py`、`atb_cpp_llm/tests/python_reference/gen_official_embedding.py`、`atb_python_qwen3vl_embedding/tests/data_utils.py`、`test_e2e.py`、`test_embedder_e2e.py`、`test_stage_reference.py`、visrope 注释、testing guide、lessons。
+- 关键约束：official reference 不是 910B-only；不能把 310P official gate skip 当最终目标；不改生产 preprocess/算子逻辑，不降阈值。
+
+**结果**：
+- 修正 `QWEN3VL_EMB_SRC` 模板语义为官方 repo root，并在 official embedding generator 中兼容 repo root / src 两种输入。
+- `gen_official_embedding.py` 改为优先 official NPU，遇到 310P unsupported op 后 fallback official CPU float32；支持 `OFFICIAL_EMBED_FORCE_CPU=1` 强制验证 fallback。后续改为由 `.env` 的 `OFFICIAL_EMBED_CASES` 控制生成哪些分辨率（不再硬编码 CPU fallback 只生成 416/720）。
+- 核心 TF reference 测试改用 safe NPU cache cleanup 并打印实际 ref device/dtype；`test_stage_reference.py` 在 engine 初始化失败时仍可生成 TEXT_ONLY transformers CPU reference。
+- `896x896` visrope case 标注为 Level2 op stress grid，避免误认为 production/e2e resolution。
+- lessons 追加 official reference 全平台原则和 `.env` root/src 语义教训。
 
 ## 2026-06-25 ｜ 测试体系整顿 阶段3 testing-guide 文档 ｜ Developer
 

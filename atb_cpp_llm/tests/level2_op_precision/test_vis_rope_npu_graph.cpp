@@ -255,6 +255,10 @@ void RunCase(const std::string& tag) {
 // Stage A: host-only index/freq_table builder regression (no NPU needed)
 // ═════════════════════════════════════════════════════════════════════
 
+// These are Level-2 op precision/stress cases, not the benchmark/e2e
+// production resolution matrix. "896x896" is a synthetic square stress grid
+// (T=2,H=W=56) used to exercise larger row/col gather and cos/sin outputs.
+
 TEST_CASE("VisRopeNPU StageA: tiny_4x4") { TestStageA("tiny_4x4"); }
 TEST_CASE("VisRopeNPU StageA: t1_8x8")   { TestStageA("t1_8x8"); }
 TEST_CASE("VisRopeNPU StageA: 224x224")  { TestStageA("224x224"); }

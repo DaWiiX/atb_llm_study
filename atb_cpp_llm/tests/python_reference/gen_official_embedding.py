@@ -13,33 +13,106 @@ as the embedding, so the C++ IMAGE_AND_TEXT request uses byte-identical text/cha
 template input. The default instruction is intentionally not overridden: the
 official default is "Represent the user's input.".
 """
+import contextlib
 import os
 import sys
 from pathlib import Path
 
 import numpy as np
 import torch
-import torch_npu  # noqa: F401 — registers the NPU backend
-import torch_npu.contrib.transfer_to_npu  # noqa: F401 — maps official cuda device to npu
 import torch.nn.functional as F
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))  # tests/ -> _tests_env
-from _tests_env import MODEL_DIR, QWEN3VL_EMB_SRC, TRANSFORMERS_SRC  # noqa: E402
+from _tests_env import (  # noqa: E402
+    MODEL_DIR,
+    OFFICIAL_EMBED_CASES,
+    QWEN3VL_EMB_SRC,
+    TRANSFORMERS_SRC,
+)
 
 if TRANSFORMERS_SRC:
     sys.path.insert(0, TRANSFORMERS_SRC)
 
-OFFICIAL_MODEL_SRC = Path(QWEN3VL_EMB_SRC or "/mnt/workspace/gitCode/Qwen3-VL-Embedding")
-OFFICIAL_SRC = OFFICIAL_MODEL_SRC / "src"
+
+def resolve_official_src(path_value: str) -> Path:
+    """Resolve QWEN3VL_EMB_SRC as either repo root or its src/ directory."""
+    base = Path(path_value or "/mnt/workspace/gitCode/Qwen3-VL-Embedding").expanduser().resolve()
+    direct = base / "models" / "qwen3_vl_embedding.py"
+    nested = base / "src" / "models" / "qwen3_vl_embedding.py"
+    if direct.is_file():
+        return base
+    if nested.is_file():
+        return base / "src"
+    raise RuntimeError(
+        "Cannot locate official Qwen3-VL-Embedding source. Set QWEN3VL_EMB_SRC "
+        "to either the repo root or its src directory. "
+        f"Got: {base}; checked {direct} and {nested}")
+
+
+OFFICIAL_SRC = resolve_official_src(QWEN3VL_EMB_SRC)
 if str(OFFICIAL_SRC) not in sys.path:
     sys.path.insert(0, str(OFFICIAL_SRC))
 
 from models.qwen3_vl_embedding import Qwen3VLEmbedder, MAX_PIXELS, MIN_PIXELS  # noqa: E402
 
 OUTPUT_DIR = "/tmp"
-PROD_CASES = [(416, 672), (720, 1280), (1080, 1920), (1440, 2560)]
 EXPECTED_DEFAULT_INSTRUCTION = "Represent the user's input."
+
+
+@contextlib.contextmanager
+def force_cuda_unavailable(enabled: bool):
+    """Temporarily force official code to choose CPU instead of cuda/NPU."""
+    if not enabled:
+        yield
+        return
+    orig = torch.cuda.is_available
+    torch.cuda.is_available = lambda: False
+    try:
+        yield
+    finally:
+        torch.cuda.is_available = orig
+
+
+def empty_npu_cache_safe() -> None:
+    try:
+        if hasattr(torch, "npu") and torch.npu.is_available():
+            torch.npu.empty_cache()
+    except Exception:
+        pass
+
+
+def enable_npu_cuda_mapping() -> None:
+    """Import torch_npu transfer shim lazily so CPU fallback can avoid it."""
+    import torch_npu  # noqa: F401 — registers the NPU backend
+    import torch_npu.contrib.transfer_to_npu  # noqa: F401 — maps official cuda device to npu
+
+
+def parse_cases(value: str):
+    """Parse OFFICIAL_EMBED_CASES as a comma-separated HxW list.
+
+    Accepts forms like:
+      416x672,720x1280
+    """
+    raw = (value or "").strip()
+    if not raw:
+        raw = "416x672,720x1280,1080x1920,1440x2560"
+
+    out = []
+    for item in raw.split(','):
+        item = item.strip()
+        if not item:
+            continue
+        if 'x' not in item:
+            raise ValueError(
+                f"Invalid OFFICIAL_EMBED_CASES item {item!r}; expected HxW, e.g. 416x672")
+        h_s, w_s = item.lower().split('x', 1)
+        case = (int(h_s), int(w_s))
+        if case not in out:
+            out.append(case)
+    if not out:
+        raise ValueError("OFFICIAL_EMBED_CASES resolved to an empty case list")
+    return out
 
 
 def read_shared_input_bin(h: int, w: int) -> np.ndarray:
@@ -113,14 +186,16 @@ def pooled_embedding_from_processed(embedder: Qwen3VLEmbedder, processed_inputs)
     return F.normalize(emb, p=2, dim=-1)
 
 
-def main() -> None:
-    print("[gen] official full embedding reference (real Qwen3VLEmbedder)")
-    print(f"  official src: {OFFICIAL_SRC}")
-    print(f"  model dir:    {MODEL_DIR}")
-    print(f"  default prompt: {EXPECTED_DEFAULT_INSTRUCTION!r} (not overridden)")
-    print(f"  max_pixels={MAX_PIXELS} min_pixels={MIN_PIXELS}")
+def build_embedder(backend: str) -> Qwen3VLEmbedder:
+    with force_cuda_unavailable(backend == "official-cpu"):
+        embedder = Qwen3VLEmbedder(MODEL_DIR)
+    if backend == "official-cpu":
+        embedder.model.to(torch.device("cpu"))
+        embedder.model.float()
+    return embedder
 
-    embedder = Qwen3VLEmbedder(MODEL_DIR)
+
+def validate_embedder(embedder: Qwen3VLEmbedder) -> None:
     if embedder.default_instruction != EXPECTED_DEFAULT_INSTRUCTION:
         raise RuntimeError(
             f"Official default instruction changed: {embedder.default_instruction!r} "
@@ -128,41 +203,86 @@ def main() -> None:
     if embedder.max_pixels != 1800 * 32 * 32:
         raise RuntimeError(f"Unexpected official max_pixels={embedder.max_pixels}")
 
-    for h, w in PROD_CASES:
-        pil = image_from_array(read_shared_input_bin(h, w))
-        public_inputs = [{"image": pil}]
 
-        # Public API reference: this is the official embedding gate target. The
-        # wrapper captures input_ids from the same preprocess call inside process().
-        public_emb, processed = run_public_process_capture(embedder, public_inputs)
+def run_case(embedder: Qwen3VLEmbedder, h: int, w: int, backend: str) -> None:
+    pil = image_from_array(read_shared_input_bin(h, w))
+    public_inputs = [{"image": pil}]
 
-        # Re-run only forward/pooling from the captured official preprocessed inputs
-        # to prove the saved embedding and saved tokens are the same conversation.
-        internal_emb = pooled_embedding_from_processed(embedder, processed)
+    # Public API reference: this is the official embedding gate target. The
+    # wrapper captures input_ids from the same preprocess call inside process().
+    public_emb, processed = run_public_process_capture(embedder, public_inputs)
 
-        max_diff = (public_emb - internal_emb).abs().max().item()
-        if max_diff > 1e-6:
-            raise RuntimeError(
-                f"Public process() and explicit official chain diverged for {h}x{w}: "
-                f"max_diff={max_diff:.6e}")
+    # Re-run only forward/pooling from the captured official preprocessed inputs
+    # to prove the saved embedding and saved tokens are the same conversation.
+    internal_emb = pooled_embedding_from_processed(embedder, processed)
 
-        input_ids = processed["input_ids"].detach().cpu().numpy().reshape(-1)
-        image_token_count = int((input_ids == embedder.model.config.image_token_id).sum())
-        grid_thw = processed.get("image_grid_thw")
-        grid_list = grid_thw.detach().cpu().tolist() if grid_thw is not None else None
+    max_diff = (public_emb - internal_emb).abs().max().item()
+    if max_diff > 1e-6:
+        raise RuntimeError(
+            f"Public process() and explicit official chain diverged for {h}x{w}: "
+            f"max_diff={max_diff:.6e}")
 
-        emb_np = public_emb.detach().cpu().numpy().astype(np.float32).reshape(-1)
-        embed_path = f"{OUTPUT_DIR}/official_embed_mm_{h}x{w}.bin"
-        token_path = f"{OUTPUT_DIR}/official_tokens_mm_{h}x{w}.bin"
-        write_embedding(embed_path, emb_np)
-        write_tokens(token_path, input_ids)
+    input_ids = processed["input_ids"].detach().cpu().numpy().reshape(-1)
+    image_token_count = int((input_ids == embedder.model.config.image_token_id).sum())
+    grid_thw = processed.get("image_grid_thw")
+    grid_list = grid_thw.detach().cpu().tolist() if grid_thw is not None else None
 
-        print(
-            f"  -> {h}x{w}: dim={emb_np.size} tokens={input_ids.size} "
-            f"image_tokens={image_token_count} grid={grid_list} "
-            f"public_vs_internal_max_diff={max_diff:.3e}")
-        print(f"     {embed_path}")
-        print(f"     {token_path}")
+    emb_np = public_emb.detach().cpu().numpy().astype(np.float32).reshape(-1)
+    embed_path = f"{OUTPUT_DIR}/official_embed_mm_{h}x{w}.bin"
+    token_path = f"{OUTPUT_DIR}/official_tokens_mm_{h}x{w}.bin"
+    write_embedding(embed_path, emb_np)
+    write_tokens(token_path, input_ids)
+
+    print(
+        f"  -> {h}x{w}: backend={backend} dim={emb_np.size} tokens={input_ids.size} "
+        f"image_tokens={image_token_count} grid={grid_list} "
+        f"public_vs_internal_max_diff={max_diff:.3e}")
+    print(f"     {embed_path}")
+    print(f"     {token_path}")
+
+
+def run_all_cases(backend: str) -> None:
+    if backend == "official-npu":
+        enable_npu_cuda_mapping()
+    embedder = build_embedder("official-cpu" if backend == "official-cpu-fallback" else backend)
+    validate_embedder(embedder)
+    cases = parse_cases(OFFICIAL_EMBED_CASES)
+    print(f"[gen] OFFICIAL_EMBED_CASES={OFFICIAL_EMBED_CASES!r} -> {cases}")
+    try:
+        for h, w in cases:
+            run_case(embedder, h, w, backend)
+    finally:
+        del embedder
+        if backend == "official-npu":
+            empty_npu_cache_safe()
+
+
+def main() -> None:
+    print("[gen] official full embedding reference (real Qwen3VLEmbedder)")
+    print(f"  official src: {OFFICIAL_SRC}")
+    print(f"  model dir:    {MODEL_DIR}")
+    print(f"  default prompt: {EXPECTED_DEFAULT_INSTRUCTION!r} (not overridden)")
+    print(f"  max_pixels={MAX_PIXELS} min_pixels={MIN_PIXELS}")
+
+    force_cpu = os.environ.get("OFFICIAL_EMBED_FORCE_CPU") == "1"
+    no_cpu_fallback = os.environ.get("OFFICIAL_EMBED_NO_CPU_FALLBACK") == "1"
+
+    if force_cpu:
+        print("[gen] OFFICIAL_EMBED_FORCE_CPU=1 — using CPU float32 official reference.")
+        run_all_cases("official-cpu-fallback")
+        print("[gen] official full embedding reference done.")
+        return
+
+    try:
+        print("[gen] Trying backend=official-npu")
+        run_all_cases("official-npu")
+    except (RuntimeError, OSError, ValueError) as e:
+        if no_cpu_fallback:
+            raise
+        print(f"[gen] NPU official Qwen3VLEmbedder failed ({type(e).__name__}: {e}); "
+              "falling back to CPU float32 official reference.")
+        empty_npu_cache_safe()
+        run_all_cases("official-cpu-fallback")
 
     print("[gen] official full embedding reference done.")
 

@@ -32,6 +32,7 @@ from atb_python_qwen3vl_embedding.engine import Qwen3VLEngine
 from atb_python_qwen3vl_embedding.env import QWEN3VL_EMB_MODEL_DIR
 from atb_python_qwen3vl_embedding.tests.data_utils import (
     cosine,
+    empty_npu_cache_safe,
     load_tf_ref,
     pool_and_normalize,
 )
@@ -104,7 +105,7 @@ def run_tf_embed(model_dir: str, processor, cases) -> dict:
     """Run TF model + pool_and_normalize for each case."""
     print("\n[TF] Loading transformers reference ...")
     model = load_tf_ref(model_dir)
-    print("[TF] Loaded")
+    print(f"[TF] Loaded on {model.device} dtype={model.dtype}")
 
     results = {}
     for name, img, txt in cases:
@@ -135,7 +136,7 @@ def run_tf_embed(model_dir: str, processor, cases) -> dict:
         print(f"[TF]  {name:<12} → {tuple(emb.shape)}")
 
     del model
-    torch.npu.empty_cache()
+    empty_npu_cache_safe()
     return results
 
 

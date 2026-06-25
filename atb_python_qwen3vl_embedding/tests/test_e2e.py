@@ -41,7 +41,7 @@ from PIL import Image
 
 from atb_python_qwen3vl_embedding.engine import Qwen3VLEngine
 from atb_python_qwen3vl_embedding.env import QWEN3VL_EMB_MODEL_DIR
-from atb_python_qwen3vl_embedding.tests.data_utils import load_tf_ref
+from atb_python_qwen3vl_embedding.tests.data_utils import load_tf_ref, empty_npu_cache_safe
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -156,7 +156,7 @@ def run_tf_phase(model_dir: str, inputs_all):
     """Load TF ref and run forward per case, return dict[name] = hidden CPU fp32."""
     print("\n[TF] Loading transformers reference ...")
     ref = load_tf_ref(model_dir)
-    print("[TF] Loaded")
+    print(f"[TF] Loaded on {ref.device} dtype={ref.dtype}")
 
     results = {}
     tf_ds_feats = {}  # name → list of CPU deepstack feature tensors
@@ -186,7 +186,7 @@ def run_tf_phase(model_dir: str, inputs_all):
                           f"deepstack features: {[tuple(d.shape) for d in tf_ds_feats[name]]}")
 
     del ref
-    torch.npu.empty_cache()
+    empty_npu_cache_safe()
     return results, tf_ds_feats
 
 

@@ -102,6 +102,8 @@ def _compute_text_only_atb(engine, input_ids):
     Returns: (embedding: np.ndarray, method: str)
     Raises on failure.
     """
+    if engine is None:
+        raise RuntimeError("ATB engine is not available")
     result_t = engine.encode(input_ids, normalize=True)
     return result_t.flatten().float().numpy(), "ATB engine"
 
@@ -253,31 +255,15 @@ def main():
     print("\n  [TEXT_ONLY]")
     input_ids_t = torch.tensor([[151643, 15339, 1879]], dtype=torch.long)
     text_only_ok = False
-    if engine_ok:
-        try:
-            result_t = engine.encode(input_ids_t, normalize=True)
-            emb_t = result_t.flatten().float().numpy()
-            save_float32("/tmp/stage_final_text_only.bin", emb_t)
-            print(f"  ✓ ATB engine: shape={emb_t.shape}, first 8: {emb_t[:8].tolist()}")
-            text_only_ok = True
-        except RuntimeError as e:
-            failed_stages.append("Stage 6 TEXT_ONLY (ATB)")
-            print(f"  ✗ ATB engine FAILED: {e}")
-            print(f"  → Falling back to transformers CPU reference...")
-
-            # Fallback: transformers reference directly (don't retry ATB)
-            try:
-                emb_t, _ = _compute_text_only_transformers(MODEL_DIR, input_ids_t)
-                save_float32("/tmp/stage_final_text_only.bin", emb_t)
-                print(f"  ✓ transformers (CPU fallback): shape={emb_t.shape}, "
-                      f"first 8: {emb_t[:8].tolist()}")
-                text_only_ok = True
-            except (RuntimeError, OSError, ValueError) as e2:
-                failed_stages.append("Stage 6 TEXT_ONLY (fallback)")
-                print(f"  ✗ Fallback also FAILED: {e2}")
+    engine_for_text = engine if engine_ok else None
+    emb_t, method, err = compute_text_only_reference(MODEL_DIR, engine_for_text, input_ids_t)
+    if emb_t is not None:
+        save_float32("/tmp/stage_final_text_only.bin", emb_t)
+        print(f"  ✓ {method}: shape={emb_t.shape}, first 8: {emb_t[:8].tolist()}")
+        text_only_ok = True
     else:
-        print("  ⊘ TEXT_ONLY SKIPPED (engine not available)")
         failed_stages.append("Stage 6 TEXT_ONLY")
+        print(f"  ✗ TEXT_ONLY FAILED: {err}")
 
     # ── IMAGE_ONLY (no fallback — too complex for CPU-only) ───
     print("\n  [IMAGE_ONLY]")

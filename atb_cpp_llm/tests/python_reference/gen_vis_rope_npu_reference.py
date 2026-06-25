@@ -155,6 +155,9 @@ def main():
     # vis_hidden_size=1024, vis_num_heads=16  →  head_dim=64
     VIS_HEAD_DIM = 64
 
+    # Level-2 op precision/stress cases for the Vision RoPE NPU graph.
+    # Tags such as "896x896" describe synthetic grid coverage (T=2,H=W=56),
+    # not the production/e2e resolution matrix used by official embedding gates.
     cases = [
         ("tiny_4x4",  torch.tensor([[1,  4,  4]],  dtype=torch.long)),
         ("t1_8x8",    torch.tensor([[1,  8,  8]],  dtype=torch.long)),

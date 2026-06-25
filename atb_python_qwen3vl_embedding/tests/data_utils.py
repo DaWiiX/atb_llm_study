@@ -29,6 +29,15 @@ def ms(seconds_list) -> np.ndarray:
     return np.asarray(seconds_list) * 1000.0
 
 
+def empty_npu_cache_safe() -> None:
+    """Best-effort NPU cache cleanup that is safe after CPU fallback."""
+    try:
+        if torch.npu.is_available():
+            torch.npu.empty_cache()
+    except Exception:
+        pass
+
+
 # ═══════════════════════════════════════════════════════════════════
 # Similarity / pooling
 # ═══════════════════════════════════════════════════════════════════

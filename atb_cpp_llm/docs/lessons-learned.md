@@ -116,6 +116,21 @@
 11. **【2026-06-25 testing-guide 沉淀】测试文档必须区分 official gate / self-consistency / diagnostic**
    阶段0–2 暴露的核心盲区不是“没有测试”，而是测试语义被混用：`benchmark --mode compare`、`test_accuracy`、path C 自比对能证明跨语言或路径一致，却不能证明 vs official；diagnostic 只打印 cosine 更不能当 gate。阶段3把这条纪律沉淀到 `evergreen/testing-architecture.md` 和 `evergreen/testing-guide-dev.md`：新增测试必须声明 `(平台 × 分辨率 × 路径 × 参考)`，写清是否 vs official，gate 必须退码，diagnostic 必须标 `not gated`。— testing-guide 阶段3
 
+12. **【2026-06-25 build_and_test.sh 定位补漏】总入口脚本的语义必须写进 testing guide，不能只把底层命令散列出来**
+   阶段3 testing guide 只列了 official gate、C++ 全量、benchmark 等命令，但没有解释 `build_and_test.sh` 的入口语义、refdata 三态和 fallback 风险，导致后来需要追问“它还重要吗”。根因是写文档时按“测试类型”组织，却没有按“开发者实际入口”组织；把脚本头部已有说明当作足够，忽略了 guide 才是开发者查验收路径的第一入口。**规则**：凡是有总入口脚本（build/test/deploy/benchmark driver），testing guide 必须明确写 4 件事：①它覆盖什么；②不覆盖什么；③常用模式；④什么日志意味着不是完整通过。尤其 `build_and_test.sh` 出现 `Falling back to --no-refdata` 或 `Excluding ... needs_refdata` 时，不能把最后的 PASS 解读为完整 C++ 全量 PASS。— build_and_test.sh guide 补漏
+
+13. **【2026-06-25 official reference fallback】official reference 不是平台专属，平台 skip 只能是待修 gap**
+   看到 `test_engine_vs_official` 在 310P skip，就把 `gen_official_embedding.py` 也误判成 910B-only，这是把“当前被测实现过不了”错误外推到“官方真相源不适用”。官方 `Qwen3VLEmbedder` reference 是全平台目标；如果 torch_npu 官方链在 310P 撞不支持算子，应 fallback 到 CPU 官方链生成 golden refdata，而不是跳过 reference。**规则**：平台限制只能体现在被测 C++ 实现是否达标，不能削弱 official reference；任何 `skip` 必须写成 tracked gap，最终目标仍是全平台 vs official cosine ≥ 0.99。— 310P official embedding generator 事件
+
+14. **【2026-06-25 .env template root/src】配置变量语义必须与消费代码一致，并在脚本侧校验**
+   `.env.example` 把 `QWEN3VL_EMB_SRC` 写成 `/path/to/Qwen3-VL-Embedding/src`，但 `gen_official_embedding.py` 又对该值追加 `/src`，导致用户按模板配置后变成 `/src/src` 并报 `ModuleNotFoundError: No module named 'models'`。这是模板和消费代码语义漂移，不是用户环境问题。**规则**：路径型 env var 必须明确是 repo root 还是 import root；模板、`env.py` 注释、消费脚本三处一致；脚本应打印最终解析路径并接受/校验常见输入，错误要指向配置语义而不是裸 import failure。— 310P official embedding generator 事件
+
+15. **【2026-06-25 Reviewer BLOCKER-1】gate 测试必须守卫空 case 列表，防止假阳性**
+   用户可能误配 `OFFICIAL_EMBED_CASES` 为空（如全空白、纯括号），导致 C++ gate 的 for 循环 0 次执行，failures=0 并打印 PASS——CTest 将其视为真 PASS，但实际没有测试任何 embedding。Python 侧 `parse_cases()` 有显式空列表检查抛出 `ValueError`，C++ 侧的等效守卫必须同步存在。**规则**：任何从用户配置解析 case 列表的 gate，必须在循环前显式检查列表非空，空列表就是 FAIL。— OFFICIAL_EMBED_CASES Reviewer
+
+16. **【2026-06-25 Reviewer MAJOR 1/2/3】跨语言（Python/Shell/C++）的配置解析必须格式一致且无效值必须告警**
+   `OFFICIAL_EMBED_CASES` 被 Python gen/Shell sentinel/C++ gate 三处独立解析，其中 bracket 剥离逻辑不一致会导致某处崩溃而别处通过。C++ 侧对不含 `x` 的 token 静默跳过无日志，用户不会知道某 case 被排除。**规则**：同一个配置项在多种语言中独立解析时，必须约定且文档化唯一格式（如 `HxW,HxW` 不含括号），且无效 token 必须 emit 日志（至少 WARN）。— OFFICIAL_EMBED_CASES Reviewer
+
 ---
 
 ## 主题 5：构建与 CMake

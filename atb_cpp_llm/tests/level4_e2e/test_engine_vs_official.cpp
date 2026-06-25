@@ -13,7 +13,7 @@
 #include "atb_llm/engine.h"
 #include "adapters/qwen3vl_embedding/qwen3vl_config.h"
 #include "adapters/qwen3vl_embedding/qwen3vl_preprocess.h"
-#include "utils/cpp11_compat.h"  // Is910B
+#include "utils/dotenv.h"
 #include "utils/float_utils.h"
 #include "log/logger.h"
 #include "test_env.h"
@@ -22,6 +22,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -157,12 +158,6 @@ int main(int argc, char** argv) {
     (void)argc;
     (void)argv;
 
-    if (!atb_llm::Is910B()) {
-        LOG_INFO("[OFFICIAL EMBED GATE] skipped on 310P — AA downsample path "
-                 "unavailable; non-AA vs official AA breaks 0.99 by design.");
-        return 0;
-    }
-
     if (MODEL_DIR.empty()) {
         std::fprintf(stderr,
             "QWEN3VL_EMB_MODEL_DIR is not set. Source .env via build_and_test.sh "
@@ -189,12 +184,36 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    struct Case { int32_t h; int32_t w; } cases[] = {
-        {416, 672},
-        {720, 1280},
-        {1080, 1920},
-        {1440, 2560},
-    };
+    struct Case { int32_t h; int32_t w; };
+    std::vector<Case> cases;
+    {
+        std::string cases_str = GetEnv("OFFICIAL_EMBED_CASES", "416x672,720x1280,1080x1920,1440x2560");
+        std::istringstream iss(cases_str);
+        std::string token;
+        while (std::getline(iss, token, ',')) {
+            // Trim whitespace and brackets
+            size_t start = 0;
+            while (start < token.size() &&
+                   (token[start] == ' ' || token[start] == '\t' || token[start] == '['))
+                start++;
+            size_t end = token.size();
+            while (end > start &&
+                   (token[end - 1] == ' ' || token[end - 1] == '\t' || token[end - 1] == ']'))
+                end--;
+            token = token.substr(start, end - start);
+            if (token.empty()) continue;
+            size_t xpos = token.find('x');
+            if (xpos == std::string::npos) { LOG_WARN("[OFFICIAL EMBED GATE] skipping invalid token '%s' (no 'x' separator)", token.c_str()); continue; }
+            int32_t h = std::stoi(token.substr(0, xpos));
+            int32_t w = std::stoi(token.substr(xpos + 1));
+            cases.push_back({h, w});
+        }
+    }
+
+    if (cases.empty()) {
+        LOG_ERROR("[OFFICIAL EMBED GATE] FAIL: OFFICIAL_EMBED_CASES resolved to an empty case list");
+        return 1;
+    }
 
     int failures = 0;
     for (const auto& c : cases) {
@@ -296,6 +315,6 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    LOG_INFO("[OFFICIAL EMBED GATE] PASS: all 910B path C embeddings cos >= %.2f", kCosThreshold);
+    LOG_INFO("[OFFICIAL EMBED GATE] PASS: all path C embeddings cos >= %.2f", kCosThreshold);
     return 0;
 }

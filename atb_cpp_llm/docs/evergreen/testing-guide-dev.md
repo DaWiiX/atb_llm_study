@@ -1,6 +1,6 @@
 # Testing Guide for Developers
 
-> 面向 Developer 的实操手册。目标是让每次改动都能明确回答：这次验证的是 **official gate**、跨语言 self-consistency，还是 diagnostic？
+> 面向 C++ Developer 的实操手册。目标是让每次 C++ 改动都能明确回答：这次验证的是 **official gate**、C++ 自一致性，还是 diagnostic？
 
 ---
 
@@ -11,8 +11,8 @@
    - 当前核心 gate：`test_engine_vs_official`，验证 910B path C raw image full engine embedding vs 官方 pooled embedding。
    - preprocess 官方 gate：`test_aclnn_bicubic_spike` TC4，验证 NPU pixel_values vs official pixel_values。
 
-2. **`benchmark --mode compare` 只是跨语言一致性/性能 compare，不是 vs official**。
-   - compare 路径保留 CPU/Python 自家链，用于 C++/Python 输出一致、性能对比、二进制冒烟。
+2. **`benchmark --mode compare` 只是 C++ benchmark 输出链冒烟，不是 vs official**。
+   - compare mode 可用于确认 C++ 侧 bin/pixel_values 输出路径可用。
    - 它不能证明 C++ 与官方 `Qwen3VLEmbedder` 对齐。
 
 3. **所有精度 gate 必须硬性退码**。
@@ -20,9 +20,15 @@
    - 只打印 `LOG_ERROR` / `LOG_INFO` 不算 gate。
    - diagnostic 可以不退码，但必须显式标注 `not gated`。
 
-4. **310P limitation 必须诚实标注**。
-   - 910B AA 路径可对齐 official full gate。
-   - 310P 上 AA 不可用，official full gate 当前 skip；这是平台精度限制，不得伪装成已覆盖。
+4. **official reference 是全平台真相源，不是 910B-only**。
+   - `gen_official_embedding.py` 应能在 310P 上生成官方 refdata；NPU 官方链失败时应 fallback 到 CPU 官方链。
+   - CPU fallback 也按 OFFICIAL_EMBED_CASES 生成；310P 用户应自行在 .env 中只保留 416x672,720x1280 以缩短耗时。
+   - 当前 `test_engine_vs_official` 在 310P skip 是待修平台 gap，不是最终目标；最终仍要求全平台 vs official cosine ≥ 0.99。
+
+5. **`build_and_test.sh` 是 C++ 全量回归主入口**。
+   - 默认执行：加载环境 → CMake configure/build → 生成 C++ 测试所需 refdata → 跑全部 C++ CTest。
+   - 它定义的是 **C++ 全量**，不包含 Python package `run_all.py`，也不包含跨语言 compare 的 Python 侧命令。
+   - 如果日志出现 `Falling back to --no-refdata` 或 `Excluding ... needs_refdata`，不能算完整 C++ 全量通过。
 
 ---
 
@@ -30,11 +36,11 @@
 
 | 修改类型 | 必跑测试 | 说明 |
 |----------|----------|------|
-| preprocess / path C / `max_pixels` / AA | `python atb_cpp_llm/tests/python_reference/gen_all.py`；`ctest -R test_aclnn_bicubic_spike`；`ctest -R test_engine_vs_official`；`ctest -R test_path_c_raw_image`；benchmark smoke + compare | official gate 优先。`test_path_c_raw_image` 是 path C vs PREPROCESSED 自比对，不是 official gate。benchmark compare 只证明跨语言一致性。 |
-| vision graph | `ctest -R test_vision_stages`；`ctest -R test_engine_vs_official`；相关 level2 vision tests | stage gate 要退码；最终仍以 official full embedding gate 确认端到端影响。 |
-| text graph / deepstack | `python atb_python_qwen3vl_embedding/tests/test_pipeline_trace.py`；`python atb_python_qwen3vl_embedding/tests/test_embedder_e2e.py`；`ctest -R test_engine_vs_official` | pipeline trace 中 diagnostic 段不能当 gate；最终以 official full embedding gate 兜底。 |
-| benchmark | 所有 mode 冒烟；`./atb_cpp_llm/build/benchmark --mode compare`；`python atb_python_qwen3vl_embedding/tests/benchmark.py --mode all --load-pixel-values`；`python atb_cpp_llm/tests/compare_py_cpp.py` | benchmark 不在 CTest；必须手动跑。compare 不证明 official，只证明 C++/Python 自家链一致和输出可用。 |
-| 310P / platform | 在 310P 上 `bash atb_cpp_llm/build_and_test.sh`；Python `run_all.py`；benchmark compare；`compare_py_cpp.py`；核对 known skips | 310P AA 不可用，`test_engine_vs_official` / official full gate 当前应 skip。known skip 必须写清原因，不能静默 PASS。 |
+| preprocess / path C / `max_pixels` / AA | `python atb_cpp_llm/tests/python_reference/gen_all.py`；`ctest -R test_aclnn_bicubic_spike`；`ctest -R test_engine_vs_official`；`ctest -R test_path_c_raw_image`；`bash atb_cpp_llm/build_and_test.sh` | official gate 优先。`test_path_c_raw_image` 是 path C vs PREPROCESSED 自比对，不是 official gate。最后用 `build_and_test.sh` 做 C++ 全量回归。 |
+| vision graph | `ctest -R test_vision_stages`；`ctest -R test_engine_vs_official`；相关 level2 vision tests；`bash atb_cpp_llm/build_and_test.sh` | stage gate 要退码；最终仍以 official full embedding gate 确认端到端影响；C++ 全量回归用 `build_and_test.sh`。 |
+| text graph / deepstack | `ctest` 相关 text/deepstack tests；`ctest -R test_engine_vs_official`；`bash atb_cpp_llm/build_and_test.sh` | C++ text/deepstack 改动以 C++ CTest 和 official full embedding gate 兜底。Python package 测试不属于本 C++ 全量定义。 |
+| benchmark | 所有 C++ benchmark mode 冒烟；`./atb_cpp_llm/build/benchmark --mode compare` | benchmark 不在 CTest；必须手动跑。compare 不证明 official，只证明 C++ benchmark 输出路径可用。 |
+| 310P / platform | 在 310P 上 `python atb_cpp_llm/tests/python_reference/gen_all.py`；`bash atb_cpp_llm/build_and_test.sh`；C++ benchmark smoke；核对 known skips 和 official gap | official reference generator 不能因 NPU 算子不支持而失败，应 fallback CPU 生成 golden refdata。`test_engine_vs_official` 当前 skip 是待修平台 gap，不能写成最终覆盖。 |
 
 ---
 
@@ -89,27 +95,59 @@ ctest --test-dir atb_cpp_llm/build -R 'test_aclnn_bicubic_spike|test_engine_vs_o
 | `test_aclnn_bicubic_spike` TC4 NPU pv vs official pv | 416 / 720 / 1080 / 1440 | 1.0 / 0.999924 / 0.999878 / 0.999951 |
 | `test_engine_vs_official` full embedding | 416 / 720 / 1080 / 1440 | 0.999882 / 0.999235 / 0.999469 / 0.999690 |
 
-### 3.4 C++ 全量
+### 3.4 C++ 全量：`build_and_test.sh`
+
+`build_and_test.sh` 是 C++ 侧全量回归的标准入口。默认行为是：
+
+1. 加载 repo root 或 `atb_cpp_llm/` 下的 `.env`。
+2. source Ascend CANN / ATB 环境脚本。
+3. CMake configure + build。
+4. 运行 `tests/python_reference/gen_all.py` 生成 C++ CTest 读取的 `/tmp/*.bin` refdata。
+5. 检测到 NPU 后运行全部 C++ CTest。
 
 ```bash
 cd /mnt/workspace/gitCode/atb_llm_study
 bash atb_cpp_llm/build_and_test.sh
 ```
 
-如只复用已有 refdata：
+常用入口：
 
 ```bash
+# 最完整 C++ 全量：构建 + 重生 refdata + 全部 C++ CTest
+bash atb_cpp_llm/build_and_test.sh
+
+# 复用已有 /tmp refdata，加快回归；只在确认 refdata 属于当前代码时使用
 bash atb_cpp_llm/build_and_test.sh --no-refresh-refdata
+
+# 只构建，不跑测试
+bash atb_cpp_llm/build_and_test.sh --no-test
+
+# 已有 build 后，只重跑全部 C++ CTest
+bash atb_cpp_llm/build_and_test.sh --test-only
+
+# 只跑某个 level label
+bash atb_cpp_llm/build_and_test.sh --test-only level4_e2e
+
+# 只跑某个测试名
+bash atb_cpp_llm/build_and_test.sh --test-only test_engine_vs_official
+
+# 查看已注册测试和 label
+bash atb_cpp_llm/build_and_test.sh --list
 ```
 
-### 3.5 Python 全量
+验收注意：
 
-```bash
-cd /mnt/workspace/gitCode/atb_llm_study
-python atb_python_qwen3vl_embedding/tests/run_all.py
-```
+- 默认模式必须成功生成 refdata；如果日志出现 `Falling back to --no-refdata`，不能算完整 C++ 全量通过。
+- 如果日志出现 `Excluding ... tests labelled needs_refdata`，说明依赖 `/tmp/*.bin` 的测试被排除了，也不能算完整 C++ 全量通过。
+- `--no-refdata` 只用于快速验证不依赖 refdata 的测试，不能用于 release / push 前的完整验收。
+- `--no-refresh-refdata` 是加速入口，不是精度闸口；当改过 preprocess、token、shape、官方参考生成器、bin 格式或 CMake refdata 登记时，必须回到默认模式重生 refdata。
+- official gate 失败不能靠 `--no-refdata` 或过滤测试绕过。
+- official reference generator 是全平台真相源；如果官方 NPU reference 在 310P 上遇到不支持算子，应 fallback 到 CPU 官方链生成 refdata，而不是把 reference 标成 910B-only。
+- CPU fallback 也按 OFFICIAL_EMBED_CASES 生成；310P 用户应自行在 .env 中只保留 416x672,720x1280 以缩短耗时。
+- `test_engine_vs_official` 在 310P 的 skip 是当前 C++ 实现缺口，报告时必须写成 tracked platform gap。
+- 本节定义的“C++ 全量”只包含 C++ build + C++ CTest；Python package 自身测试不属于这个入口。
 
-### 3.6 Benchmark smoke / compare
+### 3.5 Benchmark smoke / compare
 
 ```bash
 cd /mnt/workspace/gitCode/atb_llm_study
@@ -118,16 +156,14 @@ python atb_cpp_llm/scripts/gen_compare_tokens.py
 ./atb_cpp_llm/build/benchmark --mode io
 ./atb_cpp_llm/build/benchmark --mode mm
 ./atb_cpp_llm/build/benchmark --mode compare
-python atb_python_qwen3vl_embedding/tests/benchmark.py --mode all --load-pixel-values
-python atb_cpp_llm/tests/compare_py_cpp.py
 ./atb_cpp_llm/build/benchmark --mode all
 ./atb_cpp_llm/build/benchmark --mode cold
 ./atb_cpp_llm/build/benchmark --mode throughput
 ```
 
-验收：每个 mode 退出码 0、human-readable 表正常、`BENCH_RESULT` 行正常、compare cosine ≥ 0.99。
+验收：每个 mode 退出码 0、human-readable 表正常、`BENCH_RESULT` 行正常；`compare` mode 至少确认 C++ 侧 `/tmp/cpp_*.bin` 和中间 pixel_values 能正常生成。
 
-注意：`benchmark --mode compare` 只生成 C++ 侧 `/tmp/cpp_*.bin` 和中间 pixel_values；必须随后运行 Python benchmark 的 `--load-pixel-values` 生成 `/tmp/py_*.bin`，最后 `compare_py_cpp.py` 才能完成 13 case cosine 对比。
+注意：`benchmark --mode compare` 是 C++ benchmark 的对外二进制冒烟入口，不是 official gate。它不在 CTest，也不属于 `build_and_test.sh` 的覆盖范围；提交 benchmark 相关改动前必须手动跑。
 
 ---
 
@@ -150,6 +186,7 @@ Reviewer 破坏者审查测试相关改动时，逐项回答：
 4. **退码**
    - 所有 gate 是否有 `CHECK` / 非零退出？
    - 是否存在只打 `LOG_ERROR` / `LOG_INFO` 但 CTest 仍 PASS 的假阳性？
+   - 如果声称跑了 C++ 全量，是否确认 `build_and_test.sh` 没有 fallback 到 `--no-refdata`、没有排除 `needs_refdata`？
 
 5. **Refdata 登记**
    - 新增读取 `/tmp/*.bin` 的测试是否登记到 `REFDATA_DEPENDENT_TESTS` / `needs_refdata`？
@@ -202,7 +239,8 @@ grep -RIn "test_engine_vs_official\|gen_official_embedding\|gen_official_pixel_v
    - 因官方链降采样带 AA，而 310P 没有对应 AA 路径，full official gate 当前 skip。
 
 2. **official full gate skip 是 limitation，不是成功**
-   - `test_engine_vs_official` 在非 910B 上 skip，应在状态/报告中写明“未覆盖 official full embedding”。
+   - `test_engine_vs_official` 在非 910B 上 skip，应在状态/报告中写明“310P official full embedding gate 是待修平台 gap”。
+   - official reference 生成器仍应全平台可运行；310P 上 NPU 官方链不支持时 fallback CPU 官方链。
 
 3. **310P precision limitation 要文档化**
    - 310P 可以跑平台适配、NZ mask、GQA、self-consistency、benchmark compare。
