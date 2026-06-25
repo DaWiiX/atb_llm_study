@@ -108,9 +108,9 @@ def test_preprocess():
         print("    PASS" if result['passed'] else "    FAIL")
         all_ok &= result['passed']
 
-    return all_ok
+    assert all_ok, ("preprocess_image vs transformers Processor mismatch "
+                    "(cosine < 0.999 or grid_thw differs; see per-case output above)")
 
 
 if __name__ == "__main__":
-    ok = test_preprocess()
-    exit(0 if ok else 1)
+    test_preprocess()

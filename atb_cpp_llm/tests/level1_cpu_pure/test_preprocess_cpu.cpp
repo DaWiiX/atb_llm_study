@@ -330,16 +330,18 @@ static bool TestSmartResizeBoundary() {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// Test 4: BicubicResize against Python C++-equivalent reference [H4]
+// Test 4: BicubicResize bit-exact vs PIL reference [Batch C]
 //
-// Python `_cpp_bicubic_resize` reproduces the C++ Catmull-Rom + edge-clamp
-// algorithm. With identical uint8 inputs both sides must agree to fp32
-// precision (~1e-3). The gen script quantizes its source to uint8 before
-// computing the reference, so we can feed the dumped float32 values
-// directly to BicubicResize after casting to uint8.
+// The C++ CPU BicubicResize is now a fixed-point port of Pillow's 8bpc
+// antialias resample (Batch A, zero-diff vs real PIL). The reference
+// `bicubic_{name}_pil_output.bin` is genuine PIL.Image.resize(BICUBIC),
+// so with identical uint8 inputs both sides MUST agree bit-for-bit
+// (max_diff == 0). The gen script quantizes its source to uint8 before
+// computing the reference, so we feed the dumped float32 values directly
+// to BicubicResize after casting to uint8.
 // ═══════════════════════════════════════════════════════════════
 static bool TestBicubicVsPython() {
-    LOG_INFO("\n=== Test 4: BicubicResize vs Python C++-equivalent reference ===");
+    LOG_INFO("\n=== Test 4: BicubicResize bit-exact vs PIL reference ===");
 
     struct Case {
         const char* name;
@@ -356,7 +358,7 @@ static bool TestBicubicVsPython() {
     bool all_ok = true;
     for (const auto& c : cases) {
         std::string in_path  = std::string("/tmp/bicubic_") + c.name + "_input.bin";
-        std::string out_path = std::string("/tmp/bicubic_") + c.name + "_output.bin";
+        std::string out_path = std::string("/tmp/bicubic_") + c.name + "_pil_output.bin";
 
         LoadedArrayF32 in_ref, out_ref;
         if (!in_ref.Load(in_path) || !out_ref.Load(out_path)) {
@@ -394,9 +396,9 @@ static bool TestBicubicVsPython() {
         float max_d = MaxAbsDiff(cpp_out.data(), out_ref.data.data(), out_elems);
         float cos_s = CosineSim(cpp_out.data(), out_ref.data.data(), out_elems);
 
-        // Both sides run the SAME algorithm on the SAME uint8 input. Differences
-        // should be limited to float-summation order rounding.
-        bool ok = (max_d < 1e-3f) && (cos_s > 0.99999f);
+        // Both sides run the SAME PIL 8bpc fixed-point resample on the SAME
+        // uint8 input — bit-for-bit identical (max_diff == 0).
+        bool ok = (max_d == 0.0f);
         all_ok &= ok;
         LOG_INFO("  [%s] %s: max_diff=%.6e cosine=%.6f (in=%dx%dx%d → %dx%d)",
                  ok ? "PASS" : "FAIL", c.name, max_d, cos_s,
@@ -405,8 +407,8 @@ static bool TestBicubicVsPython() {
             // Show first divergent pixel
             for (int64_t i = 0; i < out_elems; i++) {
                 float d = std::fabs(cpp_out[i] - out_ref.data[i]);
-                if (d > 1e-3f) {
-                    LOG_ERROR("    first divergence at [%ld]: C++=%.6f Python=%.6f diff=%.6e",
+                if (d > 0.0f) {
+                    LOG_ERROR("    first divergence at [%ld]: C++=%.6f PIL=%.6f diff=%.6e",
                              i, cpp_out[i], out_ref.data[i], d);
                     break;
                 }
@@ -418,14 +420,16 @@ static bool TestBicubicVsPython() {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// Test 5: PreprocessImage end-to-end vs Python `preprocess_image` [H4]
+// Test 5: PreprocessImage end-to-end vs PIL reference [Batch C]
 //
-// The Python reference uses PyTorch's bicubic (different boundary handling
-// from C++ edge-clamp), so we use cosine similarity ≥ 0.999 instead of
-// bit-exact equality. grid_thw must be exactly equal.
+// The C++ CPU PreprocessImage and the Python PIL reference both quantize
+// the identical fp32 pixel_values to fp16, so the dumped fp16 bits must be
+// bit-for-bit equal (max_diff == 0). cos >= 0.99999 is a redundant guard.
+// grid_thw must be exactly equal. The `down_144x272` case forces the
+// genuine AA downsample path (144→128, 272→256).
 // ═══════════════════════════════════════════════════════════════
 static bool TestPreprocessImageVsPython() {
-    LOG_INFO("\n=== Test 5: PreprocessImage vs Python reference ===");
+    LOG_INFO("\n=== Test 5: PreprocessImage bit-exact vs PIL reference ===");
 
     struct Case {
         const char* name;
@@ -435,6 +439,7 @@ static bool TestPreprocessImageVsPython() {
     Case cases[] = {
         {"gradient_64x64", 3, 64, 64},
         {"random_96x96",   3, 96, 96},
+        {"down_144x272",   3, 144, 272},
     };
 
     atb_llm::adapters::Qwen3VLConfig cfg{};
@@ -448,7 +453,7 @@ static bool TestPreprocessImageVsPython() {
     bool all_ok = true;
     for (const auto& c : cases) {
         std::string in_path   = std::string("/tmp/preprocess_") + c.name + "_input.bin";
-        std::string out_path  = std::string("/tmp/preprocess_") + c.name + "_output.bin";
+        std::string out_path  = std::string("/tmp/preprocess_") + c.name + "_pil_output.bin";
         std::string grid_path = std::string("/tmp/preprocess_") + c.name + "_grid.bin";
 
         LoadedArrayF32  in_ref;       // input stored as float32 view of uint8
@@ -524,93 +529,103 @@ static bool TestPreprocessImageVsPython() {
             continue;
         }
 
-        // Decode both sides to fp32 and compare via cosine.
+        // Decode both sides to fp32 and compare. Both sides quantize the same
+        // fp32 pixel_values to fp16, so the buffers must be bit-for-bit equal.
         std::vector<float> cpp_f32(ref_total), ref_f32(ref_total);
+        bool bits_equal = true;
         for (int64_t i = 0; i < ref_total; i++) {
+            if (cpp_pixels[i] != out_ref_fp16.data[i]) bits_equal = false;
             cpp_f32[i] = Fp16BitsToFloat(cpp_pixels[i]);
             ref_f32[i] = Fp16BitsToFloat(out_ref_fp16.data[i]);
         }
         float cos_s = CosineSim(cpp_f32.data(), ref_f32.data(), ref_total);
         float md    = MaxAbsDiff(cpp_f32.data(), ref_f32.data(), ref_total);
 
-        bool ok = (cos_s >= 0.999f);
+        // fp16 bit-level equality is the primary assertion; cos>=0.99999 is a
+        // redundant guard.
+        bool ok = bits_equal && (md == 0.0f) && (cos_s >= 0.99999f);
         all_ok &= ok;
-        LOG_INFO("  [%s] %s: grid=[%ld,%ld,%ld] patches=%ld cosine=%.6f max_diff=%.6e",
+        LOG_INFO("  [%s] %s: grid=[%ld,%ld,%ld] patches=%ld cosine=%.6f max_diff=%.6e bits_equal=%d",
                  ok ? "PASS" : "FAIL", c.name,
-                 grid_thw[0], grid_thw[1], grid_thw[2], num_patches, cos_s, md);
+                 grid_thw[0], grid_thw[1], grid_thw[2], num_patches, cos_s, md, bits_equal ? 1 : 0);
+        if (!ok) {
+            for (int64_t i = 0; i < ref_total; i++) {
+                if (cpp_pixels[i] != out_ref_fp16.data[i]) {
+                    LOG_ERROR("    first divergence at [%ld]: C++ bits=0x%04x (%.6f) PIL bits=0x%04x (%.6f)",
+                             i, cpp_pixels[i], cpp_f32[i], out_ref_fp16.data[i], ref_f32[i]);
+                    break;
+                }
+            }
+        }
     }
 
     return all_ok;
 }
 
 // ═══════════════════════════════════════════════════════════════
-// Test 6: BicubicResize vs PIL (independent ground truth) [P7]
+// Test 7: BicubicResize bit-exact vs PIL at production resolutions [Batch C]
 //
-// PIL.Image.resize(BICUBIC) is an independent reference implementation
-// (NOT a translation of the C++ algorithm). Unlike _cpp_bicubic_resize,
-// PIL uses its own Catmull-Rom cubic convolution with symmetric boundary
-// handling, so it cannot reproduce C++ bugs.
-//
-// Expected differences:
-//   - Interior pixels (>=2 pixels from edges): C++ and PIL should have
-//     high cosine similarity (>= 0.99). However, PIL uses fixed-point
-//     arithmetic internally (kernel weights are quantized to 16-bit
-//     integers), which causes up to ~6.7 max_diff even at interior
-//     pixels compared to the C++ Catmull-Rom (a=-0.5) floating-point
-//     implementation. We therefore accept interior_max_diff <= 10.0.
-//     The two implementations compute the same mathematical operation
-//     — Catmull-Rom cubic convolution — but the fixed-point kernel
-//     quantization in PIL introduces small systematic deviations.
-//   - Boundary pixels (within 2 pixels of edges): C++ uses edge-clamp,
-//     PIL uses symmetric/mirror extension. These differ noticeably but
-//     are both valid bicubic boundary handling strategies.
-//
-// This test serves as the PRIMARY assertion target — if C++ diverges
-// significantly from PIL, there is a real bug. The existing
-// TestBicubicVsPython serves as a CONSISTENCY CHECK (C++ matches its
-// Python translation).
+// Level-1 CPU-only gate (no NPU). Covers the real engine resize sizes:
+//   - prod_416x672   → identity (416 stays, 672→672), no resample
+//   - prod_720x1280  → mixed axis (720→704 downsample, 1280→1280)
+//   - prod_1080x1920 → dual-axis downsample (the AA regime)
+//   - prod_1440x2560 → dual-axis downsample (noise worst-case)
+// Output dims are read from the PIL reference .bin shape, so the test
+// tracks SmartResize automatically. The C++ CPU BicubicResize is the
+// PIL 8bpc fixed-point port, so each case must be bit-for-bit identical
+// (MaxAbsDiff == 0).
 // ═══════════════════════════════════════════════════════════════
-static bool TestBicubicVsPIL() {
-    LOG_INFO("\n=== Test 6: BicubicResize vs PIL independent reference ===");
+static bool TestBicubicProdVsPIL() {
+    LOG_INFO("\n=== Test 7: BicubicResize bit-exact vs PIL (production resolutions) ===");
 
     struct Case {
         const char* name;
         int32_t channels;
         int32_t in_h, in_w;
-        int32_t out_h, out_w;
     };
     Case cases[] = {
-        {"2x2_to_4x4",              1, 2, 2,  4,  4},
-        {"4x4_to_2x2",              1, 4, 4,  2,  2},
-        {"random_8x8_to_16x16_3ch", 3, 8, 8, 16, 16},
+        {"prod_416x672",   3, 416,  672},
+        {"prod_720x1280",  3, 720,  1280},
+        {"prod_1080x1920", 3, 1080, 1920},
+        {"prod_1440x2560", 3, 1440, 2560},
     };
 
     bool all_ok = true;
     for (const auto& c : cases) {
-        std::string in_path    = std::string("/tmp/bicubic_") + c.name + "_input.bin";
-        std::string pil_path   = std::string("/tmp/bicubic_") + c.name + "_pil_output.bin";
+        std::string in_path  = std::string("/tmp/bicubic_") + c.name + "_input.bin";
+        std::string pil_path = std::string("/tmp/bicubic_") + c.name + "_pil_output.bin";
 
         LoadedArrayF32 in_ref, pil_ref;
-        bool in_ok  = in_ref.Load(in_path);
-        bool pil_ok = pil_ref.Load(pil_path);
-
-        if (!in_ok || !pil_ok) {
-            LOG_ERROR("  [SKIP] %s: PIL bin files missing — run "
-                      "'python tests/gen_cpu_reference.py --stage bicubic_preprocess'", c.name);
+        if (!in_ref.Load(in_path) || !pil_ref.Load(pil_path)) {
+            LOG_ERROR("  [SKIP] %s: bin files missing — run "
+                      "'python tests/python_reference/gen_cpu_reference.py'", c.name);
             all_ok = false;
             continue;
         }
+
+        if (pil_ref.shape.size() != 3 || in_ref.shape.size() != 3) {
+            LOG_ERROR("  [FAIL] %s: unexpected ndim (in=%zu pil=%zu)",
+                      c.name, in_ref.shape.size(), pil_ref.shape.size());
+            all_ok = false;
+            continue;
+        }
+
+        // Output dims follow SmartResize via the PIL ref shape.
+        int32_t out_h = static_cast<int32_t>(pil_ref.shape[1]);
+        int32_t out_w = static_cast<int32_t>(pil_ref.shape[2]);
 
         int64_t in_elems  = static_cast<int64_t>(c.channels) * c.in_h  * c.in_w;
-        int64_t out_elems = static_cast<int64_t>(c.channels) * c.out_h * c.out_w;
+        int64_t out_elems = static_cast<int64_t>(c.channels) * out_h * out_w;
         if (static_cast<int64_t>(in_ref.data.size())  != in_elems ||
             static_cast<int64_t>(pil_ref.data.size()) != out_elems) {
-            LOG_ERROR("  [FAIL] %s: bin size mismatch", c.name);
+            LOG_ERROR("  [FAIL] %s: bin size mismatch (in=%zu expect %ld, pil=%zu expect %ld)",
+                     c.name, in_ref.data.size(), in_elems,
+                     pil_ref.data.size(), out_elems);
             all_ok = false;
             continue;
         }
 
-        // Cast input float32 → uint8 (same as C++ BicubicResize receives).
+        // Cast input float32 (already quantized in the gen script) → uint8.
         std::vector<uint8_t> in_u8(in_elems);
         for (int64_t i = 0; i < in_elems; i++) {
             float v = std::round(in_ref.data[i]);
@@ -622,109 +637,22 @@ static bool TestBicubicVsPIL() {
         std::vector<float> cpp_out(out_elems);
         atb_llm::adapters::BicubicResize(
             in_u8.data(), c.in_h, c.in_w, c.channels,
-            c.out_h, c.out_w, cpp_out.data());
+            out_h, out_w, cpp_out.data());
 
-        // ── Interior-only comparison (skip boundary pixels) ──
-        // C++ edge-clamp and PIL symmetric extension differ within ~2 pixels
-        // of the image boundary. For the interior (pixels >= 2 from any edge),
-        // the Catmull-Rom kernels should agree closely.
-        //
-        // We compute two metrics:
-        //   1. Full-image cosine (accepts boundary differences as noise)
-        //   2. Interior max_diff (strict, should be small)
-        double full_dot = 0.0, full_na = 0.0, full_nb = 0.0;
-        float interior_max_diff = 0.0f;
-        int64_t interior_count = 0;
-
-        for (int64_t i = 0; i < out_elems; i++) {
-            float a = cpp_out[i];
-            float b = pil_ref.data[i];
-            full_dot += static_cast<double>(a) * b;
-            full_na  += static_cast<double>(a) * a;
-            full_nb  += static_cast<double>(b) * b;
-        }
-
-        // Interior: iterate per-channel spatial layout.
-        int64_t ch_stride = static_cast<int64_t>(c.out_h) * c.out_w;
-        for (int32_t ch = 0; ch < c.channels; ch++) {
-            for (int32_t oh = 0; oh < c.out_h; oh++) {
-                for (int32_t ow = 0; ow < c.out_w; ow++) {
-                    // Map output pixel (oh, ow) → input coordinate space
-                    float src_h = (oh + 0.5f) * c.in_h / c.out_h - 0.5f;
-                    float src_w = (ow + 0.5f) * c.in_w / c.out_w - 0.5f;
-                    // A pixel is "interior" if its 4x4 sample neighbourhood
-                    // (floor(src) + [-1,2]) is fully inside [0, in_dim-1].
-                    int sh = static_cast<int>(std::floor(src_h));
-                    int sw = static_cast<int>(std::floor(src_w));
-                    bool interior = (sh - 1 >= 0) && (sh + 2 <= c.in_h - 1) &&
-                                    (sw - 1 >= 0) && (sw + 2 <= c.in_w - 1);
-                    if (interior) {
-                        int64_t idx = ch * ch_stride + static_cast<int64_t>(oh) * c.out_w + ow;
-                        float d = std::fabs(cpp_out[idx] - pil_ref.data[idx]);
-                        if (d > interior_max_diff) interior_max_diff = d;
-                        interior_count++;
-                    }
-                }
-            }
-        }
-
-        float full_cos = static_cast<float>(full_dot / (std::sqrt(full_na) * std::sqrt(full_nb) + 1e-12));
-        float full_max  = MaxAbsDiff(cpp_out.data(), pil_ref.data.data(), out_elems);
-
-        // Acceptance criteria:
-        //   - Full-image cosine >= 0.99 (boundary differences are small fraction of total)
-        //   - Interior max_diff <= 10.0 (PIL's fixed-point kernel quantization causes
-        //     up to ~6.7 max_diff vs C++ float; 10.0 is a generous but justified
-        //     threshold that still catches real algorithmic bugs)
-        //   - Full-image max_diff: logged but not asserted (can be large at boundaries
-        //     for small images like 2x2→4x4 where every pixel touches a boundary)
-        bool full_cos_ok   = (full_cos >= 0.99);
-        bool interior_ok   = (interior_max_diff <= 10.0f);
-
-        // For the 2x2→4x4 case, there are NO interior pixels (every output pixel's
-        // 4x4 sample window touches an edge of the 2x2 input). Skip interior check.
-        bool has_interior = (interior_count > 0);
-
-        bool ok = full_cos_ok && (has_interior ? interior_ok : true);
+        float max_d = MaxAbsDiff(cpp_out.data(), pil_ref.data.data(), out_elems);
+        bool ok = (max_d == 0.0f);
         all_ok &= ok;
-
-        LOG_INFO("  [%s] %s: full_cos=%.6f full_max=%.6e interior_max=%.6e (n_interior=%ld)"
-                 " in=%dx%dx%d → %dx%d",
-                 ok ? "PASS" : "FAIL", c.name, full_cos, full_max, interior_max_diff,
-                 interior_count,
-                 c.channels, c.in_h, c.in_w, c.out_h, c.out_w);
-
+        LOG_INFO("  [%s] %s: max_diff=%.6e (in=%dx%dx%d → %dx%d)",
+                 ok ? "PASS" : "FAIL", c.name, max_d,
+                 c.channels, c.in_h, c.in_w, out_h, out_w);
         if (!ok) {
-            if (!full_cos_ok) {
-                LOG_ERROR("    full-image cosine %.6f < 0.99 threshold", full_cos);
-            }
-            if (!interior_ok && has_interior) {
-                LOG_ERROR("    interior max_diff %.6e > 10.0 threshold", interior_max_diff);
-                // Show first interior pixel that exceeds threshold
-                int64_t ch_stride2 = static_cast<int64_t>(c.out_h) * c.out_w;
-                for (int32_t ch = 0; ch < c.channels; ch++) {
-                    for (int32_t oh = 0; oh < c.out_h; oh++) {
-                        for (int32_t ow = 0; ow < c.out_w; ow++) {
-                            float src_h = (oh + 0.5f) * c.in_h / c.out_h - 0.5f;
-                            float src_w = (ow + 0.5f) * c.in_w / c.out_w - 0.5f;
-                            int sh = static_cast<int>(std::floor(src_h));
-                            int sw = static_cast<int>(std::floor(src_w));
-                            bool interior = (sh - 1 >= 0) && (sh + 2 <= c.in_h - 1) &&
-                                            (sw - 1 >= 0) && (sw + 2 <= c.in_w - 1);
-                            if (interior) {
-                                int64_t idx = ch * ch_stride2 + static_cast<int64_t>(oh) * c.out_w + ow;
-                                float d = std::fabs(cpp_out[idx] - pil_ref.data[idx]);
-                                if (d > 10.0f) {
-                                    LOG_ERROR("    first interior divergence: ch=%d [%d,%d]"
-                                             " C++=%.6f PIL=%.6f diff=%.6e",
-                                             ch, oh, ow, cpp_out[idx], pil_ref.data[idx], d);
-                                    goto interior_done;
-                                }
-                            }
-                        }
-                    }
+            for (int64_t i = 0; i < out_elems; i++) {
+                float d = std::fabs(cpp_out[i] - pil_ref.data[i]);
+                if (d > 0.0f) {
+                    LOG_ERROR("    first divergence at [%ld]: C++=%.6f PIL=%.6f diff=%.6e",
+                             i, cpp_out[i], pil_ref.data[i], d);
+                    break;
                 }
-                interior_done:;
             }
         }
     }
@@ -760,8 +688,8 @@ int main() {
     else LOG_ERROR("  Hint: run 'python tests/gen_cpu_reference.py --stage bicubic_preprocess' first");
 
     total++;
-    if (TestBicubicVsPIL()) passed++;
-    else LOG_ERROR("  Hint: run 'python tests/gen_cpu_reference.py --stage bicubic_preprocess' first");
+    if (TestBicubicProdVsPIL()) passed++;
+    else LOG_ERROR("  Hint: run 'python tests/python_reference/gen_cpu_reference.py' first");
 
     LOG_INFO("\n=== Summary: %d/%d tests passed ===", passed, total);
     return (passed == total) ? 0 : 1;

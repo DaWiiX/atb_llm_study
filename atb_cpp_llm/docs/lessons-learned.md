@@ -173,6 +173,9 @@
 3. **跨语言工作流要端到端验证，不只分别测两端**
    生成→消费→对比全流程跑通，而非 C++ 测 C++、Python 测 Python。— `arch §10.2 第7项`
 
+4. **【2026-06-25 CPU PIL 对齐 Batch C Reviewer】重实现一侧的参考算法后，所有同源参考生产者必须同步对齐，否则全管线级 cos 跌破；单阶段窄口径是钝指标**
+   C++ CPU `BicubicResize`/`PreprocessImage` 重写为 bit-exact PIL 8bpc AA 后，vs 官方 transformers cos=1.0、Level-1 bit-exact max_diff=0 全绿——但 `test_stage_precision` IMAGE_ONLY 端到端 cos 跌到 **0.978341 FAIL**。根因不是 C++ 引擎（同测试 engine-only 诊断喂 Python 参考 pixel_values cos=0.999929），而是 **Python 引擎 `atb_python_qwen3vl_embedding/preprocess.py:85` 仍用 torch `F.interpolate(mode='bicubic')`（Mitchell a=−0.75，无 AA），未对齐 PIL**，其生成的 stage 参考 bin 过时。**教训一**：当某算法在一个语言/路径上重对齐了官方真实现，所有产同源参考的生产者（另一语言引擎、stage 参考生成器、e2e 基线）必须同步迁移，否则"单点对齐官方"会与"未迁移的参考链"在全管线级持续漂移——C++ 对了反而让 vs-Python 参考的 gate 红。**教训二**：单阶段 pixel_values 的窄口径 gate（`vision_stages` L0=0.999908，720→704 仅轻度降采样、只比单阶段）对全管线精度问题是**钝指标**，给出假安全；真问题要靠端到端嵌入级 gate（28 层放大预处理差异）+ engine-only 诊断（隔离是预处理还是引擎）才暴露。判定回归是否触发后续修复，不能只看最钝的单阶段 cos。— CPU PIL 对齐 Batch C Reviewer（触发 Batch D）
+
 ---
 
 ## 主题 7：工作流与流程

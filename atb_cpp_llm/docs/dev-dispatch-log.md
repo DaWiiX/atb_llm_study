@@ -272,3 +272,62 @@
 - 修 MAJOR-2:official gates 命令前补 `cmake -S atb_cpp_llm -B atb_cpp_llm/build -DCMAKE_BUILD_TYPE=Release`。
 - 验证:`git diff --check` 通过;README/WORKFLOW/STATUS grep 可见 testing docs / official gate;guide 中可见 cmake configure 与 load-pixel-values 步骤。
 - 阶段3 docs 目标达成。
+
+## 2026-06-25 ｜ CPU bicubic 对齐官方 PIL 8bpc Batch A ｜ Developer
+
+**背景**:CPU `BicubicResize`/`PreprocessImage` 是 non-AA 固定 4-tap,与官方 PIL `Image.resize` 默认 BICUBIC(8bpc 定点 AA)分叉,noise 大幅降采样 cos→0.90。用户要求 bit-exact 复刻 PIL 8bpc,精度是底线。计划见 `.claude/plans/eager-marinating-hippo.md`。
+
+**派法**:
+- 角色:Developer。只改生产代码 `qwen3vl_preprocess.cpp`,逐行对照 `docs/archive/Resample.c`。给出完整实现规范(kPrecisionBits=22/Clip8/BicubicFilter 分组式/PrecomputeCoeffs8bpc/Horizontal+VerticalPass8bpc uint8→uint8/ResampleCore8bpc per-axis skip)+ 11 项 bit-exact 雷区清单。要求只验证编译+雷区自检,不跑测试(参考还是 non-AA,待 B/C)。禁动 BankersRound/SmartResize/NPU/patchify。不用 worktree。
+
+**结果**:
+- 编译零告警;11 项雷区自检全过。新增 PIL 8bpc 定点 helper,改写 BicubicResize(.h 签名不变)/PreprocessImage(resize→uint8→normalize→保留patchify),删旧 4 个 non-AA 函数。
+
+## 2026-06-25 ｜ CPU bicubic 对齐官方 PIL 8bpc Batch A ｜ Reviewer
+
+**派法**:
+- 角色:破坏者 Reviewer。默认怀疑有 bug,逐条复核 11 项必查(重点 per-axis skip 维度传参、(int)截断方向、ss偏置、normalize等价、orphan include),并独立编译复现。
+
+**结果**:
+- 结论:bit-exact 正确,**无 BLOCKER/无 MAJOR**。把移植 helper 抽出独立编译,对照真实 PIL 12.1.1 跑 408/408 用例(8定向+400随机fuzz)逐像素零差异 maxdiff=0。11 项必查全 PASS。
+- MINOR M1:`test_io_adapters.cpp:750-791/827-852` 硬编码旧 float 期望值会失败 → 已补入 Batch C 范围(原计划漏列)。MINOR M2:未跑完整 ATB build,Batch C 断言更新后做 CPU 冒烟。
+- Batch A 无需 Re-review 修复,通过。
+
+## 2026-06-25 ｜ CPU bicubic 对齐官方 PIL 8bpc Batch B ｜ Developer + Reviewer + Re-review
+
+**派法**:
+- Developer:迁移 `gen_cpu_reference.py` 参考从 non-AA 到 PIL（删 `_cpp_bicubic_resize`、新增 `_pil_preprocess_image`、新增降采样用例）。强调 patchify 次序必须与 C++ 逐字一致、smart_resize 全限定 import 不重写。
+- Reviewer 破坏者:逐条查 patchify 次序 bit-exact、tp 帧复制、PIL 逐通道、normalize 值/顺序、fp16 RNE、降采样真触发 AA、删除遗留；亲写独立循环复刻 patchify 比对。
+- Re-review（SendMessage 续 Dev 上下文）:修 MAJOR-1。
+
+**结果**:
+- Dev:新增 `_pil_preprocess_image`（patchify permute(0,3,6,4,7,2,1,5,8) 对齐 C++ :323-352）+ 降采样用例 `down_144x272`（→128x256 双轴 AA），generator exit 0。
+- Reviewer:patchify 次序经独立循环复刻确认 bit-exact（Batch C 闸口成立），必查 1-6/8 全 PASS；1 个 MAJOR——删 `bicubic_*_output.bin` 生产者但 test_preprocess_cpu.cpp:359 Test4 仍读它致失败。
+- Re-review:MAJOR-1 修复——`_gen_bicubic_case` 重新 emit `bicubic_*_output.bin` 作为 PIL 值的 byte-identical alias，Test4 保持绿，gate exit 0。归档 lessons 主题6第4条。
+
+## 2026-06-25 ｜ CPU bicubic 对齐官方 PIL 8bpc Batch C ｜ Developer + Reviewer
+
+**派法**:
+- Developer:迁移测试断言到 PIL bit-exact（Test4/5 改 PIL、删 Test6、新 Test7 prod bit-exact、test_io_adapters 硬编码期望迁移）+ 新增 CPU-vs-official gate（无 Is910B 守卫）。要求实跑验证、bit-exact 失败不许放宽阈值。
+- Reviewer 破坏者:对抗性验证断言真 fail-closed（篡改 bin 看是否 EXIT=1）、SKIP 不计 PASS、official gate 无误守、独立 PIL 复算 io_adapters 期望值、**实跑全量回归判定 Batch D**。
+
+**结果**:
+- Dev:全绿。test_preprocess_cpu Test4/5/7 max_diff=0（416 恒等/720→704 混合轴/1080,1440 双轴降采样）；CPU-vs-official 4 分辨率 cos=1.0（max_diff=2.43e-4 纯 fp16 量化差）；test_io_adapters 2 case PIL 期望（0/255/255/0/84、39/57/113/131）。
+- Reviewer:Batch C 3 文件 **0 BLOCKER/0 MAJOR/0 MINOR**——对抗实证篡改/隐藏 bin 均 EXIT=1（fail-closed），official gate 无守卫真退码，io_adapters 期望经独立 PIL 复算一致。
+- **关键回归发现**:窄口径 vision_stages L0=0.999908（>0.999）未命中，但 **test_stage_precision IMAGE_ONLY cos=0.978341 FAIL**；engine-only 诊断 cos=0.999929 坐实根因 = Python 引擎 `preprocess.py:85` 仍用 torch F.interpolate（non-AA）未对齐 PIL。**Batch D 必须触发**。归档 lessons 主题6第4条。
+
+## 2026-06-25 ｜ CPU bicubic 对齐官方 PIL 8bpc Batch D ｜ Developer + Reviewer + MINOR 修复
+
+**背景**:Batch C Reviewer 回归发现 Python 引擎 `preprocess.py:85` 未对齐 PIL，致 test_stage_precision IMAGE_ONLY FAIL。用户确认继续 Batch D（精度底线，plan 已含此条件触发项）。
+
+**派法**:
+- Developer:先调研 blast radius（谁依赖 preprocess_image 输出），再把 `F.interpolate(bicubic non-AA)` 换成逐通道 PIL `Image.resize(BICUBIC)` 8bpc，重生 Family B 参考，跑全量回归 + Python 包测试验证无回归。
+- Reviewer 破坏者:重点查 CHW→uint8 转换（[0,1] vs [0,255] 偏移）、CPU/NPU 数据流、重生完整性（stage 参考时间戳）、standalone 参考遗漏、gate 真退码；亲写独立 PIL 复刻全链比对。
+- MINOR 修复（SendMessage 续 Dev）:test_preprocess.py 假阳性退码。
+
+**结果**:
+- Dev:preprocess.py resize 改逐通道 PIL 8bpc AA（与 `_pil_preprocess_image` bit-exact cos=1.0），移除 orphan torch.nn.functional import。重生 stage_L0/stage_final_* 等。test_stage_precision IMAGE_ONLY 0.978341→PASS（≥0.99），test_vision_stages PASS。Python 包回归全改善:test_preprocess cos≈1.0、embedder_e2e Image 0.999978、e2e Image 0.999845。自曝环境坑:ASCEND_RT_VISIBLE_DEVICES=3 致 device_count==0/aclInit 107001，移除后正常。
+- Reviewer:无 BLOCKER/MAJOR。CHW→uint8 风险点不存在（输入契约恒为 uint8，硬校验）；数据流 CPU→NPU 正确；stage 参考时间戳确认晚于生产改动无 stale；standalone 参考（test_first_layer_ref/test_vision_block_ref）磁盘无 bin、无 C++ 消费者、不在 ctest，隔离无假绿；672x476 独立复刻 bit-exact；vs 官方 AutoProcessor cos=1.0。1 MINOR:test_preprocess.py 用 return 非 assert（预存假阳性）。
+- MINOR 修复:`return all_ok`→`assert all_ok`，__main__ 改由 assert 驱动退码。验证 forced FAIL→EXIT=1、restored→EXIT=0，临时改动完全恢复。
+
+**全任务成果**:C++ CPU + Python 引擎预处理均 bit-exact 对齐官方 PIL 8bpc；1440 noise cos 0.90→1.0；CPU vs 官方 4 分辨率 cos=1.0；全管线 IMAGE_ONLY 0.978→PASS。lessons 归档主题6第4条（重实现参考链需同步同源生产者 + 窄口径是钝指标）。

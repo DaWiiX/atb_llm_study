@@ -9,8 +9,9 @@ Pipeline:
     → pixel_values (N, C*tp*p*p), grid_thw (1, 3)
 """
 import math
+import numpy as np
 import torch
-import torch.nn.functional as F
+from PIL import Image
 
 
 # Qwen3-VL-Embedding-2B normalization constants (from preprocessor_config.json)
@@ -75,15 +76,27 @@ def preprocess_image(image: torch.Tensor,
         raise TypeError(f"preprocess_image: expected uint8 image, got {image.dtype}")
     if image.dim() != 3:
         raise ValueError(f"preprocess_image: expected 3D (C,H,W), got {image.dim()}D")
-    image = image.float()
     _, h, w = image.shape
     factor = patch_size * merge_size
 
     # Resize to factor-aligned dimensions within pixel budget
     new_h, new_w = smart_resize(h, w, factor=factor,
                                 min_pixels=min_pixels, max_pixels=max_pixels)
-    image = F.interpolate(image.unsqueeze(0), size=(new_h, new_w),
-                          mode='bicubic', align_corners=False).squeeze(0)
+
+    # Per-channel PIL BICUBIC resize on uint8 (8bpc fixed-point antialias).
+    # This matches the official transformers preprocessing (PIL Image.resize
+    # default BICUBIC) and the C++ CPU PreprocessImage (ResampleCore8bpc).
+    # torch F.interpolate(mode='bicubic') uses a Mitchell kernel WITHOUT
+    # antialiasing and does NOT match PIL — see gen_cpu_reference
+    # ._pil_bicubic_resize / ._pil_preprocess_image for the bit-exact reference.
+    arr_u8 = image.cpu().numpy()  # (C, H, W) uint8
+    n_ch = arr_u8.shape[0]
+    resized = np.empty((n_ch, new_h, new_w), dtype=np.float32)
+    for ch in range(n_ch):
+        pil_img = Image.fromarray(arr_u8[ch], mode="L")
+        resized[ch] = np.asarray(
+            pil_img.resize((new_w, new_h), Image.BICUBIC), dtype=np.float32)
+    image = torch.from_numpy(resized)  # (C, new_h, new_w) float32
 
     # Rescale to [0, 1] and normalize
     image = image / 255.0
