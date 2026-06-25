@@ -227,6 +227,7 @@ add_atb_test(test_stage_precision      tests/level4_e2e/test_stage_precision.cpp
 add_atb_test(test_forward_error_paths  tests/level4_e2e/test_forward_error_paths.cpp)
 add_atb_test(test_sync_safety        tests/level4_e2e/test_sync_safety.cpp)
 add_atb_test(test_path_c_raw_image   tests/level4_e2e/test_path_c_raw_image.cpp)
+add_atb_test(test_engine_vs_official tests/level4_e2e/test_engine_vs_official.cpp)
 add_atb_test(test_vision_stages       tests/level3_integration/test_vision_stages.cpp)
 add_atb_test(test_pos_embed_npu_graph tests/level2_op_precision/test_pos_embed_npu_graph.cpp)
 add_atb_test(test_vis_rope_npu_graph  tests/level2_op_precision/test_vis_rope_npu_graph.cpp)
@@ -363,13 +364,14 @@ set_tests_properties(
     test_forward_error_paths
     test_sync_safety
     test_path_c_raw_image
+    test_engine_vs_official
     test_vision_stages
     test_benchmark_modes
     PROPERTIES RESOURCE_LOCK "npu_e2e"
 )
 
 # ── Reference-data dependency labels ──────────────────────
-# Tests that fopen() /tmp/{cpu_,preprocess_,stage_,posembed_npu_,visrope_npu_,bicubic_,official_pv_}*.bin
+# Tests that fopen() /tmp/{cpu_,preprocess_,stage_,posembed_npu_,visrope_npu_,bicubic_,official_pv_,official_embed_,official_tokens_}*.bin
 # files produced by tests/python_reference/gen_all.py. When those .bin
 # files are absent, every test listed below correctly returns a non-zero exit code
 # (true failure), so ctest will report them as FAIL — not PASS.
@@ -382,7 +384,7 @@ set_tests_properties(
 # noisy, expected failures that would distract from real regressions.
 #
 # Maintenance contract: when a new test reads a /tmp/*.bin file, list it
-# here. Discovered via: grep -lE '/tmp/(cpu_|preprocess_|stage_|posembed_npu_|bicubic_|official_pv_|visrope_npu_)' \
+# here. Discovered via: grep -lE '/tmp/(cpu_|preprocess_|stage_|posembed_npu_|bicubic_|official_pv_|official_embed_|official_tokens_|visrope_npu_)' \
 #                          tests/level*/*.cpp | grep -v test_config_wiring
 set(REFDATA_DEPENDENT_TESTS
     # Level 0 framework tests
@@ -419,6 +421,7 @@ set(REFDATA_DEPENDENT_TESTS
     test_vision_stages
     # Level 4 E2E
     test_stage_precision
+    test_engine_vs_official
 )
 foreach(_t ${REFDATA_DEPENDENT_TESTS})
     # APPEND so we don't clobber the levelN_* label set by add_atb_test().

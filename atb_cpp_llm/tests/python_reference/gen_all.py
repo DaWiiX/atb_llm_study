@@ -35,6 +35,7 @@ from _tests_env import ASCEND_PLATFORM  # noqa: E402
 GENERATORS = [
     ("gen_cpu_reference.py",          ["/tmp/cpu_op_rms_norm_medium_input.bin", "/tmp/cpu_vision_merger_main_x.bin"]),
     ("gen_official_pixel_values.py",  ["/tmp/official_pv_prod_416x672.bin"]),
+    ("gen_official_embedding.py",     ["/tmp/official_embed_mm_416x672.bin", "/tmp/official_tokens_mm_416x672.bin"]),
     ("gen_stage_reference.py",        ["/tmp/stage_L0_pixel_values.bin", "/tmp/stage_L3_rope_sin.bin"]),
     ("test_stage_reference.py",       ["/tmp/stage_pixels.bin", "/tmp/stage_final_text_only.bin"]),
     ("gen_pos_embed_npu_reference.py", ["/tmp/posembed_npu_case_tiny_4x4.bin"]),

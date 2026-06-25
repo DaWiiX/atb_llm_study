@@ -81,7 +81,7 @@
 
 ## 主题 4：测试反模式
 
-**触发关键词**：静态审查、运行时测试、测试覆盖、refdata、跳过、阈值、假阳性、参数对齐、引擎真实参数、smart_resize factor、AA 降采样、抗锯齿守卫、恒等尺度、参考链真伪、bit-exact probe、unbound 方法、stand-in、精度 margin、输入分布、worst-case、自然图 vs 噪声
+**触发关键词**：静态审查、运行时测试、测试覆盖、refdata、跳过、阈值、假阳性、参数对齐、引擎真实参数、smart_resize factor、AA 降采样、抗锯齿守卫、恒等尺度、参考链真伪、bit-exact probe、unbound 方法、stand-in、精度 margin、输入分布、worst-case、自然图 vs 噪声、token 同源、chat template、official full gate
 
 1. **静态审查 ≠ 运行时测试**
    API 行为误解、运行时竞态、性能回归、兼容性、数值精度——这五类只有实际运行才能发现。审查通过 = 静态审查零问题 + 单元测试 PASS + 复现确认问题消失。— `arch §9.4`
@@ -109,6 +109,9 @@
 
 9. **【2026-06-24 max_pixels 对齐官方】精度 margin 依赖输入分布，估算勿混用自然图与 worst-case**
    同一管线（NPU fp16 + bicubic-AA vs 官方 fp32）在自然图 cos≈0.99999，但在 worst-case 随机噪声输入 cos=0.999878（margin 减半）。计划用自然图估的 0.99999 当预期，实测噪声图 0.999878 看着像回归其实不是。**精度闸口的预期值和验收输入必须明确**：用代表性分布还是 worst-case？勿在估算里混用以免误判回归。降采样 bicubic 对高频噪声最敏感，是天然 worst-case。— max_pixels 对齐 Reviewer
+
+10. **【2026-06-25 official full embedding gate】端到端参考不只要同图，还必须 token/chat template 同源**
+   full embedding gate 若 C++ 端手写 input_ids 或复用旧 token bin，就算图像 pixel_values 与官方一致，也可能因 system prompt、chat template、image token 个数或默认 instruction 漂移导致 embedding 对不上。阶段2生成器通过 wrapper 捕获 `Qwen3VLEmbedder.process()` 内部同一次 `_preprocess_inputs` 的 `input_ids` 写 token bin，并用 public embedding vs captured-chain embedding `max_diff=0` 证明 embedding 与 token 同源。**规则**：端到端 vs 官方 gate 的 token 必须从同一次官方 preprocess 捕获，不能手写；必须 guard 默认 prompt（本模型为 `Represent the user's input.`）、max_pixels、image token 数；否则就是"同图不同问题"的假参考。— 阶段2 official full embedding gate
 
 ---
 

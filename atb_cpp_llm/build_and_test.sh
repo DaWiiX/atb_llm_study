@@ -69,13 +69,15 @@ KNOWN_LEVELS=(
 REFDATA_SENTINELS=(
     /tmp/cpu_op_rms_norm_medium_input.bin
     /tmp/cpu_vision_merger_main_x.bin
+    /tmp/official_pv_prod_416x672.bin
+    /tmp/official_embed_mm_416x672.bin
+    /tmp/official_tokens_mm_416x672.bin
     /tmp/stage_L0_pixel_values.bin
     /tmp/stage_L3_rope_sin.bin
     /tmp/stage_pixels.bin
     /tmp/stage_final_text_only.bin
     /tmp/posembed_npu_case_tiny_4x4.bin
     /tmp/visrope_npu_case_tiny_4x4.bin
-    /tmp/official_pv_prod_416x672.bin
 )
 
 # ── CLI arg parsing ─────────────────────────────────────────────────

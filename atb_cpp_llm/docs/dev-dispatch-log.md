@@ -162,3 +162,29 @@
 - 主工作区合回两个文件后,`cmake --build atb_cpp_llm/build --target test_vision_stages -j8 && ctest --test-dir atb_cpp_llm/build -R test_vision_stages --output-on-failure` PASS。
 - `python atb_python_qwen3vl_embedding/tests/test_pipeline_trace.py` exit 0。输出显示 Step 1-7 gated 全 PASS,Step 8+ 低 cosine 均标 `(diagnostic, not gated)`,manual vs ref-captured inputs gate 全 PASS。
 - 阶段1目标达成:两个已知假阳性测试现在能把核心 cosine failure 传递为测试失败。
+
+## 2026-06-25 ｜ 测试体系整顿 阶段2 path C full embedding vs 官方 gate ｜ Developer
+
+**派法**:
+- 角色:Developer。重新派发 fresh worktree,新增 910B path C raw_image 全 engine embedding vs 官方 Qwen3VLEmbedder pooled embedding gate。
+- 关键约束:真实 Qwen3VLEmbedder public API 或等价链;默认 prompt 必须是 `Represent the user's input.`;tokens 必须从同一次官方 preprocess 捕获,不能手写;4 个生产分辨率;`CHECK cos>=0.99`;310P skip;refdata/CTest 登记完整。不改 benchmark 性能路径。
+
+**结果**:
+- 新增 `gen_official_embedding.py`:实例化真实 `Qwen3VLEmbedder(MODEL_DIR)`,调用 public `embedder.process(inputs, normalize=True)` 生成官方 pooled embedding;wrapper 捕获同一次 `_preprocess_inputs` 的 `input_ids` 写 token bin;guard 默认 prompt/max_pixels;public embedding vs captured chain `max_diff==0`;用 `torch_npu.contrib.transfer_to_npu` 让官方 cuda 设备映射到 NPU(仅生成器进程内)。
+- 新增 `test_engine_vs_official.cpp`:910B 执行,非 910B skip;读取 shared input bin + official tokens/embed bins;构造 `InferRequest mode=IMAGE_AND_TEXT` + `raw_image` 触发 path C;校验 image token 数==SmartResize 后 merged_tokens;`CHECK cos>=0.99`;检查 `timings.preprocess_ms>0`。
+- 注册:CMake target + RESOURCE_LOCK npu_e2e + needs_refdata;gen_all 注册;build_and_test sentinel 加 official_embed/tokens。
+- 生成参考:416 tokens=295 image_tokens=273 grid[[1,26,42]],720 tokens=902 image_tokens=880 grid[[1,44,80]],1080/1440 tokens=1758 image_tokens=1736 grid[[1,62,112]],dim=2048,public_vs_internal_max_diff=0。
+- 验证:新 target build PASS;`ctest -R test_engine_vs_official` PASS(43.9s),cos=416 0.999882 / 720 0.999235 / 1080 0.999469 / 1440 0.999690;`test_aclnn_bicubic_spike` 仍 PASS。
+
+## 2026-06-25 ｜ 测试体系整顿 阶段2 path C full embedding vs 官方 gate ｜ Reviewer/Re-review
+
+**派法**:
+- Reviewer agent 因 5-hour quota 429 未产出有效审查。主 agent 接手执行破坏者审查 + Re-review。
+- 审查重点:official generator 真伪(prompt/max_pixels/public API/token同源),C++ 是否真 raw_image path C,token/image token 校验,refdata/CTest/RESOURCE_LOCK,310P skip,阈值未降。
+
+**结果**:
+- APPROVE。零 BLOCKER、零 MAJOR。
+- 静态审查:diff 范围符合预期;`gen_official_embedding.py` 使用真实 Qwen3VLEmbedder public API,默认 prompt/max_pixels guard,token 从同一次 `_preprocess_inputs` 捕获,public vs internal max_diff=0;`transfer_to_npu` 仅生成器进程内可接受。`test_engine_vs_official.cpp` 确认为 `IMAGE_AND_TEXT + raw_image` path C,不是 PREPROCESSED;tokens 读 official bin;image token 数校验=merged_tokens;embedding loader/ cosine 维度检查严格;阈值 0.99 未降。
+- 注册完整:CMake target,RESOURCE_LOCK npu_e2e,needs_refdata,gen_all,built_and_test sentinels 均已登记。
+- Re-review 主工作区:先运行 `gen_official_embedding.py` 成功(4 分辨率 public_vs_internal_max_diff=0),首次 build 因 build 目录未 reconfigure 找不到新 target;重新 `cmake -S atb_cpp_llm -B atb_cpp_llm/build` 后 build `test_engine_vs_official` PASS,`ctest -R test_engine_vs_official` PASS(44.8s)。`ctest -R test_aclnn_bicubic_spike` PASS(22.2s)。
+- 阶段2目标达成:新增 CTest official full embedding gate,910B 4 生产分辨率 path C raw_image 全 engine embedding vs 官方 pooled embedding cos≥0.99。
