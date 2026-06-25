@@ -81,7 +81,7 @@
 
 ## 主题 4：测试反模式
 
-**触发关键词**：静态审查、运行时测试、测试覆盖、refdata、跳过、阈值、假阳性、参数对齐、引擎真实参数、smart_resize factor、AA 降采样、抗锯齿守卫、恒等尺度、参考链真伪、bit-exact probe、unbound 方法、stand-in、精度 margin、输入分布、worst-case、自然图 vs 噪声、token 同源、chat template、official full gate
+**触发关键词**：静态审查、运行时测试、测试覆盖、refdata、跳过、阈值、假阳性、参数对齐、引擎真实参数、smart_resize factor、AA 降采样、抗锯齿守卫、恒等尺度、参考链真伪、bit-exact probe、unbound 方法、stand-in、精度 margin、输入分布、worst-case、自然图 vs 噪声、token 同源、chat template、official full gate、self-consistency、diagnostic、testing guide
 
 1. **静态审查 ≠ 运行时测试**
    API 行为误解、运行时竞态、性能回归、兼容性、数值精度——这五类只有实际运行才能发现。审查通过 = 静态审查零问题 + 单元测试 PASS + 复现确认问题消失。— `arch §9.4`
@@ -112,6 +112,9 @@
 
 10. **【2026-06-25 official full embedding gate】端到端参考不只要同图，还必须 token/chat template 同源**
    full embedding gate 若 C++ 端手写 input_ids 或复用旧 token bin，就算图像 pixel_values 与官方一致，也可能因 system prompt、chat template、image token 个数或默认 instruction 漂移导致 embedding 对不上。阶段2生成器通过 wrapper 捕获 `Qwen3VLEmbedder.process()` 内部同一次 `_preprocess_inputs` 的 `input_ids` 写 token bin，并用 public embedding vs captured-chain embedding `max_diff=0` 证明 embedding 与 token 同源。**规则**：端到端 vs 官方 gate 的 token 必须从同一次官方 preprocess 捕获，不能手写；必须 guard 默认 prompt（本模型为 `Represent the user's input.`）、max_pixels、image token 数；否则就是"同图不同问题"的假参考。— 阶段2 official full embedding gate
+
+11. **【2026-06-25 testing-guide 沉淀】测试文档必须区分 official gate / self-consistency / diagnostic**
+   阶段0–2 暴露的核心盲区不是“没有测试”，而是测试语义被混用：`benchmark --mode compare`、`test_accuracy`、path C 自比对能证明跨语言或路径一致，却不能证明 vs official；diagnostic 只打印 cosine 更不能当 gate。阶段3把这条纪律沉淀到 `evergreen/testing-architecture.md` 和 `evergreen/testing-guide-dev.md`：新增测试必须声明 `(平台 × 分辨率 × 路径 × 参考)`，写清是否 vs official，gate 必须退码，diagnostic 必须标 `not gated`。— testing-guide 阶段3
 
 ---
 

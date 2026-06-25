@@ -101,6 +101,15 @@
 | 兼容性 | torch_npu 版本差异、ATB 图编译失败，只有实际运行才能发现 |
 | 数值精度 | 修改后余弦相似度是否仍 ≥ 0.99，必须用真实模型推理 |
 
+### 4.2 测试覆盖矩阵纪律
+
+新增或修改测试时，必须说明它覆盖哪个 `(平台 × 分辨率 × 路径 × 参考)` 四元组，并明确是否 **vs official**。
+
+- 覆盖矩阵和测试语义分类见 [evergreen/testing-architecture.md](./evergreen/testing-architecture.md)。
+- 开发者必跑命令和 Reviewer checklist 见 [evergreen/testing-guide-dev.md](./evergreen/testing-guide-dev.md)。
+- `test_engine_vs_official` / official pixel_values gate 才能证明对齐官方；`benchmark --mode compare`、`test_accuracy`、path C 自比对只能证明跨语言或路径一致性。
+- 310P skip 必须写清平台限制；不得把未覆盖 official gate 写成已通过。
+
 ---
 
 ## 5. Agent 派发 briefing 模板

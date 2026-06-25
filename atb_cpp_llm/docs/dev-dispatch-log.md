@@ -6,6 +6,20 @@
 
 ---
 
+## 2026-06-25 ｜ 测试体系整顿 阶段3 testing-guide 文档 ｜ Developer
+
+**派法**：
+- 角色：Developer。只改 docs，编写 testing-guide / testing-architecture，并更新索引、流程纪律、状态、教训、派单日志。
+- 工作范围：`atb_cpp_llm/docs/evergreen/testing-guide-dev.md`、`atb_cpp_llm/docs/evergreen/testing-architecture.md`、`README.md`、`WORKFLOW.md`、`STATUS.md`、`lessons-learned.md`、`dev-dispatch-log.md`。
+- 关键约束：不改代码/测试；不要把 benchmark compare 写成 official gate；310P limitation 必须诚实；文档要可执行。
+- 验收：新文档能被 README 找到；WORKFLOW 有测试覆盖矩阵纪律；STATUS 有阶段3记录；dev-dispatch-log 有记录；grep 能看到 `test_engine_vs_official` / `testing-guide-dev` / `testing-architecture`。
+
+**结果**：
+- 新增 `evergreen/testing-guide-dev.md`：写明 official gate 优先、修改类型必跑矩阵、910B 推荐命令顺序、Reviewer checklist、假阳性 grep 自检、310P AA limitation。
+- 新增 `evergreen/testing-architecture.md`：写明 L0–L4/benchmark 分层、official `Qwen3VLEmbedder` 真相源原则、覆盖矩阵、测试语义分类、决策树、refdata discipline。
+- 更新 `README.md` evergreen 索引和阅读路线；`WORKFLOW.md` 增加“测试覆盖矩阵纪律”；`STATUS.md` 记录阶段3；`lessons-learned.md` 主题4补充 official gate / self-consistency / diagnostic 区分；本文件追加派单记录。
+- 文档未运行 NPU 测试；验收以静态 grep 和 diff 审查为主。
+
 ## 2026-06-23 ｜ benchmark 接入路径C ｜ Developer（重派）
 
 **派法**：
@@ -188,3 +202,28 @@
 - 注册完整:CMake target,RESOURCE_LOCK npu_e2e,needs_refdata,gen_all,built_and_test sentinels 均已登记。
 - Re-review 主工作区:先运行 `gen_official_embedding.py` 成功(4 分辨率 public_vs_internal_max_diff=0),首次 build 因 build 目录未 reconfigure 找不到新 target;重新 `cmake -S atb_cpp_llm -B atb_cpp_llm/build` 后 build `test_engine_vs_official` PASS,`ctest -R test_engine_vs_official` PASS(44.8s)。`ctest -R test_aclnn_bicubic_spike` PASS(22.2s)。
 - 阶段2目标达成:新增 CTest official full embedding gate,910B 4 生产分辨率 path C raw_image 全 engine embedding vs 官方 pooled embedding cos≥0.99。
+
+## 2026-06-25 ｜ 测试体系整顿 阶段3 testing guide ｜ Reviewer
+
+**派法**:
+- 角色:Reviewer。破坏者审查阶段3 docs-only 改动。重点:official gate / self-consistency / diagnostic 是否分清;benchmark compare 是否被误写 official gate;310P limitation 是否诚实;命令是否可执行;README/WORKFLOW/STATUS/lessons/dev-dispatch-log 是否索引正确;确认 docs-only 范围。
+
+**结果**:
+- 审查结论:不 approve 直接合回,需修 2 BLOCKER + 2 MAJOR。
+- [BLOCKER-1] 不能整条 worktree branch 合回:full branch diff 含代码/测试,但阶段3工作区自身是 docs-only。必须只拷 7 个 docs 文件。
+- [BLOCKER-2] 两个核心新文档 `testing-guide-dev.md` / `testing-architecture.md` 是 untracked,普通 diff/提交可能漏掉。合回必须显式包含。
+- [MAJOR-1] `benchmark --mode compare` 命令链不完整:只跑 C++ benchmark + compare_py_cpp 会缺 `/tmp/py_*.bin`;必须补 Python benchmark `--load-pixel-values` 生成 py 输出。
+- [MAJOR-2] official gates 命令缺 CMake configure/reconfigure;干净 checkout 或旧 build cache 下新 target 不存在。必须补 `cmake -S ... -B ...`。
+- 准确性方面通过:文档没有把 benchmark/test_accuracy 误写 official;`test_engine_vs_official`/`test_aclnn_bicubic_spike` 语义准确;310P limitation 诚实。
+
+## 2026-06-25 ｜ 测试体系整顿 阶段3 testing guide ｜ Re-review
+
+**派法**:
+- 合回主工作区时只显式拷贝 7 个 docs 文件,不合整条 worktree branch;补 Reviewer 指出的 MAJOR 命令问题;运行文档静态验证。
+
+**结果**:
+- 合回范围仅 docs:`testing-guide-dev.md`,`testing-architecture.md`,`README.md`,`WORKFLOW.md`,`STATUS.md`,`lessons-learned.md`,`dev-dispatch-log.md`。
+- 修 MAJOR-1:benchmark 矩阵与命令链补 `python atb_python_qwen3vl_embedding/tests/benchmark.py --mode all --load-pixel-values`,并说明 C++ compare 只生成 `/tmp/cpp_*.bin`,Python benchmark 生成 `/tmp/py_*.bin`,最后 compare_py_cpp 才能完成 13 case。
+- 修 MAJOR-2:official gates 命令前补 `cmake -S atb_cpp_llm -B atb_cpp_llm/build -DCMAKE_BUILD_TYPE=Release`。
+- 验证:`git diff --check` 通过;README/WORKFLOW/STATUS grep 可见 testing docs / official gate;guide 中可见 cmake configure 与 load-pixel-values 步骤。
+- 阶段3 docs 目标达成。
