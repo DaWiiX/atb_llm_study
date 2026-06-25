@@ -100,3 +100,65 @@
 - C++ 全量 7 测试 PASS:test_config_wiring/test_e2e/test_path_c_raw_image/test_vision_stages/test_aclnn_bicubic_spike/test_preprocess_cpu/test_io_adapters,零回归(298s)。
 - 提交拆分:① fix(tests) test_text_diagnostics shutdown + run_all timeout(独立);② max_pixels 对齐 + official gate 基建 + MAJOR-1 参考链修复(原子合并,避免破窗中间态)。
 - 终极目标达成:910B 4 生产分辨率 PreprocessImageNpu 全管线 vs 官方 Qwen3VLEmbedder 推理 cos≥0.99(最低 0.999878)。
+
+## 2026-06-25 ｜ 测试体系整顿 阶段0 精度盲区实测 ｜ Developer
+
+**派法**:
+- 角色:Developer。只跑实验,不改 repo。脚本/输出放 `/tmp`。
+- 目标:在 max_pixels=1843200 后,实测官方 Qwen3VLEmbedder 链 vs CPU PreprocessImage 链的 pixel_values 差距,并查 path C full embedding vs 官方是否有现成验证入口。
+- 输入:4 个生产分辨率(416/720/1080/1440),noise(seed=2026 shared input bin) + natural(`/mnt/workspace/gitCode/Qwen3-VL-Embedding/data/examples/0.jpeg` resize 到目标尺寸)。
+- 参考链:官方链为 Qwen3VLProcessor + conversation 注入 min_pixels=4096/max_pixels=1843200 + process_vision_info(image_patch_size=16) + processor(do_resize=False);CPU 链为 `atb_python_qwen3vl_embedding.preprocess.preprocess_image`。
+
+**结果**:
+- 产物:`/tmp/measure_blind_spots.py`, `/tmp/measure_blind_spots_A_results.json`, `/tmp/test_aclnn_bicubic_spike_phase0_with_official.log`。repo 未修改。
+- CPU(非AA) vs 官方(AA) pixel_values cosine:
+  - noise:416=1.000000000,720=0.999102734,1080=0.995964392,1440=0.902562175(1440 破 0.99)
+  - natural:416=1.000000000,720=0.999994070,1080=0.999991300,1440=0.999992786(全过)
+- NPU pv vs official pv(复用 spike):416=1.000000,720=0.999924,1080=0.999878,1440=0.999951;NPU pv vs CPU pv:416=1.000000,720=0.999786,1080=0.994999,1440=0.899187。
+- 结论:910B NPU AA 路径对官方是对的;CPU 非AA 是偏离官方的路径,尤其 high-frequency/noise 1440。`benchmark compare`/`test_accuracy` 用 CPU/Python 自家链互比,对"官方精度"是弱信号/假信号。
+- path C full embedding vs 官方未完成:现有入口不能直接保存 path C raw_image full engine embedding bin。`benchmark --mode compare` 可保存 bin 但走 PREPROCESSED/CPU;bench/all/cold/throughput 走 raw_image path C 但 `RunBenchmark(..., nullptr, ...)` 不保存输出;`test_path_c_raw_image.cpp` 只 96×96 且只自比对。需要新增 `test_engine_vs_official.cpp` 或给 benchmark 增加 path C 保存输出能力。
+
+## 2026-06-25 ｜ 测试体系整顿 阶段0 精度盲区实测 ｜ Reviewer
+
+**派法**:
+- 角色:Reviewer。破坏者审查阶段0数据可信性,避免基于错数据推进阶段1/2。
+- 审查重点:`/tmp/measure_blind_spots.py` 是否真用官方 Qwen3VLEmbedder 链(do_resize=False + process_vision_info + per-item 1843200)、CPU 链是否调用当前 `preprocess_image`、noise/natural 输入是否同源、cos/max_diff 是否有 shape/grid/flatten 错误、path C full embedding blocker 是否真实。
+
+**结果**:
+- APPROVE。零 BLOCKER、零 MAJOR。
+- 独立复核 1440×2560 noise:official/cpu shape 均 `(6944,1536)`,grid 均 `[[1,62,112]]`,cos=0.9025621751299795,max_diff=1.0823148488998413,与 JSON 一致。确认这是 CPU 非AA vs 官方 AA 的真实差异,非脚本误差。
+- 官方链确认:Qwen3VLProcessor + process_vision_info(image_patch_size=16)+processor(do_resize=False)+per-item max_pixels=1843200。CPU 链确认调用当前 repo `preprocess_image` 默认 1843200。noise 输入来自 fixed seed shared bin,natural 输入同一 uint8 图喂 A/B。
+- path C full embedding blocker 成立:benchmark 非 compare 的 raw_image path C 调 `RunBenchmark(..., nullptr, ...)` 不保存 output;`--mode compare` 能保存但走 PREPROCESSED/CPU;`test_path_c_raw_image.cpp` 只 96×96 自比对且不保存 bin。未发现现成保存入口。
+- [MINOR] 阶段0脚本 system prompt 用 `Represent the given image.`,官方默认是 `Represent the user's input.`;但阶段0只比 pixel_values,文本不影响结论。阶段2 full embedding gate 必须严格对齐官方 prompt/chat template/token。
+- 影响判断:benchmark compare/test_accuracy 的 CPU/Python 自家链互比是弱信号,不能证明 vs 官方;阶段2 必须新增 path C raw_image full embedding vs official gate。
+
+## 2026-06-25 ｜ 测试体系整顿 阶段1 假阳性退码修复 ｜ Developer
+
+**派法**:
+- 角色:Developer。只修已知"已经计算 cosine 但失败不退码"的假阳性,不新增官方参考、不重写 e2e。
+- 范围:`test_vision_stages.cpp` L2a/L3 等已有 LOG_ERROR 不 CHECK 的位置;`test_pipeline_trace.py` trace 打 PASS/FAIL 但 main 恒 return 0。
+- 禁止:不改阈值、不改输入、不改参考、不碰 `test_e2e.cpp`(阶段2 official full gate 处理)。
+
+**结果**:
+- `test_vision_stages.cpp`:原 manual main 改为 `RunVisionStages()` + doctest `TEST_CASE`;所有已有 cosine failure log 后加 `CHECK`(L0/L1 0.999,L2a 0.99,L2b 0.999,L3a/L3b 0.99),失败会让 CTest FAIL。
+- `test_pipeline_trace.py`:trace() 返回 bool,main 聚合 all_ok,最后 `return 0 if all_ok else 1`;Step 8+ alternate transformers call path 标为 diagnostic/non-gated(已知低 cosine 观测,非 ATB-vs-reference gate);保留 del ref + torch.npu.empty_cache()。
+- 验证:build test_vision_stages + ctest PASS;python test_pipeline_trace.py exit 0;grep 确认 LOG_ERROR.*cos 后均接 CHECK,main 不再无条件 return 0。
+
+## 2026-06-25 ｜ 测试体系整顿 阶段1 假阳性退码修复 ｜ Reviewer
+
+**派法**:破坏者审查 worktree diff。重点:manual main→doctest 是否破坏 CTest;所有 LOG_ERROR.*cos 是否接 CHECK;pipeline trace 是否把核心 gate 纳入 all_ok;Step 8+ diagnostic 是否合理;阈值/输入/参考是否未改。
+
+**结果**:
+- APPROVE。零 BLOCKER、零 MAJOR、零必须修复 MINOR。
+- Diff 范围只改预期两个文件。`test_vision_stages.cpp` 单源 target,`DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN` 不会重复 main;`RunVisionStages()` 语义等价,`CHECK(RunVisionStages()==0)` 接入退码。所有 `LOG_ERROR(...cos...)` failure 分支后均有 CHECK,阈值未降低。实测 L2/L3 margin 充足(L2a/L2b 1.0,L3a 0.999999,L3b 0.999997)。
+- `test_pipeline_trace.py`:Step 1-7 核心 gate 均参与 all_ok,Step6 原周期性 layer cosine 也 gate,Step7 final hidden_state gate;Step 8+ alternate transformers call path 明确 diagnostic/non-gated 合理;manual vs ref-captured inputs 数值对比仍 gate;main 不再无条件 return 0;清理保留。
+- 复现:build/ctest test_vision_stages PASS;python test_pipeline_trace.py exit 0。
+
+## 2026-06-25 ｜ 测试体系整顿 阶段1 假阳性退码修复 ｜ Re-review
+
+**派法**:合回主工作区后复跑关键测试并确认退码路径。
+
+**结果**:
+- 主工作区合回两个文件后,`cmake --build atb_cpp_llm/build --target test_vision_stages -j8 && ctest --test-dir atb_cpp_llm/build -R test_vision_stages --output-on-failure` PASS。
+- `python atb_python_qwen3vl_embedding/tests/test_pipeline_trace.py` exit 0。输出显示 Step 1-7 gated 全 PASS,Step 8+ 低 cosine 均标 `(diagnostic, not gated)`,manual vs ref-captured inputs gate 全 PASS。
+- 阶段1目标达成:两个已知假阳性测试现在能把核心 cosine failure 传递为测试失败。

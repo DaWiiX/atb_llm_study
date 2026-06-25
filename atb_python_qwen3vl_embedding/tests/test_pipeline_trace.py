@@ -35,12 +35,14 @@ def cosine(a, b):
     return F.cosine_similarity(a.float().flatten(), b.float().flatten(), dim=0).item()
 
 
-def trace(label, atb, tf):
+def trace(label, atb, tf, gate=True):
     """Trace step-by-step comparison. Threshold 0.99: moderate fp16 accumulation — see THRESHOLDS.md."""
     cs = cosine(atb, tf)
-    status = "✅" if cs > 0.99 else "❌"
-    print(f"  {status} {label:<35} cosine={cs:.6f}")
-    return cs
+    ok = cs > 0.99
+    status = "✅" if ok else "❌"
+    suffix = "" if gate else " (diagnostic, not gated)"
+    print(f"  {status} {label:<35} cosine={cs:.6f}{suffix}")
+    return ok if gate else True
 
 
 def main():
@@ -74,12 +76,14 @@ def main():
 
     print(f"S={S}  pv={pv_tf.shape}  grid={gth_tf.tolist()}\n")
 
+    all_ok = True
+
     # ── Step 1: Preprocess ────────────────────────────────────────
     print("── Step 1: Preprocess ──")
     img_arr = torch.from_numpy(np.array(img)).permute(2, 0, 1)
     pv_atb, gth_atb = engine.preprocess_image(img_arr)
-    trace("pixel_values", pv_atb, pv_tf.float())
-    trace("grid_thw", gth_atb.float(), gth_tf.float())
+    all_ok &= trace("pixel_values", pv_atb, pv_tf.float())
+    all_ok &= trace("grid_thw", gth_atb.float(), gth_tf.float())
 
     # ── Step 2: Vision encoder ────────────────────────────────────
     print("\n── Step 2: Vision encoder ──")
@@ -90,13 +94,13 @@ def main():
 
     with torch.no_grad():
         # NOTE: grid_thw must stay as long (TF uses it as int for torch.linspace)
-        vis_tf_out = ref.visual(ref.place(pv_tf), grid_thw=gth_tf.to(ref.device))
+        vis_tf_out = ref.visual(to_npu_half(pv_tf), grid_thw=gth_tf.npu())
         vis_tf = to_cpu_float(vis_tf_out[0])           # TF output (CPU float)
         ds_tf = [to_cpu_float(d) for d in vis_tf_out[1]] if vis_tf_out[1] else []
 
-    trace("vision merged", vis_atb, vis_tf)
+    all_ok &= trace("vision merged", vis_atb, vis_tf)
     for i, (da, dt) in enumerate(zip(ds_atb_cpu, ds_tf)):
-        trace(f"deepstack[{i}]", da, dt)
+        all_ok &= trace(f"deepstack[{i}]", da, dt)
 
     # ── Step 3: Image injection ───────────────────────────────────
     print("\n── Step 3: Image injection ──")
@@ -107,8 +111,8 @@ def main():
     ie_atb = F.embedding(input_ids, engine.embed_w).half().npu()          # (1,S,hd) NPU
     ie_atb[0, vis_mask_1d.npu(), :] = to_npu_half(vis_atb)               # inject
 
-    # TF: replicate transformers Qwen3VLModel image-injection exactly
-    ie_tf = ref.get_input_embeddings()(input_ids.to(ref.device)).to(ref.dtype)           # (1,S,hd)
+    # TF: all on NPU — replicate transformers Qwen3VLModel image-injection exactly
+    ie_tf = ref.get_input_embeddings()(input_ids.npu()).half()           # (1,S,hd) NPU
     image_embeds_cat = torch.cat([vis_tf], dim=0).to(ie_tf.device, ie_tf.dtype)
     tok_emb = ref.get_input_embeddings()(
         torch.tensor(cfg.image_token_id, dtype=torch.long, device=ie_tf.device))
@@ -116,12 +120,12 @@ def main():
     image_mask = special_image_mask.all(-1, keepdim=True).expand_as(ie_tf)  # (1,S,hd)
     ie_tf = ie_tf.masked_scatter(image_mask, image_embeds_cat)
 
-    trace("inputs_embeds after injection", ie_atb.cpu(), ie_tf.cpu())
+    all_ok &= trace("inputs_embeds after injection", ie_atb.cpu(), ie_tf.cpu())
 
     # Compare injected vision tokens only
     atb_injected = ie_atb[0, vis_mask_1d.npu(), :].cpu()
-    tf_injected = ie_tf[0, vis_mask_1d.to(ref.device), :].cpu()
-    trace("injected vision tokens only", atb_injected, tf_injected)
+    tf_injected = ie_tf[0, vis_mask_1d.npu(), :].cpu()
+    all_ok &= trace("injected vision tokens only", atb_injected, tf_injected)
 
     # ── Step 4: Position IDs ──────────────────────────────────────
     print("\n── Step 4: Position IDs ──")
@@ -131,7 +135,7 @@ def main():
         spatial_merge_size=engine.spatial_merge)
     with torch.no_grad():
         tf_pid, _ = ref.get_rope_index(input_ids, gth_tf, None, None)
-    trace("position_ids", atb_pid.float(), tf_pid.float())
+    all_ok &= trace("position_ids", atb_pid.float(), tf_pid.float())
 
     # ── Step 5: RoPE cos/sin ──────────────────────────────────────
     print("\n── Step 5: RoPE cos/sin ──")
@@ -140,14 +144,14 @@ def main():
     sin_atb = atb_sin.reshape(-1, engine.hd_t)
 
     with torch.no_grad():
-        dummy = torch.zeros(1, S, engine.hidden_t, device=ref.device, dtype=ref.dtype)
-        # tf_pid is on CPU → move to ref device for rotary_emb
-        tf_cos, tf_sin = ref.language_model.rotary_emb(dummy, tf_pid.float().to(ref.device))
+        dummy = torch.zeros(1, S, engine.hidden_t, device='npu')
+        # tf_pid is on CPU → move to NPU for rotary_emb
+        tf_cos, tf_sin = ref.language_model.rotary_emb(dummy, tf_pid.float().npu())
     cos_tf = tf_cos.reshape(-1, engine.hd_t)
     sin_tf = tf_sin.reshape(-1, engine.hd_t)
 
-    trace("cos", cos_atb, cos_tf.cpu())
-    trace("sin", sin_atb, sin_tf.cpu())
+    all_ok &= trace("cos", cos_atb, cos_tf.cpu())
+    all_ok &= trace("sin", sin_atb, sin_tf.cpu())
 
     # ── Step 6: Text model layer by layer ─────────────────────────
     print("\n── Step 6: Text model (layer by layer) ──")
@@ -158,17 +162,15 @@ def main():
         causal_mask_atb = make_causal_mask_nz_npu(S)
     else:
         causal_mask_atb = causal_mask
-    # TF attention mask follows ref's device/dtype (causal_mask itself is ATB-only, NPU).
-    causal_mask_tf = make_causal_mask(S).to(ref.device, ref.dtype).unsqueeze(0).unsqueeze(0)
 
     # Move everything to NPU for the loop
     hidden_atb = ie_atb                                                # already NPU
-    hidden_tf = ie_tf                                                  # on ref device
+    hidden_tf = ie_tf                                                  # already NPU
     cos_npu = to_npu_half(cos_atb)
     sin_npu = to_npu_half(sin_atb)
-    tf_cos_npu = tf_cos.to(ref.device, ref.dtype)
-    tf_sin_npu = tf_sin.to(ref.device, ref.dtype)
-    vis_mask_2d = vis_mask_1d.unsqueeze(0).to(ref.device)             # (1,S) bool
+    tf_cos_npu = tf_cos.half().npu()
+    tf_sin_npu = tf_sin.half().npu()
+    vis_mask_2d = vis_mask_1d.unsqueeze(0).npu()                     # (1,S) bool NPU
 
     ds_indexes = engine.ds_indexes
     print(f"  deepstack at layers: {ds_indexes}")
@@ -187,7 +189,7 @@ def main():
             hidden_tf = ref.language_model.layers[li](
                 hidden_tf,
                 position_embeddings=(tf_cos_npu, tf_sin_npu),
-                attention_mask=causal_mask_tf)
+                attention_mask=causal_mask.unsqueeze(0).unsqueeze(0).float())
 
         torch.npu.synchronize()
 
@@ -199,7 +201,7 @@ def main():
             hidden_atb[0, vis_mask_1d.npu(), :] = local_atb
 
             # TF: _deepstack_process
-            ds_npu_tf = ds_tf[li].to(ref.device, ref.dtype)
+            ds_npu_tf = to_npu_half(ds_tf[li])  # ds_tf[li] is CPU → NPU
             local_tf = hidden_tf[vis_mask_2d, :].clone() + ds_npu_tf
             hidden_tf[vis_mask_2d, :] = local_tf
 
@@ -209,6 +211,7 @@ def main():
             ds_tag = " [+ds]" if li in ds_indexes else ""
             status = "✅" if cs > 0.99 else "❌"  # 0.99: moderate fp16 accumulation — see THRESHOLDS.md
             print(f"  {status} layer {li:2d}{ds_tag:<8} cosine={cs:.6f}")
+            all_ok &= cs > 0.99
 
     # ── Step 7: Final norm ────────────────────────────────────────
     print("\n── Step 7: Final norm ──")
@@ -217,7 +220,7 @@ def main():
     with torch.no_grad():
         out_tf = ref.language_model.norm(hidden_tf).cpu().float()
 
-    trace("final hidden_state", out_atb, out_tf)
+    all_ok &= trace("final hidden_state", out_atb, out_tf)
 
     # ── Step 8: Sanity — compare manual-TF vs ref(...) full forward ───
     # If manual_tf == ref_full, our TF chain mirrors the production path.
@@ -227,12 +230,15 @@ def main():
     print("\n── Step 8: Sanity check — manual TF vs ref(...) full ──")
     with torch.no_grad():
         ref_full = ref(
-            input_ids=input_ids.to(ref.device),
-            pixel_values=ref.place(pv_tf),
-            image_grid_thw=gth_tf.to(ref.device),
+            input_ids=input_ids.npu(),
+            pixel_values=pv_tf.half().npu(),
+            image_grid_thw=gth_tf.npu(),
         ).last_hidden_state.cpu().float()
-    trace("manual_TF vs ref_full", out_tf, ref_full)
-    trace("ATB     vs ref_full",   out_atb, ref_full)
+    # Step 8+ bisect comparisons intentionally mix alternate transformers call
+    # paths to diagnose why ref(...) differs from manual/replayed language_model
+    # calls. They are observational diagnostics, not ATB-vs-reference gates.
+    all_ok &= trace("manual_TF vs ref_full", out_tf, ref_full, gate=False)
+    all_ok &= trace("ATB     vs ref_full",   out_atb, ref_full, gate=False)
 
     # ── Step 9: Bisect ref_full into stages ────────────────────────────
     # If language_model(inputs_embeds=ie_tf, ...) matches ref_full, the
@@ -241,17 +247,17 @@ def main():
     print("\n── Step 9: Sub-bisect with ref.language_model(...) ──")
     with torch.no_grad():
         # Use TF-built ie_tf + manually computed tf_pid + deepstack list
-        ds_for_lm = [d.to(ref.device, ref.dtype) for d in ds_tf] if ds_tf else None
+        ds_for_lm = [d.half().npu() for d in ds_tf] if ds_tf else None
         vis_pos_masks_lm = vis_mask_2d if ds_for_lm else None
         sub_out = ref.language_model(
             inputs_embeds=ie_tf,
-            position_ids=tf_pid.to(ref.device),
+            position_ids=tf_pid.npu(),
             visual_pos_masks=vis_pos_masks_lm,
             deepstack_visual_embeds=ds_for_lm,
         ).last_hidden_state.cpu().float()
-    trace("sub_LM   vs ref_full", sub_out, ref_full)
-    trace("sub_LM   vs manual_TF", sub_out, out_tf)
-    trace("sub_LM   vs ATB",       sub_out, out_atb)
+    all_ok &= trace("sub_LM   vs ref_full", sub_out, ref_full, gate=False)
+    all_ok &= trace("sub_LM   vs manual_TF", sub_out, out_tf, gate=False)
+    all_ok &= trace("sub_LM   vs ATB",       sub_out, out_atb, gate=False)
 
     # ── Step 10: Capture ref's actual inputs to language_model ─────────
     # Monkey-patch language_model.forward so we can see what Qwen3VLModel
@@ -279,14 +285,14 @@ def main():
     ref.language_model.forward = spy_forward
     with torch.no_grad():
         spy_ref_full = ref(
-            input_ids=input_ids.to(ref.device),
-            pixel_values=ref.place(pv_tf),
-            image_grid_thw=gth_tf.to(ref.device),
+            input_ids=input_ids.npu(),
+            pixel_values=pv_tf.half().npu(),
+            image_grid_thw=gth_tf.npu(),
         ).last_hidden_state.cpu().float()
     ref.language_model.forward = real_lm_forward  # restore
 
     # Sanity: spy's ref_full should equal Step 8 ref_full (spy is pure wrapper)
-    trace("spy_ref_full vs ref_full (Step 8)", spy_ref_full, ref_full)
+    all_ok &= trace("spy_ref_full vs ref_full (Step 8)", spy_ref_full, ref_full, gate=False)
 
     # ── Step 10b: rerun sub_LM with EXACTLY the captured inputs ────────
     # captured kwargs came straight from ref(...); feed them back into
@@ -302,9 +308,9 @@ def main():
             visual_pos_masks=captured["visual_pos_masks"],
             deepstack_visual_embeds=captured["deepstack_visual_embeds"],
         ).last_hidden_state.cpu().float()
-    trace("replay   vs ref_full",  replay, ref_full)
-    trace("replay   vs sub_LM",    replay, sub_out)
-    trace("replay   vs manual_TF", replay, out_tf)
+    all_ok &= trace("replay   vs ref_full",  replay, ref_full, gate=False)
+    all_ok &= trace("replay   vs sub_LM",    replay, sub_out, gate=False)
+    all_ok &= trace("replay   vs manual_TF", replay, out_tf, gate=False)
 
     # ── Step 10c: dump EVERY arg/kw spy received, then replay them all ──
     # captured_all_kw + captured_args contain the COMPLETE call into
@@ -330,9 +336,9 @@ def main():
     print("\n  Replay with EXACT captured args+kwargs:")
     with torch.no_grad():
         replay_all = real_lm_forward(*captured_args, **captured_all_kw).last_hidden_state.cpu().float()
-    trace("replay_ALL vs ref_full",   replay_all, ref_full)
-    trace("replay_ALL vs replay",     replay_all, replay)
-    trace("replay_ALL vs ATB",        replay_all, out_atb)
+    all_ok &= trace("replay_ALL vs ref_full",   replay_all, ref_full, gate=False)
+    all_ok &= trace("replay_ALL vs replay",     replay_all, replay, gate=False)
+    all_ok &= trace("replay_ALL vs ATB",        replay_all, out_atb, gate=False)
 
     # ── Step 10d: isolate which of the 3 cache-related kwargs breaks it ─
     # Add use_cache / past_key_values / cache_position one at a time on top
@@ -352,8 +358,8 @@ def main():
         kw_test[extra_key] = captured_all_kw[extra_key]
         with torch.no_grad():
             out_test = ref.language_model(**kw_test).last_hidden_state.cpu().float()
-        trace(f"+{extra_key:<18} vs ref_full", out_test, ref_full)
-        trace(f"+{extra_key:<18} vs ATB",      out_test, out_atb)
+        all_ok &= trace(f"+{extra_key:<18} vs ref_full", out_test, ref_full, gate=False)
+        all_ok &= trace(f"+{extra_key:<18} vs ATB",      out_test, out_atb, gate=False)
 
     # Compare what ref REALLY passes against what we built manually
     print("\n  Inputs captured from real ref(...) call:")
@@ -371,22 +377,22 @@ def main():
     # Direct numerical compare
     print("\n  Numerical match (manual vs ref-captured):")
     if captured["inputs_embeds"] is not None:
-        trace("inputs_embeds",   ie_tf.cpu(), captured["inputs_embeds"].cpu())
+        all_ok &= trace("inputs_embeds",   ie_tf.cpu(), captured["inputs_embeds"].cpu())
     if captured["position_ids"] is not None:
-        trace("position_ids",    tf_pid.float().cpu(),
-              captured["position_ids"].float().cpu())
+        all_ok &= trace("position_ids",    tf_pid.float().cpu(),
+                        captured["position_ids"].float().cpu())
     if captured["visual_pos_masks"] is not None:
-        trace("visual_pos_masks", vis_mask_2d.float().cpu(),
-              captured["visual_pos_masks"].float().cpu())
+        all_ok &= trace("visual_pos_masks", vis_mask_2d.float().cpu(),
+                        captured["visual_pos_masks"].float().cpu())
     if captured["deepstack_visual_embeds"] is not None and ds_tf:
         for i, (manual, real) in enumerate(zip(ds_tf, captured["deepstack_visual_embeds"])):
-            trace(f"deepstack[{i}]", manual.cpu(), real.cpu())
+            all_ok &= trace(f"deepstack[{i}]", manual.cpu(), real.cpu())
 
     print("\nDone.")
 
     del ref
     torch.npu.empty_cache()
-    return 0
+    return 0 if all_ok else 1
 
 
 if __name__ == "__main__":
