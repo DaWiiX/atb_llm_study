@@ -84,6 +84,39 @@ ATB LLM 项目支持 **Ascend 310P** (Atlas推理系列产品) 和 **Ascend 910B
   shape: [maxSeqLen, maxSeqLen]
 ```
 
+## bicubic AA 降采样预处理：310P small-op 拼装（2026-06-29，P10-C / Batch A-C）
+
+### 问题
+官方图像预处理 resize 用 PIL `Image.resize(BICUBIC)`（默认含 antialias 预滤波）。910B 用硬件 AA 算子 `aclnnUpsampleBicubic2dAA` 直接对齐。**310P 上该 AA 算子不支持**（aclnnStatus=561103），非 AA 的 `aclnnUpsampleBicubic2d`（torch a=-0.75 Mitchell，无 AA）在降采样时严重偏离 PIL（1080×1920→992×1792 cos=0.987、1440×2560 cos=0.958），不达 cos≥0.99 闸口。
+
+### 方案：separable 双轴 dense MatMul
+PIL AA bicubic 本质是 **separable filtering**（先按宽 H pass、再按高 V pass），每个输出像素是源像素的加权和，权重由 PIL `precompute_coeffs`（`docs/archive/Resample.c`，bicubic 核 a=-0.5、support=`2.0*max(1, in/out)`）决定。把每轴的稀疏权重**摊成稠密矩阵**，每轴就是一次稠密 MatMul：
+
+```
+H pass: input[1,C,H,Win] view [C*H, Win] @ W_h^T[out_w, in_w] -> [C*H, out_w] -> [1,C,H,out_w]
+Transpose [1,C,H,W'] -> [1,C,W',H]        (perm {0,1,3,2})
+V pass: view [C*W', H] @ W_v^T[out_h, H]  -> [C*W', out_h] -> [1,C,W',out_h]
+Transpose [1,C,W',out_h] -> [1,C,out_h,W'] (perm {0,1,3,2})
+```
+
+**为何 separable MatMul 而非自写 resize kernel**：ATB/aclnn 无 PIL 等价 resize；ATB Linear（仓库内全 2-D + `transposeB=true`）+ Transpose 是现成、已验证的算子，把动态宽 kernel 摊成稠密权重后整个 resize 就是 2 个 MatMul + 2 个 Transpose，复用引擎既有算子路径，无需新 kernel。权重 host 端按 PIL 公式算 fp32 系数（**不做 8bpc 整数化 / clip8**——910B AA 也是 fp16 全程无 uint8 量化，实测仍 cos≥0.99998），fp32→fp16 RNE 后 H2D，生命周期跟临时缓冲走 goto cleanup。
+
+### per-axis skip
+`need_h=(out_w!=in_w)`、`need_v=(out_h!=in_h)`，跳过未变的轴：
+- 双轴恒等（416×672→416×672）→ device-to-device async memcpy，零 MatMul。
+- 单轴（720×1280→704×1280 仅高变=V-only；或宽变高不变=H-only）→ 只跑该轴的 MatMul + 必要 Transpose。
+
+### 资源管理
+单算子统一走共享 `ExecuteOperation`（`src/families/base_model.h`）。所有中间 device tensor（w_h/h_out/h_tr/w_v/v_out）在 **end-of-pipeline 单次 `runtime->Synchronize()` 之后**逆序 Free——`aclrtFree` 非 stream-ordered，必须先 drain async 队列才能安全释放（Batch A Reviewer BLOCKER-1）。不下发 per-op sync（不破坏 async 流水）。
+
+### 与 910B 等价的实测（cos）
+- spike vs PIL ground truth：416 恒等 1.000000 / 720→704（H-only）0.999984 / 1080→992×1792（双轴）0.999980 / 1440 最劣 0.999995。
+- H-only 直测 64×128→64×64：cos=0.999998。
+- 端到端 small-op AA full-pipeline（resize+normalize+patchify）vs CPU PIL PreprocessImage 4 分辨率：cos=1.0/0.999924/0.999878/0.999950。
+- Reviewer 独立 Python 复刻 `precompute_coeffs` 权重逐元素对照 + 篡改 bin fail-closed 验证，证明 small-op AA 与 910B `aclnnUpsampleBicubic2dAA` **数值等价**。
+
+性能基线（910B 实测，separable 5 算子单图）：720→704 0.81 ms / 1080→992×1792 3.72 ms / 1440 4.53 ms / 416 恒等 0.01 ms。实现 `src/components/vision/smallop_bicubic_aa.{h,cpp}`，分发见 `qwen3vl_preprocess.cpp:438`，详见 STATUS §2.9 / optimization-roadmap P10-C。
+
 ## 实验矩阵：SelfAttentionOp 原子级参数组合
 
 > **实验原则**：先基础功能，后高级功能。每次只改变一个变量。记录所有结果。

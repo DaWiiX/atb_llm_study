@@ -78,7 +78,7 @@ full embedding vs official gate 中，C++ 使用的 token 必须从**同一次 o
 
 | 缺口 | 状态 | 风险 |
 |------|------|------|
-| 310P vs official full embedding | 未覆盖；official full gate skip | AA 不可用，不能宣称 310P 对齐 official full embedding |
+| 310P vs official full embedding | 未覆盖；official full gate skip | full-engine attention 路径需 310P 硬件验证（CI 在 910B）；bicubic 降采样已由 small-op AA 对齐 PIL，非 skip 理由 |
 | benchmark compare vs official | 未覆盖；compare 非 official gate | compare PASS 只能说明 C++/Python 自家链一致，可能共同偏离 official |
 | Python e2e production resolution vs official | 弱覆盖/未系统覆盖 | Python toy/e2e sanity 不能替代 4 个生产分辨率 official gate |
 | natural image official gate | 当前 official gate 使用 noise prod inputs；natural 图已有阶段0 preprocess 观测 | noise 是 worst-case 高频输入；natural coverage 可补充代表性，但不能替代 worst-case |
@@ -210,7 +210,7 @@ full embedding refdata 必须保证：
 - 910B AA official full embedding gate 的替代。
 - “已对齐 official Qwen3VLEmbedder”的证明。
 
-原因：official 降采样链包含 AA 语义，310P 无可用 `aclnnUpsampleBicubic2dAA` 路径；因此 `test_engine_vs_official` 在 310P skip 是明确 limitation。
+原因：`test_engine_vs_official` 跑完整 engine（含 SelfAttention），310P 上需 NZ mask 路径且需 310P 硬件实测，当前 CI 在 910B 硬件，故 310P skip 是明确 limitation。**注意**：bicubic 降采样本身在 310P 已由 small-op AA 拼装（`NpuBicubicResizeAASmallOp`，端到端与 910B aclnn AA 数值等价，见 STATUS §2.9 / roadmap P10-C）对齐 PIL，**不再是 skip 的理由**——skip 仅因 full-engine attention 路径需 310P 硬件验证。
 
 ---
 

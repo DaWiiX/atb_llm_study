@@ -604,6 +604,15 @@ def gen_bicubic_preprocess():
         name = f"prod_{in_h}x{in_w}"
         _gen_bicubic_case(name, img, out_h, out_w)
 
+    # ── H-only downsample case (width shrinks, height unchanged) ─────────
+    # Covers the small-op AA `need_h && !need_v` branch (direct-write output_view
+    # + early goto cleanup, smallop_bicubic_aa.cpp:203-217), which the 4 prod
+    # resolutions don't isolate (416=identity, 720=V-only, 1080/1440=double-axis).
+    # [3,64,128] -> [3,64,64]: out_w(64)!=in_w(128) => H active; out_h==in_h => V skip.
+    np.random.seed(99)
+    honly_img = (np.random.rand(3, 64, 128) * 255.0).astype(np.float32)
+    _gen_bicubic_case("honly_64x128", honly_img, 64, 64)
+
 
     # ── PreprocessImage cases ───────────────────────────────────
     # Load the in-repo Python reference (matches engine.preprocess_image).

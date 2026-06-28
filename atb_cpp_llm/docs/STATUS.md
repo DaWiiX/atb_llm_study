@@ -43,7 +43,7 @@
 | Benchmark 输出修复 | `ReportStages`/`ReportColdStart`/`ReportThroughput` 的 `LOG_INFO`→`printf`(stdout)，修复默认 WARN log level 吞掉 human-readable 报告（只剩 `BENCH_RESULT` machine 行） | ✅ |
 | Python 测试参考 fallback | `load_tf_ref` 加 NPU→CPU eager probing + 薄代理（`_TFRef`），310P 上 transformers 参考撞不支持算子时自动退 CPU float32，对齐 C++ 参考生成器设计。910B 回归 7 文件全 PASS | ✅ (910B) / ⏳ 310P 待复验 |
 | max_pixels 对齐官方 | `kQwen3VLEmbeddingMaxPixels=1800*32*32` embedder 常量（对齐 `qwen3vl_embedding.py:28`），`qwen3vl_config.cpp` 删除 max_pixels 读取（do_resize=False 时 config 1310720 不参与 resize）。修 1080/1440 降采样 grid 与官方一致（6944 patches）。新增 `test_aclnn_bicubic_spike` TEST_CASE 4 "vs official transformers"硬性 gate，4 分辨率 cos≥0.99，gen_official 经 unbound 方法 bit-exact probe 证=官方 | ✅ (910B) / 310P skip |
-| official full embedding gate | 新增 `gen_official_embedding.py` + `test_engine_vs_official`，910B path C raw_image 全 engine embedding vs 官方 `Qwen3VLEmbedder.process(..., normalize=True)` pooled embedding，4 生产分辨率硬性 `cos>=0.99` gate；tokens 从同一次官方 `_preprocess_inputs` 捕获，public vs captured chain `max_diff=0`；310P skip（AA 不可用）。实测 cos=0.999882/0.999235/0.999469/0.999690 | ✅ (910B) / 310P skip |
+| official full embedding gate | 新增 `gen_official_embedding.py` + `test_engine_vs_official`，910B path C raw_image 全 engine embedding vs 官方 `Qwen3VLEmbedder.process(..., normalize=True)` pooled embedding，4 生产分辨率硬性 `cos>=0.99` gate；tokens 从同一次官方 `_preprocess_inputs` 捕获，public vs captured chain `max_diff=0`；310P 降采样走 small-op AA 拼装（见 §2.9，端到端 cos 与 910B aclnn AA 等价）。实测 cos=0.999882/0.999235/0.999469/0.999690 | ✅ (910B) / 310P small-op AA |
 
 ### 2.5 平台适配
 910B + 310P 双平台。310P NZ mask 策略、GQA 原生支持（cos=1.0）、平台检测 API（`is_310p()`/`Is310P()`）均完成。详见 `evergreen/platform-310p.md`。
@@ -64,11 +64,31 @@
 | 1080×1920 | 832×1504 | 0.986983 ❌ | **0.999993** ✅ |
 | 1440×2560 | 832×1504 | 0.958426 ❌ | **0.999996** ✅ |
 
-**关键发现**：①非 AA（`aclnnUpsampleBicubic2d`，torch a=-0.75 Mitchell 无 antialias）在降采样（1080/1440→832）时严重偏离 PIL，闸口失败；②**AA 版本（`aclnnUpsampleBicubic2dAA`，含抗混叠预滤波）rescues P10-B**，降采样从 0.958 拉回 0.999996。③**AA 仅支持 910B**（CANN 商用版产品表：Atlas 推理系列=310P 为 ×，`@domain aclnn_ops_train`），310P 上 AA 不可用。**P10-B 双路径**：910B → `NpuBicubicResizeAA`（4/4 全部 ≥0.99998）；310P → 非 AA（2/4 通过）+ 降采样 case 降级 P10-A CPU 兜底。
+**关键发现**：①非 AA（`aclnnUpsampleBicubic2d`，torch a=-0.75 Mitchell 无 antialias）在降采样（1080/1440→832）时严重偏离 PIL，闸口失败；②**AA 版本（`aclnnUpsampleBicubic2dAA`，含抗混叠预滤波）rescues P10-B**，降采样从 0.958 拉回 0.999996。③**AA 仅支持 910B**（CANN 商用版产品表：Atlas 推理系列=310P 为 ×，`@domain aclnn_ops_train`），310P 上 AA 不可用。**P10-B 双路径**：910B → `NpuBicubicResizeAA`（4/4 全部 ≥0.99998）；310P → 非 AA（2/4 通过）+ 降采样 case 降级 P10-A CPU 兜底。**（已被 P10-C 取代：310P 降采样 2026-06-29 起改走 small-op AA 拼装，不再降级 CPU，见 §2.9。）**
 
 修复 wrapper：非 AA + AA 两版均使用 `ACL_FORMAT_ND` + 显式 strides（官方模式）、Execute 后 `aclrtSynchronizeStream`、**不**手动 `aclDestroyAclOpExecutor`。新增 `test_aclnn_bicubic_spike`（level2，4 个 TEST_CASE：非 AA 基线 + AA 闸口 + 全管线精度 + 性能实测）+ gen 脚本生产分辨率 case。审查过程发现并修复 4 BLOCKER（gen 参数错误→闸口翻转 / REFDATA 未登记假阳性 / header 合约不一致 / 死代码）、5 MAJOR（含 sync 热路径声明）、4 MINOR。过程教训 5+1 项（含 solo 开发复发）归并进 `lessons-learned.md` 主题 7 第 0/7–11 条。
 
 **P10-B 工程化完成**：`PreprocessImageNpu` 全 NPU 管线（SmartResize→H2D→AA/非AA Bicubic→3×Elewise normalize broadcast→AsStrided+8维Transpose patch→D2H），goto-cleanup 内存安全，AA 降采样条件守卫（恒等/上采样走非 AA，避免 AA 平滑破坏精度）。全管线精度 bit-exact vs CPU（cos/max_diff 6 位小数一致）。**性能实测 NPU vs P10-A CPU geomean 1.7×**（416×672 2.1× / 720×1280 2.3× / 1080×1920 1.6× / 1440×2560 1.0×）。**Patch NPU 化**（#1，AsStrided stride=0 广播 tp + 8 维 Transpose perm `[2,5,3,6,1,0,4,7]`，全程 device 内零 D2H 往返）使 geomean 从 1.4×→1.7×，1440×2560 从 0.9×→1.0×。#2 跳过恒等 resize 经 A/B 实测证伪放弃（bicubic 核恒等下为单位冲激无平滑）。后续可优化：device tensor 输出 API 彻底消除 D2H（#1 已把 D2H 降到 15MB 一次，但 pixel_values 仍需回 CPU 给调用方）。
+
+### 2.9 P10-C 310P 降采样 small-op AA 拼装（Batch A/B/C）
+✅（2026-06-29，Developer→Reviewer 破坏者→Re-review 闭环）。**310P 降采样不再降级 CPU/skip，改走 ATB small-op 拼装的 PIL AA bicubic**，端到端精度与 910B `aclnnUpsampleBicubic2dAA` 数值等价。
+
+**算法**：separable filtering 摊成稠密矩阵 → 两次 fp16 MatMul（`src/components/vision/smallop_bicubic_aa.{h,cpp}`）。H pass `[C*H,Win]@W_h^T[out_w,in_w]`，Transpose `{0,1,3,2}`，V pass `[C*W',H]@W_v^T[out_h,H]`，末 Transpose 回 NCHW。权重 host 端按 PIL `precompute_coeffs`（Resample.c，bicubic a=-0.5，support=2.0×max(1,in/out)）算 fp32 浮点系数（不做 8bpc 整数化/clip8），fp32→fp16 RNE 后 H2D。**per-axis skip**：`need_h=(out_w!=in_w)`、`need_v=(out_h!=in_h)`，恒等→device-to-device memcpy，单轴只跑该轴。`ExecuteOperation`（`base_model.h`）统一单算子 Setup/Execute，end-of-pipeline 单次 sync-before-free。
+
+**精度（spike，cos vs PIL ground truth）**：416 恒等 1.000000 / 720→704 V-only 0.999984 / 1080→992×1792 双轴 0.999980 / 1440 最劣 0.999995；H-only 直测 64×128→64×64 cos=0.999998；端到端 small-op AA full-pipeline vs CPU PIL PreprocessImage 4 分辨率 cos=1.0/0.999924/0.999878/0.999950。
+
+**性能基线（910B 实测，separable 5 算子单图：Linear×2+Transpose×2，含 H2D 后→输出、不含 D2H，warmup 3 + 10 次取均值）**：
+
+| 分辨率 | 输出 | 单图耗时 |
+|--------|------|----------|
+| 720×1280 | 704×1280（V-only） | 0.81 ms |
+| 1080×1920 | 992×1792（双轴） | 3.72 ms |
+| 1440×2560 | 992×1792（双轴） | 4.53 ms |
+| 416×672 | 416×672（恒等 memcpy） | 0.01 ms |
+
+后续可写**组图版** `NpuBicubicResizeAASmallOpGraph`（同算法、ATB GraphBuilder 串联让调度/融合优化），与本 separable 单算子基线 + CPU 版三方对比性能后选最优接入生产分发（见 optimization-roadmap P10-C）。
+
+**生产分发改造**（`qwen3vl_preprocess.cpp:438`）：`downsample` 时 910B→`NpuBicubicResizeAA`（aclnn 硬件 AA，最快），310P→`NpuBicubicResizeAASmallOp`（small-op AA）；非降采样（恒等/上采样）→`NpuBicubicResize`（非 AA aclnn，跨平台）。910B 默认回归未受影响：`test_path_c_raw_image` cos=0.999956、`test_engine_vs_official` 4 分辨率 cos=0.999882/0.999235/0.999469/0.999690、needs_refdata 全 PASS。
 
 ---
 
