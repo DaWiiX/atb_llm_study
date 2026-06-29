@@ -331,3 +331,38 @@
 - MINOR 修复:`return all_ok`→`assert all_ok`，__main__ 改由 assert 驱动退码。验证 forced FAIL→EXIT=1、restored→EXIT=0，临时改动完全恢复。
 
 **全任务成果**:C++ CPU + Python 引擎预处理均 bit-exact 对齐官方 PIL 8bpc；1440 noise cos 0.90→1.0；CPU vs 官方 4 分辨率 cos=1.0；全管线 IMAGE_ONLY 0.978→PASS。lessons 归档主题6第4条（重实现参考链需同步同源生产者 + 窄口径是钝指标）。
+
+## 2026-06-29 ｜ 310P 降采样 small-op AA bicubic 拼装 Batch A/B/C ｜ Developer + Reviewer 破坏者 + Re-review
+
+**背景**:310P 上 `aclnnUpsampleBicubic2dAA` 不支持（aclnnStatus=561103），非 AA 降采样 1080/1440 仅 cos 0.987/0.958 不达 0.99 闸口；原 310P 降采样降级 CPU/skip。目标:用 ATB 小算子拼装 PIL AA bicubic（separable 双轴 dense MatMul），让 310P 降采样端到端对齐 910B aclnn AA。三 Batch 派单，全程 Dev→Reviewer 破坏者→Re-review 纪律。
+
+### Batch A ｜ Spike 单分辨率算法验证
+**派法**:
+- Developer:新增 `smallop_bicubic_aa.{h,cpp}`（`PrecomputeCoeffsFloat` 复刻 Resample.c + `BuildDenseWeightFp16` 稠密化 + `NpuBicubicResizeAASmallOp` H/V pass + per-axis skip + goto-cleanup）+ `test_aa_smallop_spike.cpp` TC1（1080×1920→992×1792 最劣 case vs PIL），注册 REFDATA_DEPENDENT_TESTS。
+- Reviewer 破坏者:独立 Python 复刻 `PrecomputeCoeffsFloat` 逐元素对照权重、篡改 bin 验 cos 跌破、lifetime/cleanup grep、雷区清单（`(int)` 截断/xmin-xmax clamp/filterscale/归一化）逐条核。
+
+**结果**:
+- Dev:TC1 cos=0.999980。
+- Reviewer:命中 **BLOCKER-1**——cleanup 在 async 算子未 drain 前 `alloc->Free`（`aclrtFree` 非 stream-ordered，可能 free 仍被读的 w_h/h_out/h_tr/w_v/v_out）。
+- Re-review（SendMessage 续 Dev）:BLOCKER-1 修复——cleanup 前加 end-of-pipeline `runtime->Synchronize()`，再逆序 Free；H-only 提前 goto 也经此 sync。
+
+### Batch B ｜ 扩 4 分辨率 + 端到端 vs CPU PIL 闸口
+**派法**:
+- Developer:TC2（4 生产分辨率 vs PIL，含 416 恒等/720 V-only/1080,1440 双轴）+ TC3（full NPU pipeline small-op AA + normalize + patchify vs CPU PIL PreprocessImage，无 Is910B 守卫），手串 `RunNpuPipelineSmallOpAA` 不碰生产分发。**用 `ExecuteOperation`（`base_model.h`）替换 anonymous `RunAtbOp`，删重复**（后续工作 DRY 项）。
+- Reviewer 破坏者:独立 Python PIL+numpy 端到端 vs TC3 dump 对照、篡改 bin、核 per-axis skip 真生效、4 分辨率轮跑无泄漏。
+
+**结果**:
+- Dev:TC2 416=1.0/720=0.999984/1080=0.999980/1440=0.999995；TC3 端到端 cos=1.0/0.999924/0.999878/0.999950。
+- Reviewer:证明 small-op AA 与 910B 硬件 AA **数值等价**（独立 Python 交叉验证），无 BLOCKER；**MINOR-1**——H-only 路径（`need_h && !need_v`，独有直写 output_view + 提前 goto cleanup）无测试覆盖。
+
+### Batch C ｜ 工程化分发 + 端到端回归 + 性能基线 + 补盲区 + 文档
+**派法**:Developer surgical 改 `qwen3vl_preprocess.cpp:438` 分发（910B→aclnn AA / 310P→small-op AA / 非降采样→非 AA）+ 补 H-only TEST_CASE（MINOR-1）+ perf 基线 TEST_CASE + 910B 默认回归 + 文档 5 处。
+
+**结果**:
+- 分发改造:include `smallop_bicubic_aa.h` + 嵌套 if/else（`aclError`→`Status` 转换），:434 注释更新。0 新 warning。
+- H-only（TC4 64×128→64×64）cos=0.999998（补 MINOR-1 盲区，gen_cpu_reference.py 加 `honly_64x128` case）。
+- perf 基线（separable 5 算子单图，910B 实测）:720→704 0.81 ms / 1080→992×1792 3.72 ms / 1440 4.53 ms / 416 恒等 0.01 ms（后续组图版对比基线）。
+- 910B 默认回归:`test_path_c_raw_image` cos=0.999956、`test_engine_vs_official` 4 分辨率 cos=0.999882/0.999235/0.999469/0.999690、`ctest -L needs_refdata` **31/31 PASS**（aclnn AA 路径未被改坏）。spike 全 5 TC pass。
+- `ASCEND_PLATFORM=310P` 评估:test_aa_smallop_spike（不涉 attention）310P 配置下 5/5 PASS；test_path_c_raw_image 在 910B 硬件 + 310P 配置下 Path A Encode FAIL（`ExecuteOperation` Setup status 4 = SelfAttention NZ mask 平台模拟副作用，非 small-op 问题，记录不阻塞——small-op 正确性已由 TC3 + spike 310P 配置证）。
+
+**关键发现归档**:BLOCKER-1 async free（`aclrtFree` 非 stream-ordered，cleanup 须先 drain）、TC3 与 910B aclnn AA 数值等价、`ExecuteOperation` 复用消除 RunAtbOp 重复（DRY）、H-only 盲区补测（MINOR-1）。

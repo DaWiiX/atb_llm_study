@@ -234,9 +234,13 @@ grep -RIn "test_engine_vs_official\|gen_official_embedding\|gen_official_pixel_v
 
 ## 6. 310P 注意事项
 
-1. **AA 不可用**
-   - `aclnnUpsampleBicubic2dAA` 当前不可用于 310P。
-   - 因官方链降采样带 AA，而 310P 没有对应 AA 路径，full official gate 当前 skip。
+1. **AA：310P 用 small-op AA 拼装替代 aclnn AA**
+   - `aclnnUpsampleBicubic2dAA` 在 310P 上不支持（aclnnStatus=561103）。
+   - 因官方链降采样带 AA，310P 改用 ATB small-op 拼装的 separable AA bicubic
+     （`NpuBicubicResizeAASmallOp`，Linear×2+Transpose×2，见 STATUS §2.9 /
+     optimization-roadmap P10-C），端到端 cos 与 910B aclnn AA 数值等价。
+   - 分发（`qwen3vl_preprocess.cpp:438`）：降采样时 910B→aclnn AA、310P→small-op AA；
+     非降采样→非 AA aclnn（跨平台）。310P 降采样不再降级 CPU / skip。
 
 2. **official full gate skip 是 limitation，不是成功**
    - `test_engine_vs_official` 在非 910B 上 skip，应在状态/报告中写明“310P official full embedding gate 是待修平台 gap”。

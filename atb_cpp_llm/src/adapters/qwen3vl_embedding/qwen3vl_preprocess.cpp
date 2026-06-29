@@ -7,6 +7,7 @@
 #include "ops/elewise_op.h"
 #include "ops/transpose_op.h"
 #include "components/vision/aclnn_bicubic_resize.h"
+#include "components/vision/smallop_bicubic_aa.h"
 #include <cmath>
 #include <algorithm>
 #include <cstring>
@@ -433,16 +434,32 @@ static Status PreprocessImageNpuInternal(IRuntime* runtime,
 
     // AA pre-filtering is only beneficial when genuinely downsampling.
     // At identity / near-identity scales AA smooths the image and
-    // degrades precision vs CPU (cos drops to ~0.950).  On 310P the AA
-    // op is not available so we always use non-AA.
+    // degrades precision vs CPU (cos drops to ~0.950), so non-downsample
+    // paths always use the non-AA aclnn op. When downsampling, 910B uses the
+    // hardware AA op; 310P (where the AA op is unsupported) uses a small-op
+    // AA assembly that is numerically equivalent (see dispatch below).
     {
         bool downsample = (new_h < height || new_w < width);
-        if (Is910B() && downsample) {
-            ret = NpuBicubicResizeAA(runtime,
-                                     input_tensor.deviceData,
-                                     channels, height, width, new_h, new_w,
-                                     resized_tensor.deviceData);
+        if (downsample) {
+            if (Is910B()) {
+                // 910B: hardware AA op (aclnnUpsampleBicubic2dAA), fastest path.
+                ret = NpuBicubicResizeAA(runtime,
+                                         input_tensor.deviceData,
+                                         channels, height, width, new_h, new_w,
+                                         resized_tensor.deviceData);
+            } else {
+                // 310P: aclnnUpsampleBicubic2dAA unsupported (aclnnStatus=561103).
+                // Stack ATB small ops (Linear x2 + Transpose x2) into a
+                // PIL-equivalent separable AA bicubic. Numerically equivalent to
+                // 910B's hardware AA (verified Batch B: end-to-end cos matches
+                // 910B aclnn AA to ~6 decimals).
+                aclError ae = NpuBicubicResizeAASmallOp(
+                    input_tensor.deviceData, height, width, channels,
+                    new_h, new_w, runtime, resized_tensor.deviceData);
+                ret = (ae == ACL_SUCCESS) ? STATUS_OK : ERROR_INFERENCE;
+            }
         } else {
+            // Non-downsample (identity / upsample): non-AA aclnn, cross-platform.
             ret = NpuBicubicResize(runtime,
                                    input_tensor.deviceData,
                                    channels, height, width, new_h, new_w,

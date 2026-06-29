@@ -236,7 +236,7 @@
 
 ## 主题 8：代码设计
 
-**触发关键词**：config 字段、debug dump、DEPRECATED、wrapper、死代码、返回值、接口契约、host/device 指针、裸指针契约、数据位置绑死、张量抽象、D2H/H2D 往返、调用方 sync、free-safety sync、所有权转移、Detach 静默、double-free、头注释合约漂移、stale 合约、goto-cleanup、资源泄漏、提前 return 泄漏、多资源分配
+**触发关键词**：config 字段、debug dump、DEPRECATED、wrapper、死代码、返回值、接口契约、host/device 指针、裸指针契约、数据位置绑死、张量抽象、D2H/H2D 往返、调用方 sync、free-safety sync、所有权转移、Detach 静默、double-free、头注释合约漂移、stale 合约、goto-cleanup、资源泄漏、提前 return 泄漏、多资源分配、aclrtFree 即时回收、deferred-free、异步算子输入释放、use-after-free
 
 1. **每个 config 字段必须有消费代码**
    新增字段问"谁读它？怎么验证它确实被读了？"用 `grep -rn "\.field_name"` 验证写→读链路。— `refactor §4.2`
@@ -273,6 +273,9 @@
 
 10. **【2026-06-23 P10-B 工程化 MAJOR-1】多资源分配函数必须用 goto-cleanup / RAII，提前 return 会泄漏已分配资源**
     `PreprocessImageNpu` 分配 5 个 device tensor（input/resized/normalize_tmp/mean_bc/inv_std_bc）+ workspace，每步失败都 `return`——中间任一步失败，前面已分配的 tensor 全泄漏（device memory 不像 host 有 RAII 自动回收）。Reviewer 列出 8 条泄漏路径。**分配多个资源的函数，统一用 goto-cleanup 模式（或 RAII wrapper）：所有资源前置声明为空，错误路径 goto cleanup，cleanup 段逆序释放非空资源；正常路径也走 cleanup 或显式释放。** 判据：函数内 alloc >1 个 device/host 资源 + 有多个失败点 = 必须统一 cleanup。这是 C 资源管理的通则，device memory 更甚（泄漏不 crash 但耗尽 HBM）。— P10-B 工程化 MAJOR-1
+
+11. **【2026-06-29 P10-C Batch A BLOCKER-1】`aclrtFree`（`TensorAllocator::Free`）即时回收、非 stream-ordered——异步算子的输入张量必须 sync 后才能 free，否则 use-after-free**
+    `smallop_bicubic_aa.cpp` 当初为追求异步流水（呼应第 7 条"要异步需 deferred-free intermediates"），在 H/V pass 算子 `Execute`（异步入队）后**立即** `alloc->Free` 中间张量（w_h/h_out/h_tr/w_v/v_out），以为"caller 末尾 sync 就够"。**根因**：`aclrtFree` 把内存**即时**交还池子（非 stream-ordered，ACL **无** `aclrtFreeAsync`），而排队的算子还在读这些张量。Reviewer 用指针复用实验铁证：`Free` 后立即同尺寸 `aclrtMalloc` 5/5 返回**相同指针**（REUSED=1），证明内存即时可复用 → 飞行中算子读已释放/被改写的内存。单图 spike 靠 pool 布局运气（无同尺寸复用）没炸，但接生产 allocator（normalize/patchify 张量命中池桶）会静默损坏或崩溃。**正确模式**：算子间保持异步（不 per-op sync），但所有中间张量的 free 必须延到一次 end-of-pipeline `runtime->Synchronize()` 之后（cleanup 标签内统一 sync-before-free，对齐 `qwen3vl_preprocess.cpp:580/:703`）。sync 放 cleanup 标签**内**而非标签前——否则提前 `goto cleanup` 的分支（如 H-only）会跳过 sync。sync 失败也要 fall-through 继续 free（leak-safe，对齐 preprocess.cpp:703-706）。**这是第 7 条"deferred-free intermediates"的反面实证：deferred-free 不等于 eager-free，ACL 下"deferred"只能靠 sync-before-free 实现，不能靠异步 free。** — P10-C Batch A BLOCKER-1（Reviewer 破坏者指针复用实验 + 20 次 poison-churn stress 验证修复）
 
 ---
 

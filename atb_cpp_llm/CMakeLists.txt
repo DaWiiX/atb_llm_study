@@ -103,6 +103,7 @@ set(ENGINE_SRCS
     src/components/vision/pos_embed_npu_graph.cpp
     src/components/vision/vis_rope_npu_graph.cpp
     src/components/vision/aclnn_bicubic_resize.cpp
+    src/components/vision/smallop_bicubic_aa.cpp
     # runners
     src/runners/vision_runner.cpp
     src/runners/text_runner.cpp
@@ -233,6 +234,7 @@ add_atb_test(test_pos_embed_npu_graph tests/level2_op_precision/test_pos_embed_n
 add_atb_test(test_vis_rope_npu_graph  tests/level2_op_precision/test_vis_rope_npu_graph.cpp)
 add_atb_test(test_index_add_npu       tests/level2_op_precision/test_index_add_npu.cpp)
 add_atb_test(test_aclnn_bicubic_spike tests/level2_op_precision/test_aclnn_bicubic_spike.cpp)
+add_atb_test(test_aa_smallop_spike    tests/level2_op_precision/test_aa_smallop_spike.cpp)
 
 # Level 1 CPU pure-function tests (no NPU dependency for the logic,
 # but link against engine library for the implementation).
@@ -415,6 +417,7 @@ set(REFDATA_DEPENDENT_TESTS
     test_patch_embed_precision
     test_vision_merger_precision
     test_aclnn_bicubic_spike
+    test_aa_smallop_spike
     test_pos_embed_npu_graph
     test_vis_rope_npu_graph
     # Level 3 integration
